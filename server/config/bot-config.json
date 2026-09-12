@@ -1,0 +1,31 @@
+{
+  "environment": "demo",
+  "confirmedProductionAt": null,
+  "sports": ["tennis_atp_wimbledon"],
+  "oddsProviderOrder": ["the-odds-api", "oddspapi"],
+  "oddsPapiTournamentIds": {
+    "tennis_atp_wimbledon": null
+  },
+  "scanIntervalMinutes": 20,
+  "entryWindowHours": 4,
+  "kellyFraction": 0.10,
+  "minLiquidity": 50,
+  "maxRiskPctPerTrade": 0.01,
+  "perPositionStopLossPct": 0.05,
+  "dailyLossHaltPct": 0.10,
+  "feeMultiplier": 0.07,
+  "nonSportsEnabled": false,
+  "autoStartOnBoot": true,
+  "survivalMode": {
+    "balanceThreshold": 100,
+    "flatBetDollars": 1,
+    "maxConcurrentPositions": 3,
+    "edgeMultiplier": 1.5
+  },
+  "milestones": [100, 500, 1000, 5000, 10000, 50000],
+  "monthlyCosts": {
+    "hosting": 25,
+    "oddsApi": 99,
+    "other": 0
+  }
+}
