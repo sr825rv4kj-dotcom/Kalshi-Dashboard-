@@ -106,4 +106,14 @@ export async function exitPosition(position, reason) {
     filled: contracts - remaining, reason, edgePct: null, environment: config.environment,
   });
 
-  const { bot
+  const { botToken, chatId } = getTelegramCredentials();
+  notifyExit({ botToken, chatId, ticker, side, contracts, reason, closed: contracts - remaining, remaining })
+    .catch(() => {});
+
+  const state = loadState();
+  state.positions = state.positions.filter((p) => p !== position);
+  if (remaining > 0) state.positions.push({ ...position, contracts: remaining, note: "exit incomplete" });
+  saveState(state);
+
+  return { closed: contracts - remaining, remaining };
+}
