@@ -1,0 +1,4 @@
+{
+  "_comment": "Map sportsbook team/player names (lowercase, as returned by your odds provider) to Kalshi ticker prefixes you've manually verified. The bot will ONLY consider trading tickers listed here.",
+  "_example": { "kansas city chiefs": "KXNFLGAME-25DEC01KCLAC-KC" }
+}
