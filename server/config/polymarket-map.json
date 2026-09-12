@@ -1,0 +1,4 @@
+{
+  "_comment": "Map a verified Polymarket market slug to the matching Kalshi ticker. Manual verification only - nothing is auto-matched.",
+  "_example": { "fed-decision-in-october": "KXFED-25OCT-CUT" }
+}
