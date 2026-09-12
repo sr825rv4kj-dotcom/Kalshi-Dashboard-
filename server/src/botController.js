@@ -362,3 +362,4 @@ export function stopBot() {
 export function isRunning() {
   return intervalHandle !== null;
 }
+
