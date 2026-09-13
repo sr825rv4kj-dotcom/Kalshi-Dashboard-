@@ -120,7 +120,8 @@ function DashboardApp() {
         <div className="panel"><h2>Recent Orders</h2><OrdersTable orders={orders} /></div>
       </div>
 
-      <BotControlPanel apiBase={API_BASE} />
+            <BotControlPanel apiBase={API_BASE} />
+      <BotConfigPanel apiBase={API_BASE} />
       <GamesBoard apiBase={API_BASE} />
       <MilestonesPanel apiBase={API_BASE} />
       <TradeLedgerPanel apiBase={API_BASE} />
