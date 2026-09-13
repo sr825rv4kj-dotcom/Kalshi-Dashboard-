@@ -86,3 +86,6 @@ button:disabled { opacity: 0.6; cursor: default; }
 .game-card-team { display: flex; align-items: center; gap: 8px; font-family: "Inter", sans-serif; font-size: 14px; font-weight: 500; }
 .team-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .game-card-time { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--muted); }
+.game-card-sport { font-family: "IBM Plex Mono", monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 8px; }
+.game-card-live { border-color: var(--negative); position: relative; }
+.live-badge { position: absolute; top: 10px; right: 10px; background: var(--negative); color: #2a1512; font-family: "IBM Plex Mono", monospace; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; padding: 2px 6px; border-radius: 3px; }
