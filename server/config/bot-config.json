@@ -1,5 +1,5 @@
 {
-  "environment": "demo",
+  "environment": "production",
   "confirmedProductionAt": null,
   "sportsPool": [
     "americanfootball_nfl",
@@ -13,18 +13,17 @@
     "soccer_germany_bundesliga",
     "soccer_italy_serie_a",
     "soccer_usa_mls",
-    "tennis_atp_wimbledon",
     "tennis_atp_us_open"
   ],
   "oddsProviderOrder": ["the-odds-api", "oddspapi"],
   "oddsPapiTournamentIds": {},
   "scanIntervalMinutes": 15,
   "entryWindowHours": 1,
-  "kellyFraction": 0.10,
+  "kellyFraction": 0.1,
   "minLiquidity": 50,
   "maxRiskPctPerTrade": 0.01,
   "perPositionStopLossPct": 0.05,
-  "dailyLossHaltPct": 0.10,
+  "dailyLossHaltPct": 0.1,
   "feeMultiplier": 0.07,
   "nonSportsEnabled": false,
   "autoStartOnBoot": true,
@@ -39,5 +38,6 @@
     "hosting": 25,
     "oddsApi": 129,
     "other": 0
-  }
+  },
+  "maxConcurrentPositions": 10
 }
