@@ -100,6 +100,7 @@ function atConcurrentPositionCap(config, bankroll) {
 }
 
 
+
 function withinEntryWindow(commenceTime, entryWindowHours) {
   if (!commenceTime) return { ok: false, reason: "no start time available for this event" };
   const startMs = new Date(commenceTime).getTime();
