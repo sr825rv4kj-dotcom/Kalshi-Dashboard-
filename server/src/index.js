@@ -4,13 +4,9 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
- from "./paths.js";
 import { bootstrapPersistentStorage, CONFIG_DIR, ENV_PATH } from "./paths.js";
 
 dotenv.config({ path: ENV_PATH });
-bootstrapPersistentStorage();
-
-
 bootstrapPersistentStorage();
 
 import { kalshiGet, hasCredentialsConfigured, resetCredentialsCache } from "./kalshiClient.js";
@@ -20,7 +16,7 @@ import { saveOddsKeys, getOddsKeysStatus } from "./oddsKeysStore.js";
 import { startBot, stopBot, isRunning } from "./botController.js";
 import { loadConfig, saveConfig, setEnvironment } from "./configStore.js";
 import { loadState, getRecentLog } from "./stateStore.js";
-import { getRecentTrades } from "./tradeLedgerStore.js";
+import { getRecentTrades, getTradeStats } from "./tradeLedgerStore.js";
 import { hasAccount, createAccount, verifyLogin, verifyToken } from "./authStore.js";
 import { saveTelegramConfig, getTelegramStatus } from "./telegramStore.js";
 import { getUpcomingGames, getAvailableSportKeys } from "./gamesFeed.js";
@@ -260,6 +256,8 @@ app.get("/api/bot/status", async (_req, res) => {
     currentBalance,
     survivalMode: config.survivalMode ? { active: survivalModeActive, ...config.survivalMode } : null,
     openPositions: state.positions,
+    botStartedAt: state.botStartedAt,
+    tradeStats: getTradeStats(),
   });
 });
 
