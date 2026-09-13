@@ -11,7 +11,7 @@ function newClientOrderId() {
   return `dash_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export async function enterPosition({ ticker, side, priceCents, contracts, reason = null, edgePct = null }) {
+export async function enterPosition({ ticker, side, priceCents, contracts, reason = null, edgePct = null, teamName = null, sportKey = null, commenceTime = null }) {
   if (contracts <= 0) return { filled: 0 };
 
   const clientOrderId = newClientOrderId();
@@ -41,7 +41,7 @@ export async function enterPosition({ ticker, side, priceCents, contracts, reaso
 
   if (filled > 0) {
     const state = loadState();
-    state.positions.push({ ticker, side, entryPriceCents: priceCents, contracts: filled, openedAt: new Date().toISOString() });
+    state.positions.push({ ticker, side, entryPriceCents: priceCents, contracts: filled, openedAt: new Date().toISOString(), teamName, sportKey, commenceTime });
     saveState(state);
     appendLog(`Filled ${filled}x ${ticker} (${side}) @ ${priceCents}c`);
   }
@@ -50,12 +50,13 @@ export async function enterPosition({ ticker, side, priceCents, contracts, reaso
   recordTrade({
     action: "enter", ticker, side, contracts, priceCents, filled,
     reason: reason || "no reason recorded", edgePct, environment: config.environment,
+    teamName, sportKey, commenceTime,
   });
 
   if (filled > 0) {
     const { botToken, chatId } = getTelegramCredentials();
     notifyEntry({ botToken, chatId, ticker, side, contracts: filled, priceCents, reason, environment: config.environment })
-      .catch(() => {});
+      .catch(() => {}); // notification failures never block trading
   }
 
   return { filled };
@@ -66,6 +67,7 @@ export async function exitPosition(position, reason) {
   const sellSide = side;
   let remaining = contracts;
   let attempts = 0;
+  let lastExitPriceCents = null;
 
   while (remaining > 0 && attempts < 3) {
     const book = await kalshiGet(`${V2}/markets/${ticker}/orderbook`);
@@ -87,6 +89,7 @@ export async function exitPosition(position, reason) {
     await new Promise((r) => setTimeout(r, 2000));
     const statusRes = await kalshiGet(`${V2}/portfolio/orders/${orderId}`);
     const filled = statusRes.order?.taker_fill_count ?? 0;
+    if (filled > 0) lastExitPriceCents = bestBid;
     remaining -= filled;
     attempts++;
   }
@@ -103,7 +106,11 @@ export async function exitPosition(position, reason) {
   const config = loadConfig();
   recordTrade({
     action: "exit", ticker, side, contracts, priceCents: position.entryPriceCents,
+    exitPriceCents: lastExitPriceCents,
     filled: contracts - remaining, reason, edgePct: null, environment: config.environment,
+    teamName: position.teamName ?? null,
+    sportKey: position.sportKey ?? null,
+    commenceTime: position.commenceTime ?? null,
   });
 
   const { botToken, chatId } = getTelegramCredentials();
