@@ -12,6 +12,8 @@ import MilestonesPanel from "./components/MilestonesPanel.jsx";
 import CostTrackingPanel from "./components/CostTrackingPanel.jsx";
 import AuthGate from "./components/AuthGate.jsx";
 import NotificationsPanel from "./components/NotificationsPanel.jsx";
+import GamesBoard from "./components/GamesBoard.jsx";
+import BackgroundSettings from "./components/BackgroundSettings.jsx";
 import { getTodaysTheme, applyTheme } from "./theme.js";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:4000";
@@ -118,11 +120,13 @@ function DashboardApp() {
       </div>
 
       <BotControlPanel apiBase={API_BASE} />
+      <GamesBoard apiBase={API_BASE} />
       <MilestonesPanel apiBase={API_BASE} />
       <TradeLedgerPanel apiBase={API_BASE} />
       <NotificationsPanel apiBase={API_BASE} />
       <CostTrackingPanel apiBase={API_BASE} />
       <ApiKeysPanel apiBase={API_BASE} />
+      <BackgroundSettings apiBase={API_BASE} />
     </div>
   );
 }
