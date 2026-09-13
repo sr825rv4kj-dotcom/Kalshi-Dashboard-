@@ -252,7 +252,14 @@ export async function runCycle() {
 
   let latestQuotaRemaining = null;
 
-  for (const sportKey of config.sports) {
+    const activeSports = getInSeasonSports(config.sportsPool || config.sports);
+  const skippedSports = getOutOfSeasonSports(config.sportsPool || config.sports);
+  if (skippedSports.length) {
+    appendLog(`Skipping out-of-season: ${skippedSports.join(", ")}`);
+  }
+
+  for (const sportKey of activeSports) {
+    
     let probResult;
     try {
       const tournamentId = (config.oddsPapiTournamentIds || {})[sportKey];
@@ -327,7 +334,8 @@ export async function runCycle() {
     }
   }
 
-  maybeAdjustScanInterval(config, latestQuotaRemaining, config.sports.length);
+    maybeAdjustScanInterval(config, latestQuotaRemaining, activeSports.length);
+
 }
 
 export function startBot() {
