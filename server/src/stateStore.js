@@ -13,6 +13,7 @@ function defaultState() {
     haltReason: null,
     positions: [],
     log: [],
+    botStartedAt: null,
   };
 }
 
