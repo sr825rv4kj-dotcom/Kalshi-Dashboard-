@@ -10,6 +10,7 @@ import { loadState, saveState, appendLog } from "./stateStore.js";
 import { loadConfig, saveConfig } from "./configStore.js";
 import { computeAdaptiveIntervalMinutes } from "./quotaScheduler.js";
 import { getInSeasonSports, getOutOfSeasonSports } from "./seasonCalendar.js";
+import { resolveTicker } from "./tickerResolver.js";
 import { notifyMilestone, notifyDailyHalt, notifyDailySummary } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 import { getRecentTrades } from "./tradeLedgerStore.js";
@@ -285,9 +286,17 @@ export async function runCycle() {
         appendLog(`Max concurrent positions reached - skipping remaining candidates this cycle.`, "warn");
         return;
       }
+      let ticker = tickerMap[teamName];
+      if (!ticker) {
+        const resolved = await resolveTicker({ sportKey, teamName, commenceTime });
+        if (!resolved.ticker) {
+          appendLog(`Skip "${teamName}": ${resolved.reason}`);
+          continue;
+        }
+        ticker = resolved.ticker;
+        appendLog(`Auto-resolved "${teamName}" -> ${ticker}`);
+      }
 
-      const ticker = tickerMap[teamName];
-      if (!ticker) continue;
 
       const windowCheck = withinEntryWindow(commenceTime, config.entryWindowHours ?? 4);
       if (!windowCheck.ok) {
