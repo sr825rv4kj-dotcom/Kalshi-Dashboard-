@@ -218,8 +218,10 @@ async function runPolymarketCycle(config, bankroll) {
     await enterPosition({
       ticker, side: "yes", priceCents: market.yes_ask, contracts: assessment.sizing.contracts,
       reason: `Polymarket-vs-Kalshi consensus mismatch on slug "${slug}" (non-sports, lower confidence)`,
-      edgePct: assessment.edgeCheck.observedEdge * 100,
-    });
+              edgePct: assessment.edgeCheck.observedEdge * 100,
+        teamName, sportKey, commenceTime,
+      });
+
   }
 }
 
