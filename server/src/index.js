@@ -19,7 +19,7 @@ import { loadState, getRecentLog } from "./stateStore.js";
 import { getRecentTrades, getTradeStats } from "./tradeLedgerStore.js";
 import { hasAccount, createAccount, verifyLogin, verifyToken } from "./authStore.js";
 import { saveTelegramConfig, getTelegramStatus } from "./telegramStore.js";
-import { getUpcomingGames, getAvailableSportKeys } from "./gamesFeed.js";
+import { getUpcomingGames, getAvailableSportKeys, getLiveFeed } from "./gamesFeed.js";
 import { saveBackground, getBackground, clearBackground } from "./backgroundStore.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -196,6 +196,7 @@ app.get("/api/pnl-history", async (req, res) => {
     res.json({ series });
   } catch (err) {
     res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -338,6 +339,16 @@ app.get("/api/system-status", async (_req, res) => {
 // --- Games board & background upload ---
 app.get("/api/games/sports", (_req, res) => {
   res.json({ sportKeys: getAvailableSportKeys() });
+});
+
+app.get("/api/games/live-feed", async (_req, res) => {
+  try {
+    const config = loadConfig();
+    const result = await getLiveFeed(config.sportsPool || config.sports || []);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get("/api/games/:sportKey", async (req, res) => {
