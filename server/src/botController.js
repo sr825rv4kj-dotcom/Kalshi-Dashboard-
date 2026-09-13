@@ -33,6 +33,10 @@ function loadPolymarketMap() {
   return map;
 }
 
+/**
+ * Sends one Telegram notification the first time the balance crosses each
+ * configured milestone, tracked in state so it never repeats.
+ */
 async function checkMilestones(config, currentBalance) {
   const milestones = config.milestones || [];
   if (!milestones.length) return;
@@ -51,6 +55,12 @@ async function checkMilestones(config, currentBalance) {
   }
 }
 
+/**
+ * Sends one daily summary once per calendar day (checked on whichever
+ * cycle happens to run first after midnight), regardless of whether any
+ * trades happened - this is the "throughout the day, even if quiet"
+ * signal, separate from the per-trade notifications.
+ */
 async function checkDailySummary(config, currentBalance) {
   const state = loadState();
   const today = new Date().toDateString();
@@ -182,7 +192,6 @@ async function runPolymarketCycle(config, bankroll) {
       multiplier: config.feeMultiplier, kellyFraction: config.kellyFraction, minLiquidity: config.minLiquidity,
       survivalMode: config.survivalMode,
     });
-
     if (assessment.action === "skip") {
       appendLog(`Skip (non-sports) ${ticker}: ${assessment.reason}`);
       continue;
@@ -203,7 +212,7 @@ async function runPolymarketCycle(config, bankroll) {
 
 function maybeAdjustScanInterval(config, latestQuotaRemaining, sportsScannedThisCycle) {
   if (latestQuotaRemaining == null || !sportsScannedThisCycle) return;
-  const creditsPerScan = sportsScannedThisCycle * 2;
+  const creditsPerScan = sportsScannedThisCycle * 2; // 1 market x 2 regions per sport
   const newInterval = computeAdaptiveIntervalMinutes({ remainingCredits: latestQuotaRemaining, creditsPerScan });
   if (!newInterval) return;
 
@@ -246,21 +255,15 @@ export async function runCycle() {
     await runPolymarketCycle(config, bankroll);
   }
 
-  if (Object.keys(tickerMap).length === 0) {
-    appendLog("Sports ticker map is empty - skipping sports scan. Add verified mappings to enable it.", "warn");
-    return;
-  }
-
   let latestQuotaRemaining = null;
 
-    const activeSports = getInSeasonSports(config.sportsPool || config.sports);
+  const activeSports = getInSeasonSports(config.sportsPool || config.sports);
   const skippedSports = getOutOfSeasonSports(config.sportsPool || config.sports);
   if (skippedSports.length) {
     appendLog(`Skipping out-of-season: ${skippedSports.join(", ")}`);
   }
 
   for (const sportKey of activeSports) {
-    
     let probResult;
     try {
       const tournamentId = (config.oddsPapiTournamentIds || {})[sportKey];
@@ -286,6 +289,7 @@ export async function runCycle() {
         appendLog(`Max concurrent positions reached - skipping remaining candidates this cycle.`, "warn");
         return;
       }
+
       let ticker = tickerMap[teamName];
       if (!ticker) {
         const resolved = await resolveTicker({ sportKey, teamName, commenceTime });
@@ -296,7 +300,6 @@ export async function runCycle() {
         ticker = resolved.ticker;
         appendLog(`Auto-resolved "${teamName}" -> ${ticker}`);
       }
-
 
       const windowCheck = withinEntryWindow(commenceTime, config.entryWindowHours ?? 4);
       if (!windowCheck.ok) {
@@ -343,8 +346,7 @@ export async function runCycle() {
     }
   }
 
-    maybeAdjustScanInterval(config, latestQuotaRemaining, activeSports.length);
-
+  maybeAdjustScanInterval(config, latestQuotaRemaining, activeSports.length);
 }
 
 export function startBot() {
