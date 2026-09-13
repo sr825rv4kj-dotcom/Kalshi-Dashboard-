@@ -9,6 +9,7 @@ import { enterPosition, exitPosition } from "./executor.js";
 import { loadState, saveState, appendLog } from "./stateStore.js";
 import { loadConfig, saveConfig } from "./configStore.js";
 import { computeAdaptiveIntervalMinutes } from "./quotaScheduler.js";
+import { getInSeasonSports, getOutOfSeasonSports } from "./seasonCalendar.js";
 import { notifyMilestone, notifyDailyHalt, notifyDailySummary } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 import { getRecentTrades } from "./tradeLedgerStore.js";
