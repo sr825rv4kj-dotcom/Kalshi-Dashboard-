@@ -29,3 +29,10 @@ export function getRecentTrades(limit = 100) {
   const ledger = loadLedger();
   return ledger.slice(-limit).reverse();
 }
+
+export function getTradeStats() {
+  const ledger = loadLedger();
+  const entries = ledger.filter((t) => t.action === "enter" && t.filled > 0);
+  const exits = ledger.filter((t) => t.action === "exit" && t.filled > 0);
+  return { totalEntries: entries.length, totalExits: exits.length };
+}
