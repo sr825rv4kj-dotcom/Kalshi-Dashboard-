@@ -199,3 +199,226 @@ app.get("/api/pnl-history", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// --- Risk assessment (calculation only, never places orders) ---
+app.post("/api/assess", (req, res) => {
+  try {
+    const { bankroll, trueProbability, price, restingContracts, kellyFraction, minLiquidity } = req.body;
+    if (typeof bankroll !== "number" || typeof trueProbability !== "number" || typeof price !== "number" || typeof restingContracts !== "number") {
+      return res.status(400).json({ error: "bankroll, trueProbability, price, and restingContracts must all be numbers" });
+    }
+    const result = assessOpportunity({ bankroll, trueProbability, price, restingContracts, kellyFraction, minLiquidity });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Bot config ---
+app.get("/api/bot/config", (_req, res) => res.json(loadConfig()));
+
+app.post("/api/bot/config", (req, res) => {
+  try {
+    const { environment, confirmedProductionAt, ...safeUpdates } = req.body || {};
+    res.json(saveConfig(safeUpdates));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/bot/environment", (req, res) => {
+  try {
+    const { environment, confirmed } = req.body || {};
+    if (!["demo", "production"].includes(environment)) return res.status(400).json({ error: "environment must be 'demo' or 'production'" });
+    res.json(setEnvironment(environment, confirmed));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// --- Bot start/stop/status ---
+app.get("/api/bot/status", async (_req, res) => {
+  const state = loadState();
+  const config = loadConfig();
+
+  let currentBalance = null;
+  let survivalModeActive = null;
+  try {
+    const balanceData = await kalshiGet(`${V2}/portfolio/balance`);
+    currentBalance = (balanceData.balance ?? 0) / 100;
+    if (config.survivalMode) survivalModeActive = currentBalance < config.survivalMode.balanceThreshold;
+  } catch {
+    // leave null - frontend handles it
+  }
+
+  res.json({
+    running: isRunning(), environment: config.environment,
+    haltedForDay: state.haltedForDay, haltReason: state.haltReason, dayStartBalance: state.dayStartBalance,
+    currentBalance,
+    survivalMode: config.survivalMode ? { active: survivalModeActive, ...config.survivalMode } : null,
+    openPositions: state.positions,
+    botStartedAt: state.botStartedAt,
+    tradeStats: getTradeStats(),
+  });
+});
+
+app.post("/api/bot/start", (_req, res) => res.json(startBot()));
+app.post("/api/bot/stop", (_req, res) => res.json(stopBot()));
+
+app.get("/api/bot/log", (req, res) => {
+  const limit = Number(req.query.limit) || 100;
+  res.json({ log: getRecentLog(limit) });
+});
+
+app.get("/api/trade-ledger", (req, res) => {
+  const limit = Number(req.query.limit) || 100;
+  res.json({ trades: getRecentTrades(limit) });
+});
+
+// Full trade lifecycles: completed round-trips with real cost/proceeds/ROI,
+// plus still-open positions. Optionally enriched with real final scores
+// (?withScores=true), which costs extra odds-API credits so it is opt-in.
+app.get("/api/trade-lifecycles", async (req, res) => {
+  try {
+    const { completed, open } = getTradeLifecycles();
+
+    if (req.query.withScores === "true" && completed.length) {
+      const sportKeys = [...new Set(completed.map((t) => t.sportKey).filter(Boolean))];
+      const scoresBySport = {};
+      for (const sportKey of sportKeys) {
+        const { events } = await getRecentScores(sportKey);
+        scoresBySport[sportKey] = events;
+      }
+      for (const trade of completed) {
+        if (!trade.sportKey || !trade.teamName) continue;
+        trade.finalScore = findScoreForTeam(scoresBySport[trade.sportKey] || [], trade.teamName);
+      }
+    }
+
+    res.json({ completed, open, stats: getTradeStats() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Ticker map status ---
+app.get("/api/ticker-map/status", (_req, res) => {
+  try {
+    const readCount = (p) => {
+      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+      const { _comment, _example, ...rest } = raw;
+      return Object.keys(rest).length;
+    };
+    res.json({
+      sportsTickerCount: readCount(path.join(CONFIG_DIR, "ticker-map.json")),
+      polymarketTickerCount: readCount(path.join(CONFIG_DIR, "polymarket-map.json")),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Milestones & cost tracking (informational only) ---
+app.get("/api/milestones", async (_req, res) => {
+  try {
+    const config = loadConfig();
+    const balanceData = await kalshiGet(`${V2}/portfolio/balance`).catch(() => null);
+    const currentBalance = balanceData ? (balanceData.balance ?? 0) / 100 : null;
+    res.json({ milestones: config.milestones || [], currentBalance, monthlyCosts: config.monthlyCosts || {} });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/milestones", (req, res) => {
+  try {
+    const { milestones, monthlyCosts } = req.body || {};
+    const updates = {};
+    if (Array.isArray(milestones)) updates.milestones = milestones;
+    if (monthlyCosts && typeof monthlyCosts === "object") updates.monthlyCosts = monthlyCosts;
+    res.json(saveConfig(updates));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Overall system status ---
+app.get("/api/system-status", async (_req, res) => {
+  const config = loadConfig();
+  const oddsKeys = getOddsKeysStatus();
+  let kalshiConnected = false;
+  let kalshiError = null;
+  try {
+    await kalshiGet(`${V2}/portfolio/balance`);
+    kalshiConnected = true;
+  } catch (err) {
+    kalshiError = err.message;
+  }
+  res.json({
+    kalshi: { connected: kalshiConnected, error: kalshiError },
+    oddsPapi: { configured: oddsKeys.oddsPapiConfigured },
+    theOddsApi: { configured: oddsKeys.theOddsApiConfigured },
+    botRunning: isRunning(), environment: config.environment, autoStartOnBoot: Boolean(config.autoStartOnBoot),
+  });
+});
+
+// --- Games board & background upload ---
+app.get("/api/games/sports", (_req, res) => {
+  res.json({ sportKeys: getAvailableSportKeys() });
+});
+
+app.get("/api/games/live-feed", async (_req, res) => {
+  try {
+    const config = loadConfig();
+    const result = await getLiveFeed(config.sportsPool || config.sports || []);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/games/:sportKey", async (req, res) => {
+  try {
+    const result = await getUpcomingGames(req.params.sportKey);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/background", (_req, res) => {
+  res.json(getBackground());
+});
+
+app.post("/api/background", (req, res) => {
+  try {
+    const { dataUrl } = req.body || {};
+    res.json(saveBackground(dataUrl));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete("/api/background", (_req, res) => {
+  res.json(clearBackground());
+});
+
+const clientDistPath = path.join(__dirname, "..", "..", "client", "dist");
+if (fs.existsSync(clientDistPath)) {
+  app.use(express.static(clientDistPath));
+  app.get("*", (req, res, next) => {
+    if (req.path.startsWith("/api/")) return next();
+    res.sendFile(path.join(clientDistPath, "index.html"));
+  });
+  console.log("Serving built frontend from client/dist");
+}
+
+app.listen(PORT, () => {
+  console.log(`Kalshi dashboard backend running on http://localhost:${PORT}`);
+  const config = loadConfig();
+  if (config.autoStartOnBoot && hasCredentialsConfigured()) {
+    console.log(`autoStartOnBoot enabled - starting bot in ${config.environment.toUpperCase()} mode.`);
+    startBot();
+  } else if (config.autoStartOnBoot) {
+    console.log("autoStartOnBoot enabled but no credentials configured yet - waiting for setup.");
+  }
+});
