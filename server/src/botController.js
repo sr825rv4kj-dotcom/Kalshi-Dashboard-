@@ -20,6 +20,8 @@ const POLYMARKET_MAP_PATH = path.join(CONFIG_DIR, "polymarket-map.json");
 const V2 = "/trade-api/v2";
 
 let intervalHandle = null;
+let positionMonitorHandle = null;
+const POSITION_MONITOR_INTERVAL_MS = 90 * 1000; // 90s - independent of the main scan cycle
 
 function loadTickerMap() {
   const raw = JSON.parse(fs.readFileSync(TICKER_MAP_PATH, "utf8"));
@@ -192,6 +194,7 @@ async function runPolymarketCycle(config, bankroll) {
       multiplier: config.feeMultiplier, kellyFraction: config.kellyFraction, minLiquidity: config.minLiquidity,
       survivalMode: config.survivalMode,
     });
+
     if (assessment.action === "skip") {
       appendLog(`Skip (non-sports) ${ticker}: ${assessment.reason}`);
       continue;
@@ -357,12 +360,22 @@ export function startBot() {
 
   const state = loadState();
   state.running = true;
+  state.botStartedAt = new Date().toISOString();
   saveState(state);
 
   runCycle().catch((err) => appendLog(`Cycle error: ${err.message}`, "error"));
   intervalHandle = setInterval(() => {
     runCycle().catch((err) => appendLog(`Cycle error: ${err.message}`, "error"));
   }, config.scanIntervalMinutes * 60 * 1000);
+
+  // Independent, much faster loop that only watches positions already open -
+  // for tight stop-loss reaction time without re-scanning the whole market
+  // (and burning odds-API quota) every 90 seconds.
+  positionMonitorHandle = setInterval(() => {
+    const currentState = loadState();
+    if (!currentState.positions.length) return;
+    checkOpenPositions(loadConfig()).catch((err) => appendLog(`Position monitor error: ${err.message}`, "error"));
+  }, POSITION_MONITOR_INTERVAL_MS);
 
   return { started: true };
 }
@@ -371,6 +384,10 @@ export function stopBot() {
   if (intervalHandle) {
     clearInterval(intervalHandle);
     intervalHandle = null;
+  }
+  if (positionMonitorHandle) {
+    clearInterval(positionMonitorHandle);
+    positionMonitorHandle = null;
   }
   const state = loadState();
   state.running = false;
@@ -382,4 +399,3 @@ export function stopBot() {
 export function isRunning() {
   return intervalHandle !== null;
 }
-
