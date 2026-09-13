@@ -1,13 +1,25 @@
 {
   "environment": "demo",
   "confirmedProductionAt": null,
-  "sports": ["tennis_atp_wimbledon"],
+  "sportsPool": [
+    "americanfootball_nfl",
+    "americanfootball_ncaaf",
+    "basketball_nba",
+    "basketball_ncaab",
+    "baseball_mlb",
+    "icehockey_nhl",
+    "soccer_epl",
+    "soccer_spain_la_liga",
+    "soccer_germany_bundesliga",
+    "soccer_italy_serie_a",
+    "soccer_usa_mls",
+    "tennis_atp_wimbledon",
+    "tennis_atp_us_open"
+  ],
   "oddsProviderOrder": ["the-odds-api", "oddspapi"],
-  "oddsPapiTournamentIds": {
-    "tennis_atp_wimbledon": null
-  },
-  "scanIntervalMinutes": 20,
-  "entryWindowHours": 4,
+  "oddsPapiTournamentIds": {},
+  "scanIntervalMinutes": 15,
+  "entryWindowHours": 1,
   "kellyFraction": 0.10,
   "minLiquidity": 50,
   "maxRiskPctPerTrade": 0.01,
@@ -25,7 +37,7 @@
   "milestones": [100, 500, 1000, 5000, 10000, 50000],
   "monthlyCosts": {
     "hosting": 25,
-    "oddsApi": 99,
+    "oddsApi": 129,
     "other": 0
   }
 }
