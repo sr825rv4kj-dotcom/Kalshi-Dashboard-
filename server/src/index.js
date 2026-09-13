@@ -4,7 +4,12 @@ import cors from "cors";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { bootstrapPersistentStorage, CONFIG_DIR } from "./paths.js";
+ from "./paths.js";
+import { bootstrapPersistentStorage, CONFIG_DIR, ENV_PATH } from "./paths.js";
+
+dotenv.config({ path: ENV_PATH });
+bootstrapPersistentStorage();
+
 
 bootstrapPersistentStorage();
 
