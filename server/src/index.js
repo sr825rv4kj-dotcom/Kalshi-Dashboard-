@@ -18,10 +18,17 @@ import { loadState, getRecentLog } from "./stateStore.js";
 import { getRecentTrades } from "./tradeLedgerStore.js";
 import { hasAccount, createAccount, verifyLogin, verifyToken } from "./authStore.js";
 import { saveTelegramConfig, getTelegramStatus } from "./telegramStore.js";
+import { getUpcomingGames, getAvailableSportKeys } from "./gamesFeed.js";
+import { saveBackground, getBackground, clearBackground } from "./backgroundStore.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
+// --- Crash resilience ---
+// A single bad tick in the bot loop (a malformed API response, a network
+// blip) should never take down the whole process - it should log and
+// keep running. These are last-resort catches; specific errors are still
+// caught closer to their source (botController already wraps each cycle).
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
 });
@@ -30,10 +37,12 @@ process.on("unhandledRejection", (reason) => {
 });
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "10mb" }));
 
+// --- Health check (used by Railway to know the process is alive) ---
 app.get("/api/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
+// --- Auth: account setup (once), login, and the gate for everything else ---
 app.get("/api/auth/status", (_req, res) => res.json({ hasAccount: hasAccount() }));
 
 app.post("/api/auth/setup", (req, res) => {
@@ -56,6 +65,9 @@ app.post("/api/auth/login", (req, res) => {
   }
 });
 
+// Everything below this line requires a valid session token, except the
+// routes already defined above (health, auth status/setup/login) and the
+// static frontend files, which need to load before anyone is logged in.
 app.use("/api", (req, res, next) => {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
@@ -68,6 +80,7 @@ app.use("/api", (req, res, next) => {
 const PORT = process.env.PORT || 4000;
 const V2 = "/trade-api/v2";
 
+// --- Credentials setup ---
 app.get("/api/credentials/status", (_req, res) => {
   res.json({ configured: hasCredentialsConfigured() });
 });
@@ -84,6 +97,7 @@ app.post("/api/credentials", (req, res) => {
   }
 });
 
+// --- Odds API keys ---
 app.get("/api/settings/odds-keys/status", (_req, res) => {
   res.json(getOddsKeysStatus());
 });
@@ -99,6 +113,7 @@ app.post("/api/settings/odds-keys", (req, res) => {
   }
 });
 
+// --- Telegram notification settings ---
 app.get("/api/settings/telegram/status", (_req, res) => {
   res.json(getTelegramStatus());
 });
@@ -114,6 +129,7 @@ app.post("/api/settings/telegram", (req, res) => {
   }
 });
 
+// --- Portfolio (real Kalshi data only) ---
 app.get("/api/balance", async (_req, res) => {
   try {
     const data = await kalshiGet(`${V2}/portfolio/balance`);
@@ -182,6 +198,7 @@ app.get("/api/pnl-history", async (req, res) => {
   }
 });
 
+// --- Risk assessment (calculation only, never places orders) ---
 app.post("/api/assess", (req, res) => {
   try {
     const { bankroll, trueProbability, price, restingContracts, kellyFraction, minLiquidity } = req.body;
@@ -195,6 +212,7 @@ app.post("/api/assess", (req, res) => {
   }
 });
 
+// --- Bot config ---
 app.get("/api/bot/config", (_req, res) => res.json(loadConfig()));
 
 app.post("/api/bot/config", (req, res) => {
@@ -216,6 +234,7 @@ app.post("/api/bot/environment", (req, res) => {
   }
 });
 
+// --- Bot start/stop/status ---
 app.get("/api/bot/status", async (_req, res) => {
   const state = loadState();
   const config = loadConfig();
@@ -252,6 +271,7 @@ app.get("/api/trade-ledger", (req, res) => {
   res.json({ trades: getRecentTrades(limit) });
 });
 
+// --- Ticker map status ---
 app.get("/api/ticker-map/status", (_req, res) => {
   try {
     const readCount = (p) => {
@@ -268,6 +288,7 @@ app.get("/api/ticker-map/status", (_req, res) => {
   }
 });
 
+// --- Milestones & cost tracking (informational only) ---
 app.get("/api/milestones", async (_req, res) => {
   try {
     const config = loadConfig();
@@ -291,6 +312,7 @@ app.post("/api/milestones", (req, res) => {
   }
 });
 
+// --- Overall system status ---
 app.get("/api/system-status", async (_req, res) => {
   const config = loadConfig();
   const oddsKeys = getOddsKeysStatus();
@@ -308,6 +330,37 @@ app.get("/api/system-status", async (_req, res) => {
     theOddsApi: { configured: oddsKeys.theOddsApiConfigured },
     botRunning: isRunning(), environment: config.environment, autoStartOnBoot: Boolean(config.autoStartOnBoot),
   });
+});
+
+// --- Games board & background upload ---
+app.get("/api/games/sports", (_req, res) => {
+  res.json({ sportKeys: getAvailableSportKeys() });
+});
+
+app.get("/api/games/:sportKey", async (req, res) => {
+  try {
+    const result = await getUpcomingGames(req.params.sportKey);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/background", (_req, res) => {
+  res.json(getBackground());
+});
+
+app.post("/api/background", (req, res) => {
+  try {
+    const { dataUrl } = req.body || {};
+    res.json(saveBackground(dataUrl));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete("/api/background", (_req, res) => {
+  res.json(clearBackground());
 });
 
 const clientDistPath = path.join(__dirname, "..", "..", "client", "dist");
