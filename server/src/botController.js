@@ -84,12 +84,21 @@ async function checkDailySummary(config, currentBalance) {
 
 function atConcurrentPositionCap(config, bankroll) {
   const survivalMode = config.survivalMode;
-  if (!survivalMode) return false;
-  const inSurvivalMode = bankroll < survivalMode.balanceThreshold;
-  if (!inSurvivalMode || !survivalMode.maxConcurrentPositions) return false;
+  const inSurvivalMode = survivalMode && bankroll < survivalMode.balanceThreshold;
+
+  // Survival mode's own (usually tighter) cap takes priority below the balance
+  // threshold. Above it, use the general cap - this is what actually lets the
+  // bot hold "several bots' worth" of concurrent positions as funds allow,
+  // without needing separate bot instances.
+  const cap = inSurvivalMode
+    ? survivalMode.maxConcurrentPositions
+    : config.maxConcurrentPositions;
+
+  if (!cap) return false;
   const state = loadState();
-  return state.positions.length >= survivalMode.maxConcurrentPositions;
+  return state.positions.length >= cap;
 }
+
 
 function withinEntryWindow(commenceTime, entryWindowHours) {
   if (!commenceTime) return { ok: false, reason: "no start time available for this event" };
