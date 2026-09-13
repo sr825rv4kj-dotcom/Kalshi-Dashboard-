@@ -11,8 +11,9 @@ import TradeLedgerPanel from "./components/TradeLedgerPanel.jsx";
 import MilestonesPanel from "./components/MilestonesPanel.jsx";
 import CostTrackingPanel from "./components/CostTrackingPanel.jsx";
 import AuthGate from "./components/AuthGate.jsx";
-import NotificationsPanel from "./components/NotificationsPanel.jsx";
+import NotificationsPanel from "./components/NotificationsPanel.jsx"
 import GamesBoard from "./components/GamesBoard.jsx";
+import BotConfigPanel from "./components/BotConfigPanel.jsx";
 import BackgroundSettings from "./components/BackgroundSettings.jsx";
 import { getTodaysTheme, applyTheme } from "./theme.js";
 
