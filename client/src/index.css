@@ -89,3 +89,17 @@ button:disabled { opacity: 0.6; cursor: default; }
 .game-card-sport { font-family: "IBM Plex Mono", monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 8px; }
 .game-card-live { border-color: var(--negative); position: relative; }
 .live-badge { position: absolute; top: 10px; right: 10px; background: var(--negative); color: #2a1512; font-family: "IBM Plex Mono", monospace; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; padding: 2px 6px; border-radius: 3px; }
+.collapsible { border-top: 1px solid var(--panel-border); margin-top: 16px; }
+.collapsible-header { width: 100%; margin: 0; background: transparent; border: none; color: var(--text); font-family: "IBM Plex Mono", monospace; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; padding: 14px 0; display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
+.collapsible-count { background: var(--bg); border: 1px solid var(--panel-border); border-radius: 10px; padding: 2px 9px; font-size: 11px; color: var(--muted); }
+.collapsible-body { padding-bottom: 12px; }
+.trade-card { background: var(--bg); border: 1px solid var(--panel-border); border-radius: var(--panel-radius, 6px); padding: 14px 16px; margin-bottom: 10px; }
+.trade-card-top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
+.trade-card-team { font-family: "Inter", sans-serif; font-size: 15px; font-weight: 600; }
+.trade-card-meta { font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--muted); margin-top: 2px; }
+.trade-card-roi { font-family: "IBM Plex Mono", monospace; font-size: 18px; font-weight: 600; }
+.trade-card-rows { display: flex; flex-direction: column; }
+.trade-row { display: flex; justify-content: space-between; font-family: "IBM Plex Mono", monospace; font-size: 12px; padding: 4px 0; }
+.trade-row > span:first-child { color: var(--muted); }
+.trade-card-reason { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--panel-border); font-size: 12px; color: var(--muted); line-height: 1.5; }
+.trade-card-reason strong { color: var(--text); font-weight: 600; }
