@@ -28,7 +28,8 @@ const V2 = "/trade-api/v2";
 const MATCH_WINDOW_HOURS = 3;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
-const SPORT_SERIES_MAP = {
+export const SPORT_SERIES_MAP = {
+
   americanfootball_nfl: "KXNFLGAME",
   americanfootball_ncaaf: "KXNCAAFGAME",
   basketball_nba: "KXNBAGAME",
