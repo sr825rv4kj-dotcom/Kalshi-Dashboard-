@@ -1,25 +1,47 @@
 import React, { useEffect, useState } from "react";
 import EnvironmentToggle from "./EnvironmentToggle.jsx";
 
+function formatUptime(startedAt) {
+  if (!startedAt) return "—";
+  const ms = Date.now() - new Date(startedAt).getTime();
+  const hours = Math.floor(ms / 3600000);
+  const minutes = Math.floor((ms % 3600000) / 60000);
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24);
+    return `${days}d ${hours % 24}h`;
+  }
+  return `${hours}h ${minutes}m`;
+}
+
 export default function BotControlPanel({ apiBase }) {
   const [status, setStatus] = useState(null);
   const [log, setLog] = useState([]);
+  const [cumulativePnl, setCumulativePnl] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [confirmingStop, setConfirmingStop] = useState(false);
+  const [, forceTick] = useState(0); // re-render every minute so uptime stays live
 
   async function refresh() {
     try {
-      const [statusRes, logRes] = await Promise.all([
+      const [statusRes, logRes, pnlRes] = await Promise.all([
         fetch(`${apiBase}/api/bot/status`).then((r) => r.json()),
         fetch(`${apiBase}/api/bot/log?limit=20`).then((r) => r.json()),
+        fetch(`${apiBase}/api/pnl-history`).then((r) => r.json()),
       ]);
       setStatus(statusRes);
       setLog(logRes.log ?? []);
+      const series = pnlRes.series ?? [];
+      setCumulativePnl(series.length ? series[series.length - 1].cumulativePnl : 0);
     } catch (err) { setError(err.message); }
   }
 
-  useEffect(() => { refresh(); const i = setInterval(refresh, 15000); return () => clearInterval(i); }, []);
+  useEffect(() => {
+    refresh();
+    const i = setInterval(refresh, 15000);
+    const tick = setInterval(() => forceTick((n) => n + 1), 60000);
+    return () => { clearInterval(i); clearInterval(tick); };
+  }, []);
 
   async function startBot() {
     setBusy(true); setError(null);
@@ -42,6 +64,8 @@ export default function BotControlPanel({ apiBase }) {
   }
 
   if (!status) return <div className="panel"><h2>Bot Control</h2><p className="muted">Loading status...</p></div>;
+
+  const stats = status.tradeStats || { totalEntries: 0, totalExits: 0 };
 
   return (
     <div className="panel bot-panel">
@@ -77,6 +101,20 @@ export default function BotControlPanel({ apiBase }) {
           </div>
         </div>
       )}
+
+      <div className="bot-subsection">
+        <h3>Stats</h3>
+        <div className="cost-row"><span>Uptime</span><span>{status.running ? formatUptime(status.botStartedAt) : "not running"}</span></div>
+        <div className="cost-row"><span>Trades entered</span><span>{stats.totalEntries}</span></div>
+        <div className="cost-row"><span>Trades exited</span><span>{stats.totalExits}</span></div>
+        <div className="cost-row">
+          <span>Accumulated earnings (settled)</span>
+          <span className={cumulativePnl > 0 ? "pos" : cumulativePnl < 0 ? "neg" : ""}>
+            {cumulativePnl != null ? `${cumulativePnl >= 0 ? "+" : ""}$${cumulativePnl.toFixed(2)}` : "—"}
+          </span>
+        </div>
+      </div>
+
       <div className="bot-subsection">
         <h3>Open Positions ({status.openPositions?.length ?? 0})</h3>
         {!status.openPositions?.length ? <div className="empty-state">No open positions from the bot.</div> : (
