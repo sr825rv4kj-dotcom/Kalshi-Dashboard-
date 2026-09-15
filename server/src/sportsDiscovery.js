@@ -1,5 +1,5 @@
 /**
- * sportsDiscovery.js
+ * sportsDiscovery.
  *
  * Asks The-Odds-API which sports are actually active right now instead of
  * reading a hand-maintained list. Their /sports endpoint returns every sport
