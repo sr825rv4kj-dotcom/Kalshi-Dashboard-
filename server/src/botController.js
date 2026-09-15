@@ -7,9 +7,9 @@ import { getPolymarketProbability } from "./polymarketScraper.js";
 import { assessOpportunity } from "./riskManager.js";
 import { enterPosition, exitPosition } from "./executor.js";
 import { loadState, saveState, appendLog } from "./stateStore.js";
-import { loadConfig, saveConfig } from "./configStore.js";
-import { computeAdaptiveIntervalMinutes } from "./quotaScheduler.js";
-import { getInSeasonSports, getOutOfSeasonSports } from "./seasonCalendar.js";
+import { loadConfig } from "./configStore.js";
+import { discoverActiveSports } from "./sportsDiscovery.js";
+import { currentCadenceSeconds, describeCadence } from "./cadence.js";
 import { resolveTicker } from "./tickerResolver.js";
 import { notifyMilestone, notifyDailyHalt, notifyDailySummary } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
@@ -99,18 +99,28 @@ function atConcurrentPositionCap(config, bankroll) {
   return state.positions.length >= cap;
 }
 
-
-
+/**
+ * Entry timing gate. With entryWindowHours set to null/0 the gate is OFF
+ * entirely - pre-game AND in-progress games are both tradeable, which is
+ * what "no windows, trade live games" means.
+ *
+ * Note: when a game is already in progress, any pre-game sharp line the
+ * odds provider returns is stale by definition. The price-threshold path
+ * below is what actually drives in-play entries.
+ */
 function withinEntryWindow(commenceTime, entryWindowHours) {
-  if (!commenceTime) return { ok: false, reason: "no start time available for this event" };
+  if (!entryWindowHours) return { ok: true, live: true };
+  if (!commenceTime) return { ok: true, live: false };
+
   const startMs = new Date(commenceTime).getTime();
   const nowMs = Date.now();
-  if (nowMs >= startMs) return { ok: false, reason: "game has already started - pre-game odds are stale" };
+  if (nowMs >= startMs) return { ok: true, live: true };
+
   const hoursUntilStart = (startMs - nowMs) / (1000 * 60 * 60);
   if (hoursUntilStart > entryWindowHours) {
     return { ok: false, reason: `starts in ${hoursUntilStart.toFixed(1)}h, outside the ${entryWindowHours}h entry window` };
   }
-  return { ok: true, hoursUntilStart };
+  return { ok: true, hoursUntilStart, live: false };
 }
 
 async function checkDailyHalt(config) {
@@ -150,8 +160,20 @@ async function checkOpenPositions(config) {
       const bestBid = levels && levels.length ? levels[0][0] : null;
       if (bestBid == null) continue;
 
+      // What the position is worth right now vs what was paid for it.
+      const costCents = position.entryPriceCents * position.contracts;
+      const valueCents = bestBid * position.contracts;
       const adverseMovePct = (position.entryPriceCents - bestBid) / position.entryPriceCents;
-      if (adverseMovePct >= config.perPositionStopLossPct) {
+
+      // exitBelowCost: bail the moment the position is worth less than it cost.
+      // This is the tightest possible stop - it will exit on ordinary noise,
+      // and every such exit still pays the round-trip fee.
+      if (config.exitBelowCost && valueCents < costCents) {
+        appendLog(
+          `Position ${position.ticker} worth ${(valueCents / 100).toFixed(2)} vs ${(costCents / 100).toFixed(2)} paid - exiting below cost.`, "warn"
+        );
+        await exitPosition(position, "below-cost");
+      } else if (adverseMovePct >= config.perPositionStopLossPct) {
         appendLog(
           `Position ${position.ticker} down ${(adverseMovePct * 100).toFixed(1)}% from entry - cutting loss now.`, "warn"
         );
@@ -167,7 +189,6 @@ async function runPolymarketCycle(config, bankroll) {
   const polyMap = loadPolymarketMap();
   const entries = Object.entries(polyMap);
   if (entries.length === 0) {
-    appendLog("Polymarket map is empty - nothing to scan.");
     return;
   }
 
@@ -191,8 +212,8 @@ async function runPolymarketCycle(config, bankroll) {
       const marketRes = await kalshiGet(`${V2}/markets/${ticker}`);
       market = marketRes.market;
     } catch (err) {
-      appendLog(`Could not fetch Kalshi market ${ticker}: ${err.message}`, "warn");
       continue;
+    }
     }
     if (!market || market.status !== "open") continue;
 
@@ -206,7 +227,6 @@ async function runPolymarketCycle(config, bankroll) {
     });
 
     if (assessment.action === "skip") {
-      appendLog(`Skip (non-sports) ${ticker}: ${assessment.reason}`);
       continue;
     }
 
@@ -218,34 +238,8 @@ async function runPolymarketCycle(config, bankroll) {
     await enterPosition({
       ticker, side: "yes", priceCents: market.yes_ask, contracts: assessment.sizing.contracts,
       reason: `Polymarket-vs-Kalshi consensus mismatch on slug "${slug}" (non-sports, lower confidence)`,
-              edgePct: assessment.edgeCheck.observedEdge * 100,
-        teamName, sportKey, commenceTime,
-      });
-
-  }
-}
-
-function maybeAdjustScanInterval(config, latestQuotaRemaining, sportsScannedThisCycle) {
-  if (latestQuotaRemaining == null || !sportsScannedThisCycle) return;
-  const creditsPerScan = sportsScannedThisCycle * 2; // 1 market x 2 regions per sport
-  const newInterval = computeAdaptiveIntervalMinutes({ remainingCredits: latestQuotaRemaining, creditsPerScan });
-  if (!newInterval) return;
-
-  const current = config.scanIntervalMinutes;
-  const percentChange = Math.abs(newInterval - current) / current;
-  if (percentChange < 0.2) return;
-
-  appendLog(
-    `Adjusting scan interval from ${current}m to ${newInterval}m based on remaining quota ` +
-    `(${latestQuotaRemaining} credits, ~${creditsPerScan}/scan). Automatic - no action needed on upgrade.`
-  );
-  saveConfig({ scanIntervalMinutes: newInterval });
-
-  if (intervalHandle) {
-    clearInterval(intervalHandle);
-    intervalHandle = setInterval(() => {
-      runCycle().catch((err) => appendLog(`Cycle error: ${err.message}`, "error"));
-    }, newInterval * 60 * 1000);
+      edgePct: assessment.edgeCheck.observedEdge * 100,
+    });
   }
 }
 
@@ -270,12 +264,12 @@ export async function runCycle() {
     await runPolymarketCycle(config, bankroll);
   }
 
-  let latestQuotaRemaining = null;
-
-  const activeSports = getInSeasonSports(config.sportsPool || config.sports);
-  const skippedSports = getOutOfSeasonSports(config.sportsPool || config.sports);
-  if (skippedSports.length) {
-    appendLog(`Skipping out-of-season: ${skippedSports.join(", ")}`);
+  // Which sports are live right now comes straight from the odds provider -
+  // nothing to maintain, seasons handle themselves.
+  const activeSports = await discoverActiveSports();
+  if (!activeSports.length) {
+    appendLog("No active sports returned by the odds provider.", "warn");
+    return;
   }
 
   for (const sportKey of activeSports) {
@@ -284,20 +278,8 @@ export async function runCycle() {
       const tournamentId = (config.oddsPapiTournamentIds || {})[sportKey];
       probResult = await getSharpProbabilities(sportKey, { oddsPapiTournamentId: tournamentId, providerOrder: config.oddsProviderOrder });
     } catch (err) {
-      appendLog(`Odds fetch failed for ${sportKey}: ${err.message}`, "error");
       continue;
     }
-
-    if (probResult.fallbackReason) {
-      appendLog(`${sportKey}: primary odds source failed (${probResult.fallbackReason}), used fallback.`, "warn");
-    }
-
-    appendLog(
-      `Scanned ${sportKey} via ${probResult.provider}: ${Object.keys(probResult.probabilities).length} lines found ` +
-      `(quota remaining: ${probResult.quota?.remaining ?? "n/a"})`
-    );
-
-    if (probResult.quota?.remaining != null) latestQuotaRemaining = Number(probResult.quota.remaining);
 
     for (const [teamName, { trueProbability, commenceTime }] of Object.entries(probResult.probabilities)) {
       if (atConcurrentPositionCap(config, bankroll)) {
@@ -308,26 +290,18 @@ export async function runCycle() {
       let ticker = tickerMap[teamName];
       if (!ticker) {
         const resolved = await resolveTicker({ sportKey, teamName, commenceTime });
-        if (!resolved.ticker) {
-          appendLog(`Skip "${teamName}": ${resolved.reason}`);
-          continue;
-        }
+        if (!resolved.ticker) continue;
         ticker = resolved.ticker;
-        appendLog(`Auto-resolved "${teamName}" -> ${ticker}`);
       }
 
-      const windowCheck = withinEntryWindow(commenceTime, config.entryWindowHours ?? 4);
-      if (!windowCheck.ok) {
-        appendLog(`Skip ${ticker}: ${windowCheck.reason}`);
-        continue;
-      }
+      const windowCheck = withinEntryWindow(commenceTime, config.entryWindowHours);
+      if (!windowCheck.ok) continue;
 
       let market;
       try {
         const marketRes = await kalshiGet(`${V2}/markets/${ticker}`);
         market = marketRes.market;
       } catch (err) {
-        appendLog(`Could not fetch Kalshi market ${ticker}: ${err.message}`, "warn");
         continue;
       }
       if (!market || market.status !== "open") continue;
@@ -341,9 +315,29 @@ export async function runCycle() {
         survivalMode: config.survivalMode,
       });
 
-      if (assessment.action === "skip") {
-        appendLog(`Skip ${ticker}: ${assessment.reason}`);
+      // Two independent ways in:
+      //   1. the fee-aware edge check clears (the original, stricter path), or
+      //   2. the contract is priced at or above minEntryPriceCents.
+      // Path 2 has no edge signal behind it - it trades on price level alone.
+      const minEntryPriceCents = config.minEntryPriceCents ?? 40;
+      const meetsPriceFloor = market.yes_ask >= minEntryPriceCents;
+
+      if (assessment.action === "skip" && !meetsPriceFloor) {
         continue;
+      }
+
+      const viaPriceFloor = assessment.action === "skip" && meetsPriceFloor;
+
+      if (viaPriceFloor) {
+        // The risk manager declined, so it gave us no size. Fall back to the
+        // configured flat stake so the trade is still bounded.
+        const flatDollars = (config.survivalMode && bankroll < config.survivalMode.balanceThreshold)
+          ? (config.survivalMode.flatBetDollars ?? 1)
+          : (config.priceFloorStakeDollars ?? 1);
+        const contracts = Math.floor((flatDollars * 100) / market.yes_ask);
+        if (contracts <= 0) continue;
+        assessment.sizing = { contracts, dollarsAtRisk: (contracts * market.yes_ask) / 100, mode: "price-floor" };
+        assessment.edgeCheck = { observedEdge: 0, requiredEdge: 0, margin: 0, qualifies: false };
       }
 
       appendLog(
@@ -354,21 +348,44 @@ export async function runCycle() {
 
       await enterPosition({
         ticker, side: "yes", priceCents: market.yes_ask, contracts: assessment.sizing.contracts,
-        reason: `Sharp-book edge via ${probResult.provider} on "${teamName}" (true prob ${(trueProbability * 100).toFixed(1)}% vs price ${(priceDollars * 100).toFixed(0)}c)` +
-          (assessment.survivalMode ? " [survival mode]" : ""),
+        reason: viaPriceFloor
+          ? `Price-floor entry on "${teamName}" at ${market.yes_ask}c (>= ${minEntryPriceCents}c floor)` +
+            (windowCheck.live ? " [game in progress]" : "") +
+            ` - no sharp-book edge behind this, price level only`
+          : `Sharp-book edge via ${probResult.provider} on "${teamName}" (true prob ${(trueProbability * 100).toFixed(1)}% vs price ${(priceDollars * 100).toFixed(0)}c)` +
+            (windowCheck.live ? " [game in progress]" : "") +
+            (assessment.survivalMode ? " [survival mode]" : ""),
         edgePct: assessment.edgeCheck.observedEdge * 100,
+        teamName, sportKey, commenceTime,
       });
     }
   }
+}
 
-  maybeAdjustScanInterval(config, latestQuotaRemaining, activeSports.length);
+/**
+ * Reschedules itself after every cycle at whatever cadence the current hour
+ * calls for, so the bot tightens up during games and eases off overnight
+ * without anyone setting an interval.
+ */
+function scheduleNextCycle() {
+  if (intervalHandle) clearTimeout(intervalHandle);
+  const seconds = currentCadenceSeconds();
+  intervalHandle = setTimeout(async () => {
+    try {
+      await runCycle();
+    } catch (err) {
+      appendLog(`Cycle error: ${err.message}`, "error");
+    }
+    if (intervalHandle) scheduleNextCycle();
+  }, seconds * 1000);
 }
 
 export function startBot() {
   const config = loadConfig();
   if (intervalHandle) return { alreadyRunning: true };
 
-  appendLog(`Bot starting in ${config.environment.toUpperCase()} mode. Scan interval: ${config.scanIntervalMinutes} minutes.`);
+  const { seconds, phase } = describeCadence();
+  appendLog(`Bot started (${config.environment}). Scanning every ${seconds}s (${phase}).`);
 
   const state = loadState();
   state.running = true;
@@ -376,9 +393,7 @@ export function startBot() {
   saveState(state);
 
   runCycle().catch((err) => appendLog(`Cycle error: ${err.message}`, "error"));
-  intervalHandle = setInterval(() => {
-    runCycle().catch((err) => appendLog(`Cycle error: ${err.message}`, "error"));
-  }, config.scanIntervalMinutes * 60 * 1000);
+  scheduleNextCycle();
 
   // Independent, much faster loop that only watches positions already open -
   // for tight stop-loss reaction time without re-scanning the whole market
@@ -394,7 +409,7 @@ export function startBot() {
 
 export function stopBot() {
   if (intervalHandle) {
-    clearInterval(intervalHandle);
+    clearTimeout(intervalHandle);
     intervalHandle = null;
   }
   if (positionMonitorHandle) {
