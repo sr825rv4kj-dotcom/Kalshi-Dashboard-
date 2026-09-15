@@ -3,7 +3,6 @@ import path from "path";
 import { CONFIG_DIR } from "./paths.js";
 import { kalshiGet } from "./kalshiClient.js";
 import { getSharpProbabilities } from "./scraper.js";
-import { getPolymarketProbability } from "./polymarketScraper.js";
 import { assessOpportunity } from "./riskManager.js";
 import { enterPosition, exitPosition } from "./executor.js";
 import { loadState, saveState, appendLog } from "./stateStore.js";
@@ -16,7 +15,6 @@ import { getTelegramCredentials } from "./telegramStore.js";
 import { getRecentTrades } from "./tradeLedgerStore.js";
 
 const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
-const POLYMARKET_MAP_PATH = path.join(CONFIG_DIR, "polymarket-map.json");
 const V2 = "/trade-api/v2";
 
 let intervalHandle = null;
@@ -25,12 +23,6 @@ const POSITION_MONITOR_INTERVAL_MS = 90 * 1000; // 90s - independent of the main
 
 function loadTickerMap() {
   const raw = JSON.parse(fs.readFileSync(TICKER_MAP_PATH, "utf8"));
-  const { _comment, _example, ...map } = raw;
-  return map;
-}
-
-function loadPolymarketMap() {
-  const raw = JSON.parse(fs.readFileSync(POLYMARKET_MAP_PATH, "utf8"));
   const { _comment, _example, ...map } = raw;
   return map;
 }
@@ -185,64 +177,6 @@ async function checkOpenPositions(config) {
   }
 }
 
-async function runPolymarketCycle(config, bankroll) {
-  const polyMap = loadPolymarketMap();
-  const entries = Object.entries(polyMap);
-  if (entries.length === 0) {
-    return;
-  }
-
-  for (const [slug, ticker] of entries) {
-    if (atConcurrentPositionCap(config, bankroll)) {
-      appendLog(`Max concurrent positions reached - skipping remaining non-sports scan.`, "warn");
-      return;
-    }
-
-    let polyData;
-    try {
-      polyData = await getPolymarketProbability(slug);
-    } catch (err) {
-      appendLog(`Polymarket fetch failed for "${slug}": ${err.message}`, "warn");
-      continue;
-    }
-    if (!polyData || polyData.closed || !polyData.active) continue;
-
-    let market;
-    try {
-      const marketRes = await kalshiGet(`${V2}/markets/${ticker}`);
-      market = marketRes.market;
-    } catch (err) {
-      continue;
-    }
-    }
-    if (!market || market.status !== "open") continue;
-
-    const priceDollars = (market.yes_ask ?? 0) / 100;
-    const restingContracts = market.yes_ask_size ?? 0;
-
-    const assessment = assessOpportunity({
-      bankroll, trueProbability: polyData.trueProbability, price: priceDollars, restingContracts,
-      multiplier: config.feeMultiplier, kellyFraction: config.kellyFraction, minLiquidity: config.minLiquidity,
-      survivalMode: config.survivalMode,
-    });
-
-    if (assessment.action === "skip") {
-      continue;
-    }
-
-    appendLog(
-      `Candidate (non-sports, Polymarket-vs-Kalshi) ${ticker}: edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}%, ` +
-      `sizing ${assessment.sizing.contracts} contracts. Consensus-vs-consensus edge - lower confidence than sports.`
-    );
-
-    await enterPosition({
-      ticker, side: "yes", priceCents: market.yes_ask, contracts: assessment.sizing.contracts,
-      reason: `Polymarket-vs-Kalshi consensus mismatch on slug "${slug}" (non-sports, lower confidence)`,
-      edgePct: assessment.edgeCheck.observedEdge * 100,
-    });
-  }
-}
-
 export async function runCycle() {
   const config = loadConfig();
 
@@ -259,10 +193,6 @@ export async function runCycle() {
   const bankroll = (balanceData.balance ?? 0) / 100;
   await checkMilestones(config, bankroll);
   await checkDailySummary(config, bankroll);
-
-  if (config.nonSportsEnabled) {
-    await runPolymarketCycle(config, bankroll);
-  }
 
   // Which sports are live right now comes straight from the odds provider -
   // nothing to maintain, seasons handle themselves.
