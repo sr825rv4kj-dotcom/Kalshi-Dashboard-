@@ -1,20 +1,26 @@
 /**
  * cadence.js
  *
- * Decides how often to scan based on time of day, so the bot leans in when
- * US sports are actually running and backs off overnight when there is
- * nothing live to trade. No interval to configure.
+ * Scan cadence by time of day. Sized to use the paid odds tier properly
+ * rather than ration it - at ~12 credits per scan against a 5M/month
+ * allowance, the numbers below land around 690k credits/month, with
+ * headroom for the scores endpoint and spikes.
  *
- * Hours are US Eastern, where the large majority of Kalshi's sports volume
- * sits. Overnight still scans - just rarely - so an early match or an
- * overseas fixture is never missed entirely.
+ * Faster scanning shortens the gap between a price moving and the bot
+ * seeing it. It does not create opportunities that aren't there - the edge
+ * threshold and market conditions decide whether anything trades.
+ *
+ * The real ceiling on speed is Kalshi's own rate limits, not odds credits:
+ * every scan also makes Kalshi events/markets calls for ticker resolution.
+ *
+ * Hours are US Eastern, where most of Kalshi's sports volume sits.
  */
 
-const PEAK_MINUTES = 3;       // 12pm - 11pm ET: games in progress
-const SHOULDER_MINUTES = 10;  // 9am - 12pm ET: lines forming, early starts
-const OVERNIGHT_MINUTES = 45; // 11pm - 9am ET: little live, stay cheap
+const PEAK_SECONDS = 30;        // 11am - 12am ET: games live, prices moving
+const SHOULDER_SECONDS = 90;    // 7am - 11am ET: lines forming, early starts
+const OVERNIGHT_SECONDS = 300;  // 12am - 7am ET: overseas fixtures only
 
-export function currentCadenceMinutes(now = new Date()) {
+export function currentCadenceSeconds(now = new Date()) {
   const etHour = Number(
     new Intl.DateTimeFormat("en-US", {
       timeZone: "America/New_York",
@@ -23,14 +29,25 @@ export function currentCadenceMinutes(now = new Date()) {
     }).format(now)
   );
 
-  if (etHour >= 12 && etHour < 23) return PEAK_MINUTES;
-  if (etHour >= 9 && etHour < 12) return SHOULDER_MINUTES;
-  return OVERNIGHT_MINUTES;
+  if (etHour >= 11 || etHour === 0) return PEAK_SECONDS;
+  if (etHour >= 7 && etHour < 11) return SHOULDER_SECONDS;
+  return OVERNIGHT_SECONDS;
 }
 
 export function describeCadence(now = new Date()) {
-  const minutes = currentCadenceMinutes(now);
-  if (minutes === PEAK_MINUTES) return { minutes, phase: "peak" };
-  if (minutes === SHOULDER_MINUTES) return { minutes, phase: "shoulder" };
-  return { minutes, phase: "overnight" };
+  const seconds = currentCadenceSeconds(now);
+  if (seconds === PEAK_SECONDS) return { seconds, phase: "peak" };
+  if (seconds === SHOULDER_SECONDS) return { seconds, phase: "shoulder" };
+  return { seconds, phase: "overnight" };
+}
+
+/** Rough monthly credit burn at the current cadence, for the dashboard. */
+export function estimateMonthlyCredits(activeSportCount = 6) {
+  const creditsPerScan = activeSportCount * 2;
+  let scansPerDay = 0;
+  for (let h = 0; h < 24; h++) {
+    const probe = new Date(Date.UTC(2026, 0, 1, (h + 5) % 24, 0));
+    scansPerDay += 3600 / currentCadenceSeconds(probe);
+  }
+  return Math.round(scansPerDay * creditsPerScan * 30);
 }
