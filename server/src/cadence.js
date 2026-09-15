@@ -51,3 +51,4 @@ export function estimateMonthlyCredits(activeSportCount = 6) {
   }
   return Math.round(scansPerDay * creditsPerScan * 30);
 }
+
