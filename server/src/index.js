@@ -153,8 +153,13 @@ app.get("/api/positions", async (_req, res) => {
       realizedPnlDollars: p.realized_pnl_dollars != null
         ? Number(p.realized_pnl_dollars)
         : (p.realized_pnl ?? 0) / 100,
-      resting_orders_count: p.resting_orders_count,
-    }));
+         resting_orders_count: p.resting_orders_count,
+    }))
+    // Kalshi keeps returning settled holdings at 0 contracts. Those aren't
+    // positions you hold, so they don't belong in an "open positions" table.
+    .filter((p) => p.position !== 0);
+    res.json({ positions });
+
     res.json({ positions });
   } catch (err) {
     res.status(500).json({ error: err.message });
