@@ -15,9 +15,6 @@
  *
  * Hours are US Eastern, where most of Kalshi's sports volume sits.
  */
-
-const PEAK_SECONDS = 30;        // 11am - 12am ET: games live, prices moving
-const SHOULDER_SECONDS = 90;    // 7am - 11am ET: lines forming, early starts
 const OVERNIGHT_SECONDS = 300;  // 12am - 7am ET: overseas fixtures only
     for (const [teamName, { trueProbability, commenceTime }] of Object.entries(probResult.probabilities)) {
       if (atConcurrentPositionCap(config, bankroll)) {
