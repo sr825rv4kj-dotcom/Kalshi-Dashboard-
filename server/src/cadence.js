@@ -2,9 +2,7 @@
  * cadence.js
  *
  * Scan cadence by time of day. Sized to use the paid odds tier properly
- * rather than ration it - at ~12 credits per scan against a 5M/month
- * allowance, the numbers below land around 690k credits/month, with
- * headroom for the scores endpoint and spikes.
+ * rather than ration it.
  *
  * Faster scanning shortens the gap between a price moving and the bot
  * seeing it. It does not create opportunities that aren't there - the edge
@@ -15,33 +13,10 @@
  *
  * Hours are US Eastern, where most of Kalshi's sports volume sits.
  */
+
+const PEAK_SECONDS = 20;        // 11am - 12am ET: games live, prices moving
+const SHOULDER_SECONDS = 60;    // 7am - 11am ET: lines forming, early starts
 const OVERNIGHT_SECONDS = 300;  // 12am - 7am ET: overseas fixtures only
-    for (const [teamName, { trueProbability, commenceTime }] of Object.entries(probResult.probabilities)) {
-      if (atConcurrentPositionCap(config, bankroll)) {
-        appendLog(`Max concurrent positions reached - skipping remaining candidates this cycle.`, "warn");
-        return;
-      }
-
-      let ticker = tickerMap[teamName];
-      if (!ticker) {
-        const resolved = await resolveTicker({ sportKey, teamName, commenceTime });
-        if (!resolved.ticker) continue;
-        ticker = resolved.ticker;
-      }
-
-      const windowCheck = withinEntryWindow(commenceTime, config.entryWindowHours);
-      if (!windowCheck.ok) continue;
-
-      let market;
-      try {
-        const marketRes = await kalshiGet(`${V2}/markets/${ticker}`);
-        market = marketRes.market;
-      } catch (err) {
-        continue;
-      }
-      if (!market || market.status !== "open") continue;
-
-      const priceDollars
 
 export function currentCadenceSeconds(now = new Date()) {
   const etHour = Number(
@@ -74,4 +49,3 @@ export function estimateMonthlyCredits(activeSportCount = 6) {
   }
   return Math.round(scansPerDay * creditsPerScan * 30);
 }
-
