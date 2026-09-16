@@ -1,16 +1,8 @@
 /**
- * tickerResolver.js
- *
- * Finds the correct, currently-open Kalshi market for a given sportsbook
- * team name and kickoff time. Safety comes from two hard filters applied
- * BEFORE any text comparison:
- *
- *   1. Series filter - only looks within that sport's own Kalshi series.
- *   2. Time filter - only events within MATCH_WINDOW_HOURS of kickoff.
- *
- * Kalshi titles games by city ("Seattle vs Texas") while sportsbooks send
- * full names ("Seattle Mariners"), so matching is on any significant word.
- * Three-way sports (soccer, where "draw" is an outcome) are excluded.
+ * Resolves a sportsbook team name + kickoff time to a live Kalshi ticker.
+ * Filters by sport series and time window before any text matching.
+ * Kalshi titles games by city ("Seattle vs Texas"); sportsbooks send full
+ * names ("Seattle Mariners"), so matching is on any significant word.
  */
 
 import { kalshiGet } from "./kalshiClient.js";
@@ -28,74 +20,70 @@ export const SPORT_SERIES_MAP = {
   icehockey_nhl: "KXNHLGAME",
 };
 
-const eventListCache = new Map();
+const NON_TEAM_OUTCOMES = new Set(["draw", "tie"]);
+const cache = new Map();
 
-function normalize(text) {
-  return (text || "").toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
+function normalize(t) {
+  return (t || "").toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
 }
 
-async function getOpenEvents(seriesTicker) {
-  const cached = eventListCache.get(seriesTicker);
-  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached.events;
+function eventTime(e) {
+  return e.strike_date ?? e.expected_expiration_time;
+}
 
-  const data = await kalshiGet(`${V2}/events`, `?series_ticker=${seriesTicker}&status=open&with_nested_markets=true`);
+async function getOpenEvents(series) {
+  const hit = cache.get(series);
+  if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.events;
+  const data = await kalshiGet(`${V2}/events`, `?series_ticker=${series}&status=open&with_nested_markets=true`);
   const events = data.events ?? [];
-  eventListCache.set(seriesTicker, { events, fetchedAt: Date.now() });
+  cache.set(series, { events, at: Date.now() });
   return events;
 }
-
-function withinTimeWindow(eventTime, targetTime, hours) {
-  if (!eventTime) return false;
-  const diffMs = Math.abs(new Date(eventTime).getTime() - new Date(targetTime).getTime());
-  return diffMs <= hours * 60 * 60 * 1000;
-}
-
-const NON_TEAM_OUTCOMES = new Set(["draw", "tie"]);
 
 export async function resolveTicker({ sportKey, teamName, commenceTime }) {
   if (NON_TEAM_OUTCOMES.has((teamName || "").toLowerCase().trim())) {
     return { ticker: null, reason: "draw/tie is not a two-sided market" };
   }
-  const seriesTicker = SPORT_SERIES_MAP[sportKey];
-  if (!seriesTicker) {
-    return { ticker: null, reason: `no Kalshi series mapping configured for "${sportKey}"` };
-  }
+
+  const series = SPORT_SERIES_MAP[sportKey];
+  if (!series) return { ticker: null, reason: `no Kalshi series for "${sportKey}"` };
 
   let events;
   try {
-    events = await getOpenEvents(seriesTicker);
+    events = await getOpenEvents(series);
   } catch (err) {
-    return { ticker: null, reason: `Kalshi events fetch failed for ${seriesTicker}: ${err.message}` };
+    return { ticker: null, reason: `${series} events fetch failed: ${err.message}` };
   }
 
-  const timeMatches = events.filter((e) =>
-    withinTimeWindow(e.strike_date ?? e.expected_expiration_time, commenceTime, MATCH_WINDOW_HOURS)
-  );
-  if (timeMatches.length === 0) {
-    return { ticker: null, reason: `no ${seriesTicker} event within ${MATCH_WINDOW_HOURS}h of kickoff (${events.length} open events total)` };
-  }
-
-  // Kalshi titles games by city ("Seattle vs Texas") while sportsbooks send
-  // full names ("Seattle Mariners"). Matching on ANY significant word handles
-  // both directions - city-only titles and nickname-only subtitles.
-  const teamWords = normalize(teamName).split(" ").filter((w) => w.length > 2);
-  if (!teamWords.length) {
-    return { ticker: null, reason: `no usable words in team name "${teamName}"` };
-  }
-
-  const candidates = timeMatches.filter((event) => {
-    const title = normalize(event.title);
-    return teamWords.some((w) => title.includes(w));
+  const target = new Date(commenceTime).getTime();
+  const inWindow = events.filter((e) => {
+    const t = eventTime(e);
+    return t && Math.abs(new Date(t).getTime() - target) <= MATCH_WINDOW_HOURS * 3600 * 1000;
   });
-
-  if (candidates.length === 0) {
-    return { ticker: null, reason: `no title match for "${teamName}" among ${timeMatches.length} event(s), e.g. "${timeMatches[0].title}"` };
+  if (!inWindow.length) {
+    return { ticker: null, reason: `no ${series} event within ${MATCH_WINDOW_HOURS}h (${events.length} open total)` };
   }
 
-  // A team can appear in more than one upcoming fixture. The sportsbook gave
-  // us an exact kickoff time, so take the event closest to it.
-  const event = candidates.reduce((best, e) => {
-    const t = (ev) => Math.abs(
-      new Date(ev.strike_date ?? ev.expected_expiration_time).getTime() - new Date(commenceTime).getTime()
-    );
-    return t(e) 
+  const words = normalize(teamName).split(" ").filter((w) => w.length > 2);
+  if (!words.length) return { ticker: null, reason: `no usable words in "${teamName}"` };
+
+  const matches = inWindow.filter((e) => words.some((w) => normalize(e.title).includes(w)));
+  if (!matches.length) {
+    return { ticker: null, reason: `no title match for "${teamName}" among ${inWindow.length}, e.g. "${inWindow[0].title}"` };
+  }
+
+  // A team can appear in several fixtures; take the one closest to the
+  // sportsbook's kickoff time rather than guessing.
+  const event = matches.reduce((best, e) =>
+    Math.abs(new Date(eventTime(e)).getTime() - target) < Math.abs(new Date(eventTime(best)).getTime() - target) ? e : best
+  );
+
+  const market = (event.markets ?? []).find((m) =>
+    words.some((w) => normalize(`${m.yes_sub_title ?? ""} ${m.subtitle ?? ""} ${m.title ?? ""}`).includes(w))
+  );
+  if (!market) {
+    return { ticker: null, reason: `matched "${event.title}" but no side matched "${teamName}"` };
+  }
+
+  return { ticker: market.ticker, reason: `resolved via ${series} "${event.title}"` };
+}
