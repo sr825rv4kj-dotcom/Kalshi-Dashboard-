@@ -1,6 +1,14 @@
 import { getTodayTheme, THEMES } from '../themes.js';
 import React, { useEffect, useState } from "react";
+const [theme, setTheme] = useState(getTodayTheme());
+const [animationPhase, setAnimationPhase] = useState(0);
 
+useEffect(() => {
+  const interval = setInterval(() => {
+    setAnimationPhase((p) => (p + 1) % 360);
+  }, 50);
+  return () => clearInterval(interval);
+}, []);
 export default function BackgroundSettings({ apiBase }) {
   const [hasBackground, setHasBackground] = useState(false);
   const [busy, setBusy] = useState(false);
