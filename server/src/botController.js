@@ -211,30 +211,59 @@ export async function runCycle() {
       continue;
     }
 
-    for (const [teamName, { trueProbability, commenceTime }] of Object.entries(probResult.probabilities)) {
-      if (atConcurrentPositionCap(config, bankroll)) {
-        appendLog(`Max concurrent positions reached - skipping remaining candidates this cycle.`, "warn");
-        return;
-      }
+    // Resolve tickers and pull market prices for every team in parallel.
+    // Sequentially this was one round-trip per team (24+ for MLB alone),
+    // which is what put entry latency into minutes rather than seconds.
+    const teamEntries = Object.entries(probResult.probabilities);
+    const drops = { window: 0, unresolved: 0, marketClosed: 0, marketError: 0 };
+    let sampleUnresolved = null;
+
+    const prepared = await Promise.all(teamEntries.map(async ([teamName, info]) => {
+      const { trueProbability, commenceTime } = info;
+
+      const windowCheck = withinEntryWindow(commenceTime, config.entryWindowHours);
+      if (!windowCheck.ok) { drops.window++; return null; }
 
       let ticker = tickerMap[teamName];
       if (!ticker) {
         const resolved = await resolveTicker({ sportKey, teamName, commenceTime });
-        if (!resolved.ticker) continue;
+        if (!resolved.ticker) {
+          drops.unresolved++;
+          if (!sampleUnresolved) sampleUnresolved = `${teamName}: ${resolved.reason}`;
+          return null;
+        }
         ticker = resolved.ticker;
       }
 
-      const windowCheck = withinEntryWindow(commenceTime, config.entryWindowHours);
-      if (!windowCheck.ok) continue;
-
-      let market;
       try {
         const marketRes = await kalshiGet(`${V2}/markets/${ticker}`);
-        market = marketRes.market;
-      } catch (err) {
-        continue;
+        const market = marketRes.market;
+        if (!market || market.status !== "open") { drops.marketClosed++; return null; }
+        return { teamName, trueProbability, commenceTime, ticker, market, windowCheck };
+      } catch {
+        drops.marketError++;
+        return null;
       }
-      if (!market || market.status !== "open") continue;
+    }));
+
+    const viable = prepared.filter(Boolean);
+    const rejected = [];
+
+    appendLog(
+      `${sportKey}: ${teamEntries.length} lines -> ${viable.length} tradeable ` +
+      `(dropped: ${drops.unresolved} unresolved, ${drops.window} out-of-window, ` +
+      `${drops.marketClosed} market closed, ${drops.marketError} fetch error)` +
+      (sampleUnresolved ? ` | e.g. ${sampleUnresolved}` : "")
+    );
+
+    for (const candidate of prepared) {
+      if (!candidate) continue;
+      const { teamName, trueProbability, commenceTime, ticker, market, windowCheck } = candidate;
+
+      if (atConcurrentPositionCap(config, bankroll)) {
+        appendLog(`Max concurrent positions reached - skipping remaining candidates this cycle.`, "warn");
+        return;
+      }
 
       const priceDollars = (market.yes_ask ?? 0) / 100;
       const restingContracts = market.yes_ask_size ?? 0;
@@ -253,6 +282,7 @@ export async function runCycle() {
       const meetsPriceFloor = market.yes_ask >= minEntryPriceCents;
 
       if (assessment.action === "skip" && !meetsPriceFloor) {
+        rejected.push(`${ticker} ${market.yes_ask}c: ${assessment.reason}`);
         continue;
       }
 
@@ -288,6 +318,10 @@ export async function runCycle() {
         edgePct: assessment.edgeCheck.observedEdge * 100,
         teamName, sportKey, commenceTime,
       });
+    }
+
+    if (rejected.length) {
+      appendLog(`${sportKey}: ${rejected.length} tradeable market(s) failed entry checks. First: ${rejected[0]}`);
     }
   }
 }
