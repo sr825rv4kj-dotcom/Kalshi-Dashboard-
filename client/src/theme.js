@@ -1,52 +1,91 @@
+/**
+ * theme.js
+ *
+ * Palette variants that sit on top of the iOS-style base in index.css.
+ * All of them keep the same structure - system typeface, grouped cards,
+ * hairline separators - and vary only the accent and field tones.
+ */
+
 const THEMES = {
-  ledger: {
-    name: "Ledger",
+  daylight: {
+    name: "Daylight",
     vars: {
-      "--bg": "#0b0f14",
-      "--panel": "#121821",
-      "--panel-border": "#202a35",
-      "--text": "#e7ecef",
-      "--muted": "#7c8a99",
-      "--positive": "#3ed598",
-      "--negative": "#ff6b5e",
-      "--accent": "#f5a623",
-      "--heading-font": "'Fraunces', serif",
-      "--heading-weight": "600",
-      "--heading-transform": "none",
-      "--heading-letter-spacing": "-0.01em",
-      "--panel-radius": "6px",
+      "--field": "#f2f2f7",
+      "--card": "#ffffff",
+      "--label": "#1c1c1e",
+      "--blue": "#007aff",
+      "--green": "#34c759",
+      "--red": "#ff3b30",
+      "--orange": "#ff9500",
     },
   },
-  hypebeast: {
-    name: "Hypebeast",
+  graphite: {
+    name: "Graphite",
     vars: {
-      "--bg": "#0a0a0a",
-      "--panel": "#161616",
-      "--panel-border": "#2e2e2e",
-      "--text": "#f5f5f0",
-      "--muted": "#8a8a85",
-      "--positive": "#c9ff3d",
-      "--negative": "#ff3d5a",
-      "--accent": "#ff3d5a",
-      "--heading-font": "'Inter', sans-serif",
-      "--heading-weight": "900",
-      "--heading-transform": "uppercase",
-      "--heading-letter-spacing": "0.02em",
-      "--panel-radius": "2px",
+      "--field": "#eceff3",
+      "--card": "#ffffff",
+      "--label": "#11161d",
+      "--blue": "#3a5a8c",
+      "--green": "#2f9e63",
+      "--red": "#d1453b",
+      "--orange": "#c47d1a",
+    },
+  },
+  dusk: {
+    name: "Dusk",
+    vars: {
+      "--field": "#1c1c1e",
+      "--card": "#2c2c2e",
+      "--label": "#f2f2f7",
+      "--label-secondary": "rgba(235, 235, 245, 0.6)",
+      "--label-tertiary": "rgba(235, 235, 245, 0.3)",
+      "--separator": "rgba(235, 235, 245, 0.2)",
+      "--fill": "rgba(120, 120, 128, 0.24)",
+      "--blue": "#0a84ff",
+      "--green": "#30d158",
+      "--red": "#ff453a",
+      "--orange": "#ff9f0a",
     },
   },
 };
 
+export const THEME_KEYS = Object.keys(THEMES);
+
+export function getTheme(key) {
+  return THEMES[key] ? { key, ...THEMES[key] } : { key: "daylight", ...THEMES.daylight };
+}
+
 export function getTodaysTheme() {
-  const now = new Date();
-  const startOfYear = new Date(now.getFullYear(), 0, 0);
-  const dayOfYear = Math.floor((now - startOfYear) / 86400000);
-  const key = dayOfYear % 2 === 0 ? "ledger" : "hypebeast";
-  return { key, ...THEMES[key] };
+  // Safari throws a SecurityError on localStorage access when site data is
+  // blocked or in Private Browsing - a `typeof` check is not enough. This
+  // runs inside a useState initializer, so an uncaught throw here takes the
+  // whole app down to a white screen.
+  let saved = null;
+  try {
+    saved = localStorage.getItem("kalshi_theme");
+  } catch {
+    saved = null;
+  }
+  if (saved && THEMES[saved]) return { key: saved, ...THEMES[saved] };
+  return { key: "daylight", ...THEMES.daylight };
+}
+
+export function setTheme(key) {
+  try {
+    localStorage.setItem("kalshi_theme", key);
+  } catch {
+    // Preference just won't persist - not worth breaking the app over.
+  }
+  return getTheme(key);
 }
 
 export function applyTheme(theme) {
   const root = document.documentElement;
+  // Clear any vars a previous theme set that this one doesn't, so switching
+  // never leaves a stale value behind.
+  for (const t of Object.values(THEMES)) {
+    for (const prop of Object.keys(t.vars)) root.style.removeProperty(prop);
+  }
   for (const [prop, value] of Object.entries(theme.vars)) {
     root.style.setProperty(prop, value);
   }
