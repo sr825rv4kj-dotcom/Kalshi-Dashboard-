@@ -1,9 +1,9 @@
 /**
- * sportsDiscovery.
+ * sportsDiscovery.js
  *
  * Asks The-Odds-API which sports are actually active right now instead of
  * reading a hand-maintained list. Their /sports endpoint returns every sport
- * with an `active` flag and - per their docs - does not count against quota.
+ * with an `active` flag and does not count against quota.
  *
  * Result: no sports pool to maintain. Seasons start and end on their own.
  */
