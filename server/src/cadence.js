@@ -1,12 +1,10 @@
 /**
  * cadence.js
  *
- * Scan cadence by time of day. Sized to use the paid odds tier properly
- * rather than ration it.
- *
- * Faster scanning shortens the gap between a price moving and the bot
- * seeing it. It does not create opportunities that aren't there - the edge
- * threshold and market conditions decide whether anything trades.
+ * Scan cadence by time of day. Faster scanning shortens the gap between a
+ * price moving and the bot seeing it. It does not create opportunities that
+ * aren't there - the edge threshold and market conditions decide whether
+ * anything trades.
  *
  * The real ceiling on speed is Kalshi's own rate limits, not odds credits:
  * every scan also makes Kalshi events/markets calls for ticker resolution.
