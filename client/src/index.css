@@ -263,3 +263,4 @@ input[type="file"] { width: 100%; font-size: 15px; color: var(--label-secondary)
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
