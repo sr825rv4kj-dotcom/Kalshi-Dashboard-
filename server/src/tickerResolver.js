@@ -87,4 +87,3 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
 
   return { ticker: market.ticker, reason: `resolved via ${series} "${event.title}"` };
 }
-
