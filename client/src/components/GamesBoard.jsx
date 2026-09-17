@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { getTeamColor } from "../teamColors.js";
+import { getTeamColor } from "./teamColors.js";
 
 function formatKickoff(iso) {
   if (!iso) return "TBD";
