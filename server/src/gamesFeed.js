@@ -9,7 +9,7 @@
 
 import { kalshiGet } from "./kalshiClient.js";
 import { SPORT_SERIES_MAP } from "./tickerResolver.js";
-import { getInSeasonSports } from "./seasonCalendar.js";
+import { discoverActiveSports } from "./sportsDiscovery.js";
 
 const V2 = "/trade-api/v2";
 
@@ -56,7 +56,7 @@ export async function getUpcomingGames(sportKey) {
  * (already started) sort first, then soonest-upcoming.
  */
 export async function getLiveFeed(sportsPool) {
-  const activeSports = getInSeasonSports(sportsPool);
+  const activeSports = await discoverActiveSports();
   const results = await Promise.all(
     activeSports.map((sportKey) => getUpcomingGames(sportKey).catch(() => ({ games: [] })))
   );
