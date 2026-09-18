@@ -25,12 +25,27 @@ window.fetch = function (input, init) {
   }
   if (!token) return nativeFetch(input, init);
 
-  const next = { ...(init || {}) };
+    const next = { ...(init || {}) };
   const headers = new Headers((init && init.headers) || {});
   if (!headers.has("Authorization")) headers.set("Authorization", "Bearer " + token);
   next.headers = headers;
-  return nativeFetch(input, next);
+
+  return nativeFetch(input, next).then((res) => {
+    // A stored token that the server rejects would otherwise strand you: the
+    // login screen is skipped because a token exists, but every call 401s.
+    // Clearing it and reloading drops you back to a working login.
+    if (res.status === 401 && !url.includes("/api/auth/")) {
+      try {
+        localStorage.removeItem(TOKEN_KEY);
+      } catch {
+        // ignore
+      }
+      window.location.reload();
+    }
+    return res;
+  });
 };
+
 
 /**
  * Without this, any error thrown while rendering leaves an empty <div id="root">
