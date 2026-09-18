@@ -79,6 +79,13 @@ app.use("/api", (req, res, next) => {
   next();
 });
 
+/**
+ * Sits behind the gate above, so a 200 here means the caller's token is still
+ * valid. Its URL starts with /api/auth/ so the client's fetch wrapper leaves
+ * the 401 alone and AuthGate can handle it deliberately.
+ */
+app.get("/api/auth/verify", (_req, res) => res.json({ ok: true }));
+
 const PORT = process.env.PORT || 4000;
 const V2 = "/trade-api/v2";
 
