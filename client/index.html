@@ -4,6 +4,55 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Kalshi Portfolio</title>
+    <script>
+      // Catches failures that happen BEFORE React mounts - a module that throws
+      // while loading, a missing export, a syntax error in the bundle. A React
+      // error boundary cannot see any of those, which is why a white screen can
+      // survive every in-app fix. Anything caught here gets printed into the
+      // page so it is readable on a phone with no console.
+      (function () {
+        var shown = false;
+        function show(title, detail) {
+          if (shown) return;
+          shown = true;
+          var root = document.getElementById("root") || document.body;
+          root.innerHTML =
+            '<div style="margin:24px 16px;padding:16px;border-radius:12px;background:#fff;' +
+            'color:#1c1c1e;font-family:-apple-system,BlinkMacSystemFont,sans-serif;line-height:1.45">' +
+            '<h2 style="margin:0 0 6px;font-size:19px">' + title + '</h2>' +
+            '<p style="margin:0;font-size:15px;color:rgba(60,60,67,.6)">' +
+            'This is what stopped the app from loading.</p>' +
+            '<div style="white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,monospace;' +
+            'font-size:12px;background:rgba(120,120,128,.12);padding:12px;border-radius:8px;margin-top:10px">' +
+            detail + '</div></div>';
+        }
+
+        window.addEventListener("error", function (e) {
+          if (e.target && (e.target.tagName === "SCRIPT" || e.target.tagName === "LINK")) {
+            show("A file failed to load", "Could not load: " + (e.target.src || e.target.href));
+            return;
+          }
+          show("The app crashed while loading", (e.error && e.error.stack) || e.message || String(e));
+        }, true);
+
+        window.addEventListener("unhandledrejection", function (e) {
+          show("A background request failed", (e.reason && e.reason.stack) || String(e.reason));
+        });
+
+        // If nothing has rendered after 8 seconds and nothing threw, say so
+        // rather than leaving a blank page with no explanation.
+        setTimeout(function () {
+          var root = document.getElementById("root");
+          if (root && root.children.length === 0) {
+            show(
+              "The app loaded but rendered nothing",
+              "No JavaScript error was thrown. The bundle ran but produced no output.\n\n" +
+              "Most likely: the script tag did not load, or React mounted to a different element."
+            );
+          }
+        }, 8000);
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
