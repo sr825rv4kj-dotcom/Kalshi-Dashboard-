@@ -6,8 +6,13 @@ import React, { useState } from "react";
  * and Kalshi only lets you download the key once - so pasting is usually the
  * more reliable path. The key is validated here before it is sent, so a
  * malformed paste fails with a clear message instead of a signing error later.
+ *
+ * onSaved  - credentials were accepted by the backend.
+ * onSkip   - no credentials; show the dashboard read-only anyway. These must
+ *            stay separate: wiring Skip to onSaved is what bounced you back to
+ *            this screen the moment the first Kalshi call returned 401.
  */
-export default function CredentialsSetup({ apiBase, onSaved }) {
+export default function CredentialsSetup({ apiBase, onSaved, onSkip }) {
   const [keyId, setKeyId] = useState("");
   const [pemContent, setPemContent] = useState("");
   const [pemFileName, setPemFileName] = useState("");
@@ -68,6 +73,11 @@ export default function CredentialsSetup({ apiBase, onSaved }) {
     } catch (err) { setError(err.message); } finally { setSaving(false); }
   }
 
+  function handleSkip() {
+    if (typeof onSkip === "function") onSkip();
+    else onSaved();
+  }
+
   return (
     <div className="setup-screen">
       <div className="panel setup-panel">
@@ -108,7 +118,7 @@ export default function CredentialsSetup({ apiBase, onSaved }) {
 
         {/* Without these this screen is a dead end: you cannot reach the
             dashboard without a key, and cannot get back to the login page. */}
-        <button type="button" className="modal-cancel" style={{ marginTop: 12 }} onClick={onSaved}>
+        <button type="button" className="modal-cancel" style={{ marginTop: 12 }} onClick={handleSkip}>
           Skip for now - go to the dashboard
         </button>
         <button
