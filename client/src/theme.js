@@ -90,3 +90,4 @@ export function applyTheme(theme) {
     root.style.setProperty(prop, value);
   }
 }
+
