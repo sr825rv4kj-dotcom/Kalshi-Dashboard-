@@ -105,6 +105,21 @@ export default function CredentialsSetup({ apiBase, onSaved }) {
           {error && <div className="error-banner setup-error">{error}</div>}
           <button type="submit" disabled={saving}>{saving ? "Saving..." : "Save and connect"}</button>
         </form>
+
+        {/* Without these this screen is a dead end: you cannot reach the
+            dashboard without a key, and cannot get back to the login page. */}
+        <button type="button" className="modal-cancel" style={{ marginTop: 12 }} onClick={onSaved}>
+          Skip for now - go to the dashboard
+        </button>
+        <button
+          type="button" className="modal-cancel" style={{ marginTop: 8 }}
+          onClick={() => {
+            try { localStorage.removeItem("kalshi_dashboard_token"); } catch { /* ignore */ }
+            window.location.reload();
+          }}
+        >
+          Log out
+        </button>
       </div>
     </div>
   );
