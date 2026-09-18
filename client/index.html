@@ -27,17 +27,20 @@
             detail + '</div></div>';
         }
 
-        window.addEventListener("error", function (e) {
+                window.addEventListener("error", function (e) {
           if (e.target && (e.target.tagName === "SCRIPT" || e.target.tagName === "LINK")) {
             show("A file failed to load", "Could not load: " + (e.target.src || e.target.href));
             return;
           }
-          show("The app crashed while loading", (e.error && e.error.stack) || e.message || String(e));
+          var err = e.error;
+          var parts = [];
+          if (err && err.name) parts.push(err.name + ": " + (err.message || ""));
+          else if (e.message) parts.push(e.message);
+          if (e.filename) parts.push("at " + e.filename + ":" + e.lineno + ":" + e.colno);
+          if (err && err.stack) parts.push("\n" + err.stack);
+          show("The app crashed while loading", parts.join("\n") || String(e));
         }, true);
 
-        window.addEventListener("unhandledrejection", function (e) {
-          show("A background request failed", (e.reason && e.reason.stack) || String(e.reason));
-        });
 
         // If nothing has rendered after 8 seconds and nothing threw, say so
         // rather than leaving a blank page with no explanation.
