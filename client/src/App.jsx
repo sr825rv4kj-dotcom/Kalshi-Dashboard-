@@ -11,20 +11,26 @@ import TradeLedgerPanel from "./components/TradeLedgerPanel.jsx";
 import MilestonesPanel from "./components/MilestonesPanel.jsx";
 import CostTrackingPanel from "./components/CostTrackingPanel.jsx";
 import AuthGate from "./components/AuthGate.jsx";
-import NotificationsPanel from "./components/NotificationsPanel.jsx"
+import NotificationsPanel from "./components/NotificationsPanel.jsx";
 import GamesBoard from "./components/GamesBoard.jsx";
-import BotConfigPanel from "./components/BotConfigPanel.jsx";
 import BackgroundSettings from "./components/BackgroundSettings.jsx";
-import { getTodaysTheme, applyTheme } from "./theme.js";
+import BotConfigPanel from "./components/BotConfigPanel.jsx";
+import DiagnosticPanel from "./components/DiagnosticPanel.jsx";
+import { getTodaysTheme, applyTheme, setTheme, getTheme, THEME_KEYS } from "./theme.js";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:4000";
 
 function DashboardApp() {
-  const [theme] = useState(() => getTodaysTheme());
+  const [theme, setThemeState] = useState(() => getTodaysTheme());
   useEffect(() => { applyTheme(theme); }, [theme]);
 
   const [checkingConfig, setCheckingConfig] = useState(true);
   const [needsSetup, setNeedsSetup] = useState(false);
+
+  // Set when you choose "Skip for now". Without it, the first failing Kalshi
+  // call bounced you straight back to the credentials screen - the error text
+  // contains "credential"/"401", which used to re-arm setNeedsSetup below.
+  const [skippedSetup, setSkippedSetup] = useState(false);
 
   const [balance, setBalance] = useState(null);
   const [positions, setPositions] = useState([]);
@@ -37,9 +43,11 @@ function DashboardApp() {
     try {
       const res = await fetch(`${API_BASE}/api/credentials/status`);
       const data = await res.json();
-      setNeedsSetup(!data.configured);
+      const configured = Boolean(data.configured);
+      if (configured) setSkippedSetup(false);
+      setNeedsSetup(!configured && !skippedSetup);
     } catch {
-      setNeedsSetup(true);
+      setNeedsSetup(!skippedSetup);
     } finally {
       setCheckingConfig(false);
     }
@@ -66,7 +74,11 @@ function DashboardApp() {
       setLastUpdated(new Date());
     } catch (err) {
       setError(err.message);
-      if (/key|credential|401|403/i.test(err.message)) setNeedsSetup(true);
+      // Only auto-redirect to setup if you haven't deliberately skipped it.
+      // The banner's "Update credentials" button is always available instead.
+      if (!skippedSetup && /key|credential|401|403/i.test(err.message)) {
+        setNeedsSetup(true);
+      }
     }
   }
 
@@ -85,7 +97,11 @@ function DashboardApp() {
     return (
       <div className="app">
         <div className="masthead"><h1>Portfolio Ledger</h1></div>
-        <CredentialsSetup apiBase={API_BASE} onSaved={() => { setNeedsSetup(false); setError(null); }} />
+        <CredentialsSetup
+          apiBase={API_BASE}
+          onSaved={() => { setSkippedSetup(false); setNeedsSetup(false); setError(null); }}
+          onSkip={() => { setSkippedSetup(true); setNeedsSetup(false); setError(null); }}
+        />
       </div>
     );
   }
@@ -95,16 +111,27 @@ function DashboardApp() {
       <div className="masthead">
         <h1>Portfolio Ledger</h1>
         <span className="clock">
-          {theme.name} theme today · {lastUpdated ? `last synced ${lastUpdated.toLocaleTimeString()}` : "syncing..."}
+          {lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "Syncing"}
         </span>
       </div>
 
       <SystemStatusBar apiBase={API_BASE} />
 
-      {error && (
+      {skippedSetup && (
+        <div className="error-banner">
+          No Kalshi API key saved - balance, positions and trading are offline.
+          <div className="error-action">
+            <button onClick={() => { setSkippedSetup(false); setNeedsSetup(true); }}>Add credentials</button>
+          </div>
+        </div>
+      )}
+
+      {error && !skippedSetup && (
         <div className="error-banner">
           Could not reach backend or Kalshi API: {error}
-          <div className="error-action"><button onClick={() => setNeedsSetup(true)}>Update credentials</button></div>
+          <div className="error-action">
+            <button onClick={() => { setSkippedSetup(false); setNeedsSetup(true); }}>Update credentials</button>
+          </div>
         </div>
       )}
 
@@ -120,7 +147,8 @@ function DashboardApp() {
         <div className="panel"><h2>Recent Orders</h2><OrdersTable orders={orders} /></div>
       </div>
 
-            <BotControlPanel apiBase={API_BASE} />
+      <BotControlPanel apiBase={API_BASE} />
+      <DiagnosticPanel apiBase={API_BASE} />
       <BotConfigPanel apiBase={API_BASE} />
       <GamesBoard apiBase={API_BASE} />
       <MilestonesPanel apiBase={API_BASE} />
@@ -128,6 +156,21 @@ function DashboardApp() {
       <NotificationsPanel apiBase={API_BASE} />
       <CostTrackingPanel apiBase={API_BASE} />
       <ApiKeysPanel apiBase={API_BASE} />
+      <div className="panel">
+        <h2>Appearance</h2>
+        <div className="env-pill-group" style={{ width: "fit-content" }}>
+          {THEME_KEYS.map((key) => (
+            <button
+              key={key}
+              type="button"
+              className={`env-pill ${theme.key === key ? "env-pill-active" : ""}`}
+              onClick={() => setThemeState(setTheme(key))}
+            >
+              {getTheme(key).name}
+            </button>
+          ))}
+        </div>
+      </div>
       <BackgroundSettings apiBase={API_BASE} />
     </div>
   );
