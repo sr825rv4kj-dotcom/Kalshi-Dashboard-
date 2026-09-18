@@ -29,4 +29,5 @@ export function getTodayTheme() {
 }
 export function getTheme(name) {
   return THEMES[name] || THEMES.aurora;
+
 }
