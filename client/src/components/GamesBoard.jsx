@@ -1,5 +1,20 @@
 import React, { useEffect, useState } from "react";
-import { getTeamColor } from "./teamColors.js";
+
+/**
+ * Team colors are derived from the team name rather than read from a lookup
+ * file. That keeps this component self-contained - an earlier version imported
+ * "../teamColors.js" and broke the whole build when that file moved, which is
+ * not a risk worth carrying for a decorative dot. Hue comes from a hash of the
+ * name, with saturation and lightness fixed so every color stays legible.
+ */
+function teamColor(name) {
+  if (!name) return "hsl(0 0% 60%)";
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = (hash * 31 + name.charCodeAt(i)) % 360;
+  }
+  return `hsl(${hash} 62% 48%)`;
+}
 
 function formatKickoff(iso) {
   if (!iso) return "TBD";
@@ -31,24 +46,28 @@ export default function GamesBoard({ apiBase }) {
 
   useEffect(() => {
     refresh();
-    const i = setInterval(refresh, 60000); // refresh every minute - live status changes
+    const i = setInterval(refresh, 60000);
     return () => clearInterval(i);
   }, []);
 
   return (
     <div className="panel">
       <div className="bot-panel-header">
-        <h2>Live Feed - All Sports</h2>
-        <span className="muted" style={{ fontSize: 11, fontFamily: "IBM Plex Mono, monospace" }}>
-          {sportsScanned.length} in-season sport{sportsScanned.length === 1 ? "" : "s"} scanned
+        <h2>Live Feed</h2>
+        <span className="muted" style={{ fontSize: 13 }}>
+          {sportsScanned.length} sport{sportsScanned.length === 1 ? "" : "s"} active
         </span>
       </div>
-      <p className="setup-copy">Everything the bot can currently see and consider, across every in-season sport in your pool.</p>
+      <p className="setup-copy">
+        Everything the bot can currently see, across every in-season sport.
+      </p>
+
       {loading && <p className="muted">Loading games...</p>}
       {error && <div className="error-banner">{error}</div>}
       {!loading && !error && games.length === 0 && (
-        <div className="empty-state">No open Kalshi markets found right now across any in-season sport.</div>
+        <div className="empty-state">No open Kalshi markets found right now.</div>
       )}
+
       <div className="games-grid">
         {games.map((game) => (
           <div key={game.eventTicker} className={`game-card ${game.isLive ? "game-card-live" : ""}`}>
@@ -56,17 +75,19 @@ export default function GamesBoard({ apiBase }) {
             <div className="game-card-sport">{game.sportKey}</div>
             <div className="game-card-teams">
               <div className="game-card-team">
-                <span className="team-dot" style={{ background: getTeamColor(game.teamA) }} />
+                <span className="team-dot" style={{ background: teamColor(game.teamA) }} />
                 {game.teamA}
               </div>
               {game.teamB && (
                 <div className="game-card-team">
-                  <span className="team-dot" style={{ background: getTeamColor(game.teamB) }} />
+                  <span className="team-dot" style={{ background: teamColor(game.teamB) }} />
                   {game.teamB}
                 </div>
               )}
             </div>
-            <div className="game-card-time">{game.isLive ? "In progress" : formatKickoff(game.startTime)}</div>
+            <div className="game-card-time">
+              {game.isLive ? "In progress" : formatKickoff(game.startTime)}
+            </div>
           </div>
         ))}
       </div>
