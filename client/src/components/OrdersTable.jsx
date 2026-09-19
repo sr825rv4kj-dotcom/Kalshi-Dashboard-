@@ -62,7 +62,7 @@ export default function OrdersTable({ orders }) {
         const isBuy = String(o.action || "").toLowerCase() === "buy";
 
         return (
-          <div key={o.order_id || `${o.ticker}-${i}`} className="order-row">
+                   <div key={o.orderId || `${o.ticker}-${i}`} className="order-row">
             <div
               className="team-chip-badge order-badge"
               style={{ background: primary, borderColor: secondary, color: secondary }}
@@ -74,13 +74,14 @@ export default function OrdersTable({ orders }) {
               <div className="order-title">
                 {side ? `${side} · ` : ""}{matchup || "—"}
               </div>
-              <div className="order-sub">
+                           <div className="order-sub">
                 {meta.label}
-                {o.created_time ? ` · ${new Date(o.created_time).toLocaleString(undefined, {
+                {o.createdTime ? ` · ${new Date(o.createdTime).toLocaleString(undefined, {
                   month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
                 })}` : ""}
+                {o.priceCents != null ? ` · ${o.priceCents}c` : ""}
+                {o.count != null ? ` · ${o.count}x` : ""}
               </div>
-            </div>
 
             <div className="order-right">
               <div className={isBuy ? "pos" : "neg"}>
