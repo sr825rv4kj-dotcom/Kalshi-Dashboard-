@@ -263,4 +263,43 @@ input[type="file"] { width: 100%; font-size: 15px; color: var(--label-secondary)
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+/* ---- Team identity + trade ledger ---- */
+.team-chip { display: flex; align-items: center; gap: 12px; padding: 10px 0; }
+.team-chip-badge {
+  width: 52px; height: 52px; border-radius: 14px; flex: 0 0 52px;
+  display: flex; align-items: center; justify-content: center;
+  border: 2px solid; box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+}
+.team-chip-emoji { font-size: 28px; line-height: 1; filter: drop-shadow(0 1px 1px rgba(0,0,0,0.25)); }
+.team-chip-body { flex: 1; min-width: 0; }
+.team-chip-name { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
+.team-chip-stripe { display: flex; gap: 3px; margin-top: 6px; }
+.team-chip-stripe span { height: 4px; width: 28px; border-radius: 2px; }
+.team-chip-score { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.ledger-vs { font-size: 13px; color: var(--muted); text-align: center; margin: -2px 0; }
+
+.ledger-card { border: 1px solid var(--panel-border); border-radius: 14px; padding: 14px; margin-top: 12px; background: var(--card); }
+.ledger-card-head { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.ledger-live { color: #0a84ff; font-weight: 700; }
+
+.ledger-figures { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 12px; }
+.ledger-figures > div { background: var(--field); border-radius: 10px; padding: 10px 12px; }
+.ledger-figures span { display: block; font-size: 12px; color: var(--muted); }
+.ledger-figures strong { font-size: 17px; font-variant-numeric: tabular-nums; }
+.ledger-summary { margin-top: 4px; }
+
+.ledger-toggle { margin-top: 12px; width: 100%; background: var(--field); color: inherit; border: none; border-radius: 10px; padding: 9px; font-size: 14px; }
+.ledger-detail { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--panel-border); }
+.ledger-reason { font-size: 14px; line-height: 1.45; margin-top: 8px; color: var(--muted); }
+.ledger-reason strong { color: inherit; }
+.mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+
+.ledger-section { margin-top: 14px; }
+.ledger-section-head {
+  width: 100%; display: flex; align-items: center; gap: 10px;
+  background: none; border: none; color: inherit; padding: 10px 0; font-size: 16px; font-weight: 600;
+}
+.ledger-count { background: var(--field); border-radius: 999px; padding: 2px 9px; font-size: 13px; color: var(--muted); }
+.ledger-chevron { margin-left: auto; color: var(--muted); }
 
