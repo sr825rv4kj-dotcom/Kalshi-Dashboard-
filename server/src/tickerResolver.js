@@ -1,18 +1,19 @@
 /**
  * Resolves a sportsbook team name + kickoff time to a live Kalshi ticker.
  *
- * Queries /markets directly rather than /events. The events list carried no
- * usable dates, which forced a title-only search across every open event and
- * matched teams to the wrong week's fixture - tickers resolved, but the market
- * was already settled. /markets filters by close time server-side, so what
- * comes back is open and closing today, by construction.
+ * Kalshi's /markets filters have not behaved as documented here: filtering by
+ * status and close-time server-side returned zero rows for series that plainly
+ * had live games. So this tries progressively looser queries and keeps the
+ * first that returns anything, then does all filtering locally where the data
+ * is visible and testable. lastFetchReport exposes what happened for the
+ * diagnostic endpoint.
  */
 
 import { kalshiGet } from "./kalshiClient.js";
 
 const V2 = "/trade-api/v2";
-const WINDOW_BEFORE_H = 2;   // markets closing before now + this are already underway/over
-const WINDOW_AFTER_H = 16;   // a game started now closes within this
+const WINDOW_BEFORE_H = 3;
+const WINDOW_AFTER_H = 30;
 const CACHE_TTL_MS = 3 * 60 * 1000;
 
 export const SPORT_SERIES_MAP = {
@@ -24,15 +25,16 @@ export const SPORT_SERIES_MAP = {
   icehockey_nhl: "KXNHLGAME",
 };
 
+// Kalshi has used several words for "tradeable" across its API surface.
+const TRADEABLE = new Set(["open", "active"]);
 const NON_TEAM_OUTCOMES = new Set(["draw", "tie"]);
-
-// Words that match far too many schools/teams to identify one on their own.
 const WEAK = new Set([
   "state", "university", "college", "the", "saint", "north", "south", "east", "west",
-  "central", "eastern", "western", "northern", "southern", "tech", "a&m", "am",
+  "central", "eastern", "western", "northern", "southern", "tech",
 ]);
 
 const cache = new Map();
+export const lastFetchReport = new Map();
 
 function normalize(t) {
   return (t || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
@@ -43,38 +45,74 @@ function marketText(m) {
 }
 
 function closeMs(m) {
-  const t = m.close_time ?? m.expected_expiration_time;
+  const t = m.close_time ?? m.expected_expiration_time ?? m.expiration_time;
   if (!t) return null;
   const ms = new Date(t).getTime();
   return Number.isNaN(ms) ? null : ms;
 }
 
-/** All open markets in this series closing inside the window, paginated. */
-async function getOpenMarkets(series) {
+async function fetchPaged(query) {
+  const out = [];
+  let cursor = "";
+  for (let page = 0; page < 8; page++) {
+    const q = query + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+    const data = await kalshiGet(`${V2}/markets`, q);
+    const batch = data.markets ?? [];
+    out.push(...batch);
+    cursor = data.cursor || "";
+    if (!cursor || !batch.length) break;
+  }
+  return out;
+}
+
+/** Tries each query shape in order, keeping the first that returns rows. */
+async function getMarkets(series) {
   const hit = cache.get(series);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.markets;
 
   const nowSec = Math.floor(Date.now() / 1000);
-  const minTs = nowSec - WINDOW_BEFORE_H * 3600;
-  const maxTs = nowSec + WINDOW_AFTER_H * 3600;
+  const attempts = [
+    { label: "status=open", q: `?series_ticker=${series}&status=open&limit=1000` },
+    { label: "status=active", q: `?series_ticker=${series}&status=active&limit=1000` },
+    {
+      label: "status=open+close_ts",
+      q: `?series_ticker=${series}&status=open&limit=1000` +
+         `&min_close_ts=${nowSec - WINDOW_BEFORE_H * 3600}&max_close_ts=${nowSec + WINDOW_AFTER_H * 3600}`,
+    },
+    { label: "no filters", q: `?series_ticker=${series}&limit=1000` },
+  ];
 
-  const markets = [];
-  let cursor = "";
-  // Hard page cap: a full Saturday slate is large, but this must not loop forever
-  // if Kalshi ever returns a non-advancing cursor.
-  for (let page = 0; page < 10; page++) {
-    const q =
-      `?series_ticker=${series}&status=open&limit=1000` +
-      `&min_close_ts=${minTs}&max_close_ts=${maxTs}` +
-      (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
-    const data = await kalshiGet(`${V2}/markets`, q);
-    for (const m of data.markets ?? []) markets.push(m);
-    cursor = data.cursor || "";
-    if (!cursor || !(data.markets ?? []).length) break;
+  const tried = [];
+  let markets = [];
+  let winner = "none";
+  for (const a of attempts) {
+    try {
+      const rows = await fetchPaged(a.q);
+      tried.push({ label: a.label, returned: rows.length });
+      if (rows.length) { markets = rows; winner = a.label; break; }
+    } catch (err) {
+      tried.push({ label: a.label, error: err.message });
+    }
   }
+
+  const statuses = {};
+  for (const m of markets) statuses[m.status ?? "undefined"] = (statuses[m.status ?? "undefined"] || 0) + 1;
+
+  lastFetchReport.set(series, {
+    series, tried, winner, total: markets.length, statuses,
+    sample: markets.slice(0, 3).map((m) => ({
+      ticker: m.ticker, title: m.title, yes_sub_title: m.yes_sub_title,
+      status: m.status, close_time: m.close_time, yes_ask: m.yes_ask,
+    })),
+    at: new Date().toISOString(),
+  });
 
   cache.set(series, { markets, at: Date.now() });
   return markets;
+}
+
+export function getFetchReport(series) {
+  return lastFetchReport.get(series) ?? null;
 }
 
 export async function resolveTicker({ sportKey, teamName, commenceTime }) {
@@ -85,27 +123,41 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
   const series = SPORT_SERIES_MAP[sportKey];
   if (!series) return { ticker: null, reason: `no Kalshi series for "${sportKey}"` };
 
-  let markets;
+  let all;
   try {
-    markets = await getOpenMarkets(series);
+    all = await getMarkets(series);
   } catch (err) {
     return { ticker: null, reason: `${series} markets fetch failed: ${err.message}` };
   }
-  if (!markets.length) {
-    return { ticker: null, reason: `${series}: no open markets closing in the next ${WINDOW_AFTER_H}h` };
+  if (!all.length) {
+    const r = getFetchReport(series);
+    return { ticker: null, reason: `${series}: every query shape returned 0 (${JSON.stringify(r?.tried ?? [])})` };
+  }
+
+  // Local filtering: status first, then close time. Markets with no close time
+  // are kept rather than dropped - absent data is not a reason to skip a live game.
+  const target = new Date(commenceTime).getTime();
+  const lo = Date.now() - WINDOW_BEFORE_H * 3600 * 1000;
+  const hi = Date.now() + WINDOW_AFTER_H * 3600 * 1000;
+
+  const tradeable = all.filter((m) => TRADEABLE.has(String(m.status || "").toLowerCase()));
+  const pool = (tradeable.length ? tradeable : all).filter((m) => {
+    const ms = closeMs(m);
+    return ms == null || (ms >= lo && ms <= hi);
+  });
+
+  if (!pool.length) {
+    const statuses = {};
+    for (const m of all) statuses[m.status ?? "?"] = (statuses[m.status ?? "?"] || 0) + 1;
+    return { ticker: null, reason: `${series}: ${all.length} markets, none tradeable in window (statuses: ${JSON.stringify(statuses)})` };
   }
 
   const words = normalize(teamName).split(" ").filter((w) => w.length > 2);
   const strong = words.filter((w) => !WEAK.has(w));
   if (!words.length) return { ticker: null, reason: `no usable words in "${teamName}"` };
 
-  const target = new Date(commenceTime).getTime();
-
-  // Score every open market: strong words (mascot, distinctive city) count
-  // double, weak ones count one. "NC State Wolfpack" must not match every
-  // school with "State" in the name.
   const scored = [];
-  for (const m of markets) {
+  for (const m of pool) {
     const text = marketText(m);
     let score = 0;
     for (const w of strong) if (text.includes(w)) score += 2;
@@ -114,13 +166,9 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
   }
 
   if (!scored.length) {
-    return {
-      ticker: null,
-      reason: `no open ${series} market matched "${teamName}" among ${markets.length}, e.g. "${markets[0].title}"`,
-    };
+    return { ticker: null, reason: `no ${series} market matched "${teamName}" among ${pool.length}, e.g. "${pool[0].title}"` };
   }
 
-  // Best score wins; ties break on proximity to the sportsbook's kickoff.
   const best = scored.reduce((a, b) => {
     if (b.score !== a.score) return b.score > a.score ? b : a;
     const da = a.ms == null || Number.isNaN(target) ? Infinity : Math.abs(a.ms - target);
@@ -128,8 +176,5 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
     return db < da ? b : a;
   });
 
-  return {
-    ticker: best.m.ticker,
-    reason: `resolved to open market "${best.m.title}" (score ${best.score})`,
-  };
+  return { ticker: best.m.ticker, reason: `matched "${best.m.title}" (${best.m.status}, score ${best.score})` };
 }
