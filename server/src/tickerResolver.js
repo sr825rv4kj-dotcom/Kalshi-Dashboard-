@@ -1,12 +1,10 @@
 /**
  * Resolves a sportsbook team name + kickoff time to a live Kalshi ticker.
  *
- * Kalshi's /markets filters have not behaved as documented here: filtering by
- * status and close-time server-side returned zero rows for series that plainly
- * had live games. So this tries progressively looser queries and keeps the
- * first that returns anything, then does all filtering locally where the data
- * is visible and testable. lastFetchReport exposes what happened for the
- * diagnostic endpoint.
+ * Kalshi's /markets filters have not behaved as documented here, so this tries
+ * progressively looser queries and keeps the first that returns anything, then
+ * filters locally where the data is visible. lastFetchReport exposes what
+ * happened for the diagnostic endpoint.
  */
 
 import { kalshiGet } from "./kalshiClient.js";
@@ -149,11 +147,12 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
     return { ticker: null, reason: `${series}: ${all.length} markets, none with a tradeable status (${JSON.stringify(statuses)})` };
   }
 
-
   const words = normalize(teamName).split(" ").filter((w) => w.length > 2);
   const strong = words.filter((w) => !WEAK.has(w));
   if (!words.length) return { ticker: null, reason: `no usable words in "${teamName}"` };
 
+  // Strong words (mascot, distinctive city) count double so "NC State
+  // Wolfpack" does not match every school with "State" in the name.
   const scored = [];
   for (const m of pool) {
     const text = marketText(m);
