@@ -424,7 +424,7 @@ if (fs.existsSync(clientDistPath)) {
   });
   console.log("Serving built frontend from client/dist");
 }
-
+registerDiagnosticRoutes(app);
 app.listen(PORT, () => {
   console.log(`Kalshi dashboard backend running on http://localhost:${PORT}`);
   const config = loadConfig();
