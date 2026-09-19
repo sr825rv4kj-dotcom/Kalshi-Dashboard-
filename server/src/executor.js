@@ -11,24 +11,67 @@ function newClientOrderId() {
   return `dash_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** Contract prices are 1-99c; anything outside that is rejected by Kalshi. */
+function clampPrice(cents) {
+  return Math.max(1, Math.min(99, Math.round(cents)));
+}
+
+/**
+ * Kalshi reports fills in a few different shapes depending on how the order
+ * crossed. Taking the real average fill price matters: booking the limit price
+ * as cost basis overstates what you paid and makes the below-cost exit fire on
+ * positions that are actually flat.
+ */
+function readFill(order, fallbackCents) {
+  const filled = order?.taker_fill_count ?? order?.filled_count ?? 0;
+  const avg =
+    order?.average_fill_price ??
+    order?.taker_fill_cost && filled ? Math.round(order.taker_fill_cost / filled) : null;
+  const price = avg && avg > 0 ? clampPrice(avg) : fallbackCents;
+  return { filled, price };
+}
+
 export async function enterPosition({ ticker, side, priceCents, contracts, reason = null, edgePct = null, teamName = null, sportKey = null, commenceTime = null }) {
   if (contracts <= 0) return { filled: 0 };
+
+  const config = loadConfig();
+
+  // Cross the spread by this much. At 0 the order quotes the ask exactly and
+  // rests behind everyone already there; in a live market the ask has usually
+  // moved before the order lands, so it never fills. 1-2c buys the fill.
+  const slippage = config.entrySlippageCents ?? 1;
+  const limitCents = clampPrice(priceCents + slippage);
+  const waitMs = (config.fillWaitSeconds ?? 6) * 1000;
 
   const clientOrderId = newClientOrderId();
   const body = {
     ticker, client_order_id: clientOrderId, side, action: "buy", type: "limit", count: contracts,
-    [side === "yes" ? "yes_price" : "no_price"]: priceCents,
+    [side === "yes" ? "yes_price" : "no_price"]: limitCents,
   };
 
-  appendLog(`Placing entry order: ${side.toUpperCase()} ${contracts}x ${ticker} @ ${priceCents}c`);
+  appendLog(
+    `Placing entry order: ${side.toUpperCase()} ${contracts}x ${ticker} @ ${limitCents}c ` +
+    `(ask ${priceCents}c + ${slippage}c cross)`
+  );
   const placeRes = await kalshiPost(`${V2}/portfolio/orders`, body);
   const orderId = placeRes.order?.order_id;
   if (!orderId) throw new Error(`Kalshi did not return an order_id: ${JSON.stringify(placeRes)}`);
 
-  await new Promise((r) => setTimeout(r, 5000));
-  const statusRes = await kalshiGet(`${V2}/portfolio/orders/${orderId}`);
-  const order = statusRes.order;
-  const filled = order.taker_fill_count ?? order.filled_count ?? 0;
+  // Poll rather than sleeping once: a crossing order usually fills instantly,
+  // and waiting the full window on every entry adds latency for no reason.
+  let order = null;
+  let filled = 0;
+  let fillPrice = limitCents;
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const statusRes = await kalshiGet(`${V2}/portfolio/orders/${orderId}`);
+    order = statusRes.order;
+    const read = readFill(order, limitCents);
+    filled = read.filled;
+    fillPrice = read.price;
+    if (filled >= contracts) break;
+  }
 
   if (filled < contracts) {
     try {
@@ -41,29 +84,35 @@ export async function enterPosition({ ticker, side, priceCents, contracts, reaso
 
   if (filled > 0) {
     const state = loadState();
-    state.positions.push({ ticker, side, entryPriceCents: priceCents, contracts: filled, openedAt: new Date().toISOString(), teamName, sportKey, commenceTime });
+    state.positions.push({
+      ticker, side, entryPriceCents: fillPrice, contracts: filled,
+      openedAt: new Date().toISOString(), teamName, sportKey, commenceTime,
+    });
     saveState(state);
-    appendLog(`Filled ${filled}x ${ticker} (${side}) @ ${priceCents}c`);
+    appendLog(`Filled ${filled}x ${ticker} (${side}) @ ${fillPrice}c`);
   }
 
-  const config = loadConfig();
   recordTrade({
-    action: "enter", ticker, side, contracts, priceCents, filled,
+    action: "enter", ticker, side, contracts, priceCents: fillPrice, filled,
     reason: reason || "no reason recorded", edgePct, environment: config.environment,
     teamName, sportKey, commenceTime,
   });
 
   if (filled > 0) {
     const { botToken, chatId } = getTelegramCredentials();
-    notifyEntry({ botToken, chatId, ticker, side, contracts: filled, priceCents, reason, environment: config.environment })
+    notifyEntry({ botToken, chatId, ticker, side, contracts: filled, priceCents: fillPrice, reason, environment: config.environment })
       .catch(() => {}); // notification failures never block trading
   }
 
-  return { filled };
+  return { filled, fillPrice };
 }
 
 export async function exitPosition(position, reason) {
   const { ticker, side, contracts } = position;
+  const config = loadConfig();
+  // Same logic in reverse: sell UNDER the best bid so the order crosses.
+  const slippage = config.exitSlippageCents ?? 1;
+
   const sellSide = side;
   let remaining = contracts;
   let attempts = 0;
@@ -77,21 +126,27 @@ export async function exitPosition(position, reason) {
     if (!bestBid) {
       appendLog(`No resting bids for ${ticker} on exit attempt ${attempts + 1}`, "warn");
       attempts++;
+      await new Promise((r) => setTimeout(r, 1000));
       continue;
     }
 
+    const limitCents = clampPrice(bestBid - slippage);
     const body = {
       ticker, client_order_id: newClientOrderId(), side: sellSide, action: "sell", type: "limit", count: remaining,
-      [side === "yes" ? "yes_price" : "no_price"]: bestBid,
+      [side === "yes" ? "yes_price" : "no_price"]: limitCents,
     };
     const placeRes = await kalshiPost(`${V2}/portfolio/orders`, body);
     const orderId = placeRes.order?.order_id;
     await new Promise((r) => setTimeout(r, 2000));
     const statusRes = await kalshiGet(`${V2}/portfolio/orders/${orderId}`);
-    const filled = statusRes.order?.taker_fill_count ?? 0;
-    if (filled > 0) lastExitPriceCents = bestBid;
-    remaining -= filled;
+    const read = readFill(statusRes.order, limitCents);
+    if (read.filled > 0) lastExitPriceCents = read.price;
+    remaining -= read.filled;
     attempts++;
+
+    if (remaining > 0 && orderId) {
+      try { await kalshiDelete(`${V2}/portfolio/orders/${orderId}`); } catch { /* already gone */ }
+    }
   }
 
   if (remaining > 0) {
@@ -100,10 +155,9 @@ export async function exitPosition(position, reason) {
       `Market is illiquid - manual intervention needed in the Kalshi app.`, "error"
     );
   } else {
-    appendLog(`Exited ${ticker} (${reason}): all ${contracts} contracts closed.`);
+    appendLog(`Exited ${ticker} (${reason}): all ${contracts} contracts closed @ ${lastExitPriceCents}c.`);
   }
 
-  const config = loadConfig();
   recordTrade({
     action: "exit", ticker, side, contracts, priceCents: position.entryPriceCents,
     exitPriceCents: lastExitPriceCents,
