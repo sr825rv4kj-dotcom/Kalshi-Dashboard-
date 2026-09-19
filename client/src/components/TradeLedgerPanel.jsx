@@ -1,165 +1,203 @@
 import React, { useEffect, useState } from "react";
+import { teamIdentity, sportLabel } from "../teamIdentity.js";
 
-function fmtDateTime(iso) {
+function money(n) {
+  if (n == null) return "—";
+  return `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
+}
+
+function when(iso) {
   if (!iso) return "—";
   return new Date(iso).toLocaleString(undefined, {
     month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
   });
 }
 
-function fmtMoney(n) {
-  if (n == null) return "—";
-  return `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
-}
-
-function Collapsible({ title, count, defaultOpen = false, children }) {
-  const [open, setOpen] = useState(defaultOpen);
+/** The identity chip: large sport emoji, team colors, full name, final score. */
+function TeamChip({ name, sportKey, score, muted }) {
+  const id = teamIdentity(name, sportKey);
   return (
-    <div className="collapsible">
-      <button type="button" className="collapsible-header" onClick={() => setOpen(!open)}>
-        <span>{open ? "▾" : "▸"} {title}</span>
-        <span className="collapsible-count">{count}</span>
-      </button>
-      {open && <div className="collapsible-body">{children}</div>}
+    <div className="team-chip" style={{ opacity: muted ? 0.62 : 1 }}>
+      <div
+        className="team-chip-badge"
+        style={{ background: id.primary, borderColor: id.secondary, color: id.secondary }}
+      >
+        <span className="team-chip-emoji">{id.emoji}</span>
+      </div>
+      <div className="team-chip-body">
+        <div className="team-chip-name">{id.name}</div>
+        <div className="team-chip-stripe">
+          <span style={{ background: id.primary }} />
+          <span style={{ background: id.secondary }} />
+        </div>
+      </div>
+      {score != null && <div className="team-chip-score">{score}</div>}
     </div>
   );
 }
 
-function TradeCard({ trade }) {
-  const isWin = trade.netDollars > 0;
-  const score = trade.finalScore;
+function TradeCard({ t }) {
+  const [showDetail, setShowDetail] = useState(false);
+  const win = (t.netDollars ?? 0) > 0;
+  const opponent = t.opponentName || null;
 
   return (
-    <div className="trade-card">
-      <div className="trade-card-top">
+    <div className="ledger-card">
+      <div className="ledger-card-head">
+        <span className="ledger-sport">{sportLabel(t.sportKey)}</span>
+        <span className="ledger-when">{when(t.entryTimestamp)}</span>
+      </div>
+
+      <TeamChip name={t.teamName} sportKey={t.sportKey} score={t.finalScore?.score} />
+      {opponent && (
+        <>
+          <div className="ledger-vs">vs</div>
+          <TeamChip name={opponent} sportKey={t.sportKey} score={t.finalScore?.opponentScore} muted />
+        </>
+      )}
+
+      <div className="ledger-figures">
+        <div><span>Invested</span><strong>{money(t.costDollars)}</strong></div>
+        <div><span>Returned</span><strong>{money(t.proceedsDollars)}</strong></div>
         <div>
-          <div className="trade-card-team">{trade.teamName || trade.ticker}</div>
-          <div className="trade-card-meta">{trade.sportKey || "—"} · {trade.ticker}</div>
+          <span>{win ? "Won" : "Lost"}</span>
+          <strong className={win ? "pos" : "neg"}>{money(t.netDollars)}</strong>
         </div>
-        {trade.status === "closed" && (
-          <div className={`trade-card-roi ${isWin ? "pos" : "neg"}`}>
-            {trade.roiPct != null ? `${trade.roiPct >= 0 ? "+" : ""}${trade.roiPct.toFixed(1)}%` : "—"}
-          </div>
-        )}
+        <div>
+          <span>ROI</span>
+          <strong className={win ? "pos" : "neg"}>
+            {t.roiPct == null ? "—" : `${t.roiPct > 0 ? "+" : ""}${t.roiPct.toFixed(1)}%`}
+          </strong>
+        </div>
       </div>
 
-      <div className="trade-card-rows">
-        <div className="trade-row"><span>Entered</span><span>{fmtDateTime(trade.entryTimestamp || trade.timestamp)}</span></div>
-        {trade.status === "closed" && (
-          <div className="trade-row"><span>Exited</span><span>{fmtDateTime(trade.exitTimestamp)}</span></div>
-        )}
-        <div className="trade-row">
-          <span>Contracts</span>
-          <span>{trade.contracts} @ {trade.entryPriceCents ?? trade.priceCents}c</span>
-        </div>
-        <div className="trade-row"><span>Amount paid</span><span>{fmtMoney(trade.costDollars)}</span></div>
-        {trade.status === "closed" && (
-          <>
-            <div className="trade-row"><span>Amount received</span><span>{fmtMoney(trade.proceedsDollars)}</span></div>
-            <div className="trade-row">
-              <span>Net P&amp;L</span>
-              <span className={isWin ? "pos" : "neg"}>{fmtMoney(trade.netDollars)}</span>
-            </div>
-          </>
-        )}
-        {score && score.homeScore != null && (
-          <div className="trade-row">
-            <span>Final score</span>
-            <span>{score.awayTeam} {score.awayScore} – {score.homeScore} {score.homeTeam}</span>
-          </div>
-        )}
-        {trade.edgePct != null && (
-          <div className="trade-row"><span>Edge at entry</span><span>{trade.edgePct.toFixed(1)}%</span></div>
-        )}
-      </div>
+      <button type="button" className="ledger-toggle" onClick={() => setShowDetail((v) => !v)}>
+        {showDetail ? "Hide details" : "Details"}
+      </button>
 
-      <div className="trade-card-reason">
-        <strong>Entry:</strong> {trade.entryReason || trade.reason || "—"}
-      </div>
-      {trade.exitReason && (
-        <div className="trade-card-reason"><strong>Exit:</strong> {trade.exitReason}</div>
+      {showDetail && (
+        <div className="ledger-detail">
+          <div className="trade-row"><span>Ticker</span><span className="mono">{t.ticker}</span></div>
+          <div className="trade-row"><span>Contracts</span><span>{t.contracts}</span></div>
+          <div className="trade-row"><span>Entry</span><span>{t.entryPriceCents}c · {when(t.entryTimestamp)}</span></div>
+          <div className="trade-row"><span>Close</span><span>{t.exitPriceCents}c · {when(t.exitTimestamp)}</span></div>
+          <div className="trade-row"><span>Edge at entry</span><span>{t.edgePct == null ? "—" : `${t.edgePct.toFixed(1)}%`}</span></div>
+          <div className="ledger-reason"><strong>Why it entered:</strong> {t.entryReason || "—"}</div>
+          <div className="ledger-reason"><strong>Why it closed:</strong> {t.exitReason || "—"}</div>
+        </div>
       )}
     </div>
   );
 }
 
+function OpenCard({ t }) {
+  const [showDetail, setShowDetail] = useState(false);
+  return (
+    <div className="ledger-card">
+      <div className="ledger-card-head">
+        <span className="ledger-sport">{sportLabel(t.sportKey)}</span>
+        <span className="ledger-live">OPEN</span>
+      </div>
+      <TeamChip name={t.teamName} sportKey={t.sportKey} />
+      <div className="ledger-figures">
+        <div><span>Invested</span><strong>{money(t.costDollars)}</strong></div>
+        <div><span>Contracts</span><strong>{t.filled}</strong></div>
+        <div><span>Entry</span><strong>{t.priceCents}c</strong></div>
+        <div><span>Opened</span><strong>{when(t.timestamp)}</strong></div>
+      </div>
+      <button type="button" className="ledger-toggle" onClick={() => setShowDetail((v) => !v)}>
+        {showDetail ? "Hide details" : "Details"}
+      </button>
+      {showDetail && (
+        <div className="ledger-detail">
+          <div className="trade-row"><span>Ticker</span><span className="mono">{t.ticker}</span></div>
+          <div className="ledger-reason"><strong>Why it entered:</strong> {t.reason || "—"}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Section({ title, count, children, defaultOpen }) {
+  const [open, setOpen] = useState(Boolean(defaultOpen));
+  return (
+    <div className="ledger-section">
+      <button type="button" className="ledger-section-head" onClick={() => setOpen((v) => !v)}>
+        <span>{title}</span>
+        <span className="ledger-count">{count}</span>
+        <span className="ledger-chevron">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && <div className="ledger-section-body">{children}</div>}
+    </div>
+  );
+}
+
 export default function TradeLedgerPanel({ apiBase }) {
-  const [data, setData] = useState(null);
-  const [withScores, setWithScores] = useState(false);
+  const [data, setData] = useState({ completed: [], open: [], stats: null });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  async function refresh(fetchScores = withScores) {
+  async function load() {
     try {
       setError(null);
-      const res = await fetch(`${apiBase}/api/trade-lifecycles${fetchScores ? "?withScores=true" : ""}`);
-      const d = await res.json();
-      if (d.error) throw new Error(d.error);
-      setData(d);
-    } catch (err) { setError(err.message); } finally { setLoading(false); }
+      const res = await fetch(`${apiBase}/api/trade-lifecycles?withScores=true`);
+      const json = await res.json();
+      if (json.error) throw new Error(json.error);
+      setData({ completed: json.completed ?? [], open: json.open ?? [], stats: json.stats ?? null });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
   }
 
   useEffect(() => {
-    refresh(false);
-    const i = setInterval(() => refresh(), 30000);
+    load();
+    const i = setInterval(load, 60000);
     return () => clearInterval(i);
   }, []);
 
-  if (loading) return <div className="panel"><h2>Trade History</h2><p className="muted">Loading...</p></div>;
-
-  const completed = data?.completed ?? [];
-  const open = data?.open ?? [];
-  const stats = data?.stats ?? {};
+  const s = data.stats;
 
   return (
     <div className="panel">
-      <h2>Trade History</h2>
-      <p className="setup-copy">
-        Every figure below comes from real recorded fills - entry and exit prices, contract
-        counts, and timestamps as they actually executed.
-      </p>
+      <h2>Trade Log</h2>
 
+      {s && (
+        <div className="ledger-figures ledger-summary">
+          <div><span>Completed</span><strong>{s.totalExits}</strong></div>
+          <div><span>Win rate</span><strong>{s.winRatePct == null ? "—" : `${s.winRatePct.toFixed(0)}%`}</strong></div>
+          <div>
+            <span>Net</span>
+            <strong className={(s.totalNetDollars ?? 0) >= 0 ? "pos" : "neg"}>{money(s.totalNetDollars)}</strong>
+          </div>
+          <div>
+            <span>Overall ROI</span>
+            <strong className={(s.overallRoiPct ?? 0) >= 0 ? "pos" : "neg"}>
+              {s.overallRoiPct == null ? "—" : `${s.overallRoiPct.toFixed(1)}%`}
+            </strong>
+          </div>
+        </div>
+      )}
+
+      {loading && <p className="muted">Loading trades...</p>}
       {error && <div className="error-banner">{error}</div>}
 
-      <div className="bot-subsection" style={{ marginTop: 0, borderTop: "none", paddingTop: 0 }}>
-        <div className="cost-row"><span>Win rate</span><span>{stats.winRatePct != null ? `${stats.winRatePct.toFixed(0)}% (${stats.wins}W / ${stats.losses}L)` : "—"}</span></div>
-        <div className="cost-row"><span>Total net P&amp;L</span>
-          <span className={stats.totalNetDollars > 0 ? "pos" : stats.totalNetDollars < 0 ? "neg" : ""}>
-            {fmtMoney(stats.totalNetDollars)}
-          </span>
-        </div>
-        <div className="cost-row"><span>Overall ROI</span>
-          <span className={stats.overallRoiPct > 0 ? "pos" : stats.overallRoiPct < 0 ? "neg" : ""}>
-            {stats.overallRoiPct != null ? `${stats.overallRoiPct >= 0 ? "+" : ""}${stats.overallRoiPct.toFixed(1)}%` : "—"}
-          </span>
-        </div>
-      </div>
+      {!loading && !error && (
+        <>
+          <Section title="Open positions" count={data.open.length} defaultOpen>
+            {data.open.length === 0
+              ? <div className="empty-state">No open positions.</div>
+              : data.open.map((t, i) => <OpenCard key={`${t.ticker}-${i}`} t={t} />)}
+          </Section>
 
-      <Collapsible title="Open positions" count={open.length} defaultOpen={open.length > 0}>
-        {open.length === 0
-          ? <div className="empty-state">No open positions. The bot has nothing live right now.</div>
-          : open.map((t, i) => <TradeCard key={i} trade={t} />)}
-      </Collapsible>
-
-      <Collapsible title="Completed trades" count={completed.length}>
-        {completed.length === 0
-          ? <div className="empty-state">No completed trades yet.</div>
-          : (
-            <>
-              {!withScores && (
-                <button
-                  type="button"
-                  className="modal-cancel"
-                  style={{ marginTop: 0, marginBottom: 12 }}
-                  onClick={() => { setWithScores(true); refresh(true); }}
-                >
-                  Load final scores (uses extra odds-API credits)
-                </button>
-              )}
-              {completed.map((t, i) => <TradeCard key={i} trade={t} />)}
-            </>
-          )}
-      </Collapsible>
+          <Section title="Completed trades" count={data.completed.length}>
+            {data.completed.length === 0
+              ? <div className="empty-state">No completed trades yet.</div>
+              : data.completed.map((t, i) => <TradeCard key={`${t.ticker}-${i}`} t={t} />)}
+          </Section>
+        </>
+      )}
     </div>
   );
 }
