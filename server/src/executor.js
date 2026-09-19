@@ -24,12 +24,16 @@ function clampPrice(cents) {
  */
 function readFill(order, fallbackCents) {
   const filled = order?.taker_fill_count ?? order?.filled_count ?? 0;
-  const avg =
-    order?.average_fill_price ??
-    order?.taker_fill_cost && filled ? Math.round(order.taker_fill_cost / filled) : null;
+
+  let avg = order?.average_fill_price ?? null;
+  if (!avg && filled > 0 && order?.taker_fill_cost) {
+    avg = Math.round(order.taker_fill_cost / filled);
+  }
+
   const price = avg && avg > 0 ? clampPrice(avg) : fallbackCents;
   return { filled, price };
 }
+
 
 export async function enterPosition({ ticker, side, priceCents, contracts, reason = null, edgePct = null, teamName = null, sportKey = null, commenceTime = null }) {
   if (contracts <= 0) return { filled: 0 };
