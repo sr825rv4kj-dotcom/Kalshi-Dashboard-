@@ -302,4 +302,14 @@ input[type="file"] { width: 100%; font-size: 15px; color: var(--label-secondary)
 }
 .ledger-count { background: var(--field); border-radius: 999px; padding: 2px 9px; font-size: 13px; color: var(--muted); }
 .ledger-chevron { margin-left: auto; color: var(--muted); }
+/* ---- Recent orders ---- */
+.order-row { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--panel-border); }
+.order-row:last-of-type { border-bottom: none; }
+.order-badge { width: 44px; height: 44px; flex: 0 0 44px; border-radius: 12px; }
+.order-badge .team-chip-emoji { font-size: 23px; }
+.order-body { flex: 1; min-width: 0; }
+.order-title { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+.order-sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
+.order-right { text-align: right; font-size: 14px; font-weight: 600; }
+.order-status { font-size: 12px; font-weight: 400; margin-top: 2px; }
 
