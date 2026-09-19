@@ -7,7 +7,9 @@
  * the panel reported "the string did not match the expected pattern" - a JSON
  * parse failure that told you nothing about the actual fault.
  */
-import { kalshiGet, describeCredentials } from "./kalshiClient.js";
+import fs from "fs";
+import crypto from "crypto";
+import { kalshiGet } from "./kalshiClient.js";
 import { tradableBankroll } from "./botController.js";
 import { loadConfig } from "./configStore.js";
 import { loadState } from "./stateStore.js";
@@ -23,9 +25,42 @@ export function registerDiagnosticRoutes(app) {
     const report = { ranAt: new Date().toISOString(), stages: {}, sports: [] };
 
     try {
-      // Stage 1: which key is actually signing requests
+           // Stage 1: which key is actually signing requests. Computed here rather
+      // than imported so this endpoint works against the current kalshiClient.
       try {
-        report.stages.credentials = describeCredentials();
+        const keyId = process.env.KALSHI_API_KEY_ID;
+        const keyPath = process.env.KALSHI_PRIVATE_KEY_PATH;
+        const keyPem = process.env.KALSHI_PRIVATE_KEY_PEM;
+        const fileExists = Boolean(keyPath && fs.existsSync(keyPath));
+
+        // The env var wins in the current client, so report it as the source
+        // whenever it is set - that is what is really signing.
+        const source = keyPem
+          ? "KALSHI_PRIVATE_KEY_PEM env var"
+          : fileExists ? "saved in app" : "none";
+
+        let fingerprint = null;
+        let keyError = null;
+        try {
+          const pem = keyPem ? keyPem.replace(/\\n/g, "\n") : fs.readFileSync(keyPath, "utf8");
+          const pub = crypto.createPublicKey(pem);
+          fingerprint = crypto
+            .createHash("sha256")
+            .update(pub.export({ type: "spki", format: "der" }))
+            .digest("hex")
+            .slice(0, 16);
+        } catch (err) {
+          keyError = err.message;
+        }
+
+        report.stages.credentials = {
+          keyId: keyId ? `${keyId.slice(0, 8)}...` : null,
+          source,
+          envVarAlsoSet: Boolean(keyPem),
+          keyFileExists: fileExists,
+          fingerprint,
+          keyError,
+        };
       } catch (err) {
         report.stages.credentials = { error: err.message };
       }
