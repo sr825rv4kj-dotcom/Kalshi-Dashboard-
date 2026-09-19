@@ -166,7 +166,6 @@ app.get("/api/positions", async (_req, res) => {
     // Kalshi keeps returning settled holdings at 0 contracts. Those aren't
     // positions you hold, so they don't belong in an "open positions" table.
     .filter((p) => p.position !== 0);
-    res.json({ positions });
 
     res.json({ positions });
   } catch (err) {
