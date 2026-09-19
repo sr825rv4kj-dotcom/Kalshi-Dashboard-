@@ -14,18 +14,47 @@ import { getRecentTrades } from "./tradeLedgerStore.js";
 
 const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
-const POSITION_MONITOR_INTERVAL_MS = 90 * 1000;
+const POSITION_MONITOR_INTERVAL_MS = 45 * 1000;
 
 let intervalHandle = null;
 let positionMonitorHandle = null;
+let consecutiveFailures = 0;
 
 function loadTickerMap() {
-  const raw = JSON.parse(fs.readFileSync(TICKER_MAP_PATH, "utf8"));
-  const { _comment, _example, ...map } = raw;
-  return map;
+  try {
+    const raw = JSON.parse(fs.readFileSync(TICKER_MAP_PATH, "utf8"));
+    const { _comment, _example, ...map } = raw;
+    return map;
+  } catch {
+    return {}; // a missing manual map is normal - the resolver handles it
+  }
 }
 
-/** One notification the first time the balance crosses each milestone. */
+/**
+ * Milestone tiers. Crossing a milestone used to send a message and change
+ * nothing. Now it actually governs how the bot trades: more size, more
+ * concurrency, and a reserve that sizing is not allowed to touch.
+ */
+export function tierFor(bankroll, config) {
+  const tiers = config.milestoneTiers || [
+    { at: 0,     kellyFraction: 0.10, maxConcurrentPositions: 2, maxStakeDollars: 2,   reservePct: 0.00 },
+    { at: 100,   kellyFraction: 0.15, maxConcurrentPositions: 3, maxStakeDollars: 8,   reservePct: 0.10 },
+    { at: 500,   kellyFraction: 0.20, maxConcurrentPositions: 5, maxStakeDollars: 30,  reservePct: 0.20 },
+    { at: 2500,  kellyFraction: 0.25, maxConcurrentPositions: 8, maxStakeDollars: 120, reservePct: 0.30 },
+    { at: 10000, kellyFraction: 0.25, maxConcurrentPositions: 12, maxStakeDollars: 400, reservePct: 0.40 },
+  ];
+  let active = tiers[0];
+  for (const t of tiers) if (bankroll >= t.at) active = t;
+  return active;
+}
+
+/** Capital the bot is allowed to risk: balance minus the locked-in reserve. */
+export function tradableBankroll(bankroll, config) {
+  const tier = tierFor(bankroll, config);
+  const reserve = bankroll * (tier.reservePct ?? 0);
+  return { tier, reserve, tradable: Math.max(0, bankroll - reserve) };
+}
+
 async function checkMilestones(config, currentBalance) {
   const milestones = config.milestones || [];
   if (!milestones.length) return;
@@ -37,12 +66,16 @@ async function checkMilestones(config, currentBalance) {
 
   state.highestMilestoneNotified = crossed[0];
   saveState(state);
-  appendLog(`Milestone reached: $${crossed[0].toLocaleString()}`);
+  const tier = tierFor(currentBalance, config);
+  appendLog(
+    `Milestone reached: $${crossed[0].toLocaleString()} - now sizing at ${(tier.kellyFraction * 100).toFixed(0)}% Kelly, ` +
+    `${tier.maxConcurrentPositions} concurrent, $${tier.maxStakeDollars} max stake, ` +
+    `${(tier.reservePct * 100).toFixed(0)}% reserved.`
+  );
   const { botToken, chatId } = getTelegramCredentials();
   await notifyMilestone({ botToken, chatId, milestone: crossed[0], currentBalance }).catch(() => {});
 }
 
-/** One summary per calendar day, whether or not anything traded. */
 async function checkDailySummary(config, currentBalance) {
   const state = loadState();
   const today = new Date().toDateString();
@@ -65,13 +98,22 @@ async function checkDailySummary(config, currentBalance) {
 function atConcurrentPositionCap(config, bankroll) {
   const sm = config.survivalMode;
   const inSurvival = sm && bankroll < sm.balanceThreshold;
-
-  // Survival mode's tighter cap applies below the balance threshold; above it
-  // the general cap governs, which is what lets the bot hold several
-  // positions at once without needing separate bot instances.
-  const cap = inSurvival ? sm.maxConcurrentPositions : config.maxConcurrentPositions;
+  const tier = tierFor(bankroll, config);
+  const cap = inSurvival
+    ? sm.maxConcurrentPositions
+    : (config.maxConcurrentPositions ?? tier.maxConcurrentPositions);
   if (!cap) return false;
   return loadState().positions.length >= cap;
+}
+
+/** One position per game. Both sides of the same event is a guaranteed fee loss. */
+function eventKeyOf(ticker) {
+  const parts = String(ticker).split("-");
+  return parts.length > 1 ? `${parts[0]}-${parts[1]}` : String(ticker);
+}
+
+function openEventKeys() {
+  return new Set(loadState().positions.map((p) => eventKeyOf(p.ticker)));
 }
 
 async function checkDailyHalt(config) {
@@ -102,8 +144,18 @@ async function checkDailyHalt(config) {
   return { halted: false, currentBalance };
 }
 
+/**
+ * Position monitor. Previously this could only ever close a LOSER - there was
+ * no path that banked a winner, so every profitable position rode to
+ * settlement. Take-profit and the trailing stop are what turn an entry into a
+ * completed round trip.
+ */
 async function checkOpenPositions(config) {
   const state = loadState();
+  const takeProfitPct = config.takeProfitPct ?? 0.12;
+  const trailPct = config.trailingStopPct ?? 0.08;
+  let dirty = false;
+
   for (const position of [...state.positions]) {
     try {
       const book = await kalshiGet(`${V2}/markets/${position.ticker}/orderbook`);
@@ -111,81 +163,136 @@ async function checkOpenPositions(config) {
       const bestBid = levels && levels.length ? levels[0][0] : null;
       if (bestBid == null) continue;
 
-      const costCents = position.entryPriceCents * position.contracts;
-      const valueCents = bestBid * position.contracts;
-      const adverseMovePct = (position.entryPriceCents - bestBid) / position.entryPriceCents;
+      const entry = position.entryPriceCents;
+      const gainPct = (bestBid - entry) / entry;
+      const adverseMovePct = (entry - bestBid) / entry;
 
-      // exitBelowCost is the tightest possible stop: it fires on ordinary
-      // noise, and every exit still pays the round-trip fee.
-      if (config.exitBelowCost && valueCents < costCents) {
+      // Track the high-water mark so the trailing stop has a reference.
+      if (position.peakBidCents == null || bestBid > position.peakBidCents) {
+        position.peakBidCents = bestBid;
+        dirty = true;
+      }
+      const offPeakPct = position.peakBidCents ? (position.peakBidCents - bestBid) / position.peakBidCents : 0;
+
+      if (gainPct >= takeProfitPct) {
         appendLog(
-          `${position.ticker} worth $${(valueCents / 100).toFixed(2)} vs $${(costCents / 100).toFixed(2)} paid - exiting.`,
+          `${position.ticker} at ${bestBid}c vs ${entry}c entry (+${(gainPct * 100).toFixed(1)}%) - taking profit.`
+        );
+        await exitPosition(position, "take-profit");
+        continue;
+      }
+
+      // Only trails once the position has actually been in profit.
+      if (position.peakBidCents > entry && offPeakPct >= trailPct) {
+        appendLog(
+          `${position.ticker} fell ${(offPeakPct * 100).toFixed(1)}% from its ${position.peakBidCents}c peak - trailing out.`,
           "warn"
+        );
+        await exitPosition(position, "trailing-stop");
+        continue;
+      }
+
+      if (config.exitBelowCost && bestBid * position.contracts < entry * position.contracts) {
+        appendLog(
+          `${position.ticker} worth ${bestBid}c vs ${entry}c paid - exiting below cost.`, "warn"
         );
         await exitPosition(position, "below-cost");
-      } else if (adverseMovePct >= config.perPositionStopLossPct) {
-        appendLog(
-          `${position.ticker} down ${(adverseMovePct * 100).toFixed(1)}% from entry - cutting loss.`,
-          "warn"
-        );
+        continue;
+      }
+
+      if (adverseMovePct >= config.perPositionStopLossPct) {
+        appendLog(`${position.ticker} down ${(adverseMovePct * 100).toFixed(1)}% from entry - cutting loss.`, "warn");
         await exitPosition(position, "stop-loss");
       }
     } catch (err) {
       appendLog(`Error checking ${position.ticker}: ${err.message}`, "error");
     }
   }
+
+  if (dirty) {
+    const fresh = loadState();
+    for (const p of fresh.positions) {
+      const match = state.positions.find((s) => s.ticker === p.ticker && s.openedAt === p.openedAt);
+      if (match && match.peakBidCents != null) p.peakBidCents = match.peakBidCents;
+    }
+    saveState(fresh);
+  }
 }
 
 export async function runCycle() {
   const config = loadConfig();
 
-  const { halted, reason } = await checkDailyHalt(config);
-  if (halted) {
-    appendLog(`Skipping cycle - halted for today: ${reason}`);
+  // Circuit breaker: stop hammering the exchange after repeated failures.
+  const maxFailures = config.circuitBreakerFailures ?? 3;
+  if (consecutiveFailures >= maxFailures) {
+    appendLog(`Circuit breaker open (${consecutiveFailures} consecutive failures) - skipping cycle.`, "error");
     return;
   }
 
-  await checkOpenPositions(config);
+  try {
+    const { halted, reason } = await checkDailyHalt(config);
+    if (halted) {
+      appendLog(`Skipping cycle - halted for today: ${reason}`);
+      return;
+    }
 
-  const tickerMap = loadTickerMap();
-  const balanceData = await kalshiGet(`${V2}/portfolio/balance`);
-  const bankroll = (balanceData.balance ?? 0) / 100;
-  await checkMilestones(config, bankroll);
-  await checkDailySummary(config, bankroll);
+    await checkOpenPositions(config);
 
-  // Which sports are live comes straight from the odds provider - nothing to
-  // maintain, seasons handle themselves.
-  const activeSports = await discoverActiveSports();
-  if (!activeSports.length) {
-    appendLog("No active sports returned by the odds provider.", "warn");
-    return;
-  }
+    const tickerMap = loadTickerMap();
+    const balanceData = await kalshiGet(`${V2}/portfolio/balance`);
+    const bankroll = (balanceData.balance ?? 0) / 100;
+    await checkMilestones(config, bankroll);
+    await checkDailySummary(config, bankroll);
 
-  for (const sportKey of activeSports) {
-    const stop = await scanSport({
-      sportKey,
-      config,
-      bankroll,
-      tickerMap,
-      atCap: () => atConcurrentPositionCap(config, bankroll),
-    });
-    if (stop) return;
+    const { tier, reserve, tradable } = tradableBankroll(bankroll, config);
+    if (tradable <= 0) {
+      appendLog(`Balance $${bankroll.toFixed(2)} is entirely reserved - no tradable capital.`, "warn");
+      return;
+    }
+
+    const activeSports = await discoverActiveSports();
+    if (!activeSports.length) {
+      appendLog("No active sports returned by the odds provider.", "warn");
+      return;
+    }
+
+    const skipEvents = openEventKeys();
+
+    for (const sportKey of activeSports) {
+      const stop = await scanSport({
+        sportKey,
+        config: {
+          ...config,
+          kellyFraction: config.kellyFraction ?? tier.kellyFraction,
+          maxStakeDollars: tier.maxStakeDollars,
+        },
+        bankroll: tradable,
+        tickerMap,
+        skipEvents,
+        atCap: () => atConcurrentPositionCap(config, bankroll),
+      });
+      if (stop) break;
+    }
+
+    consecutiveFailures = 0;
+  } catch (err) {
+    consecutiveFailures++;
+    appendLog(`Cycle failed (${consecutiveFailures}/${maxFailures}): ${err.message}`, "error");
+    if (consecutiveFailures >= maxFailures) {
+      appendLog("Circuit breaker tripped - trading paused. Restart the bot once the cause is fixed.", "error");
+    }
   }
 }
 
-/**
- * Reschedules itself after every cycle at whatever cadence the current hour
- * calls for, so the bot tightens up during games and eases off overnight
- * without anyone setting an interval.
- */
+export function resetCircuitBreaker() {
+  consecutiveFailures = 0;
+  return { reset: true };
+}
+
 function scheduleNextCycle() {
   if (intervalHandle) clearTimeout(intervalHandle);
   intervalHandle = setTimeout(async () => {
-    try {
-      await runCycle();
-    } catch (err) {
-      appendLog(`Cycle error: ${err.message}`, "error");
-    }
+    await runCycle();
     if (intervalHandle) scheduleNextCycle();
   }, currentCadenceSeconds() * 1000);
 }
@@ -194,6 +301,7 @@ export function startBot() {
   const config = loadConfig();
   if (intervalHandle) return { alreadyRunning: true };
 
+  consecutiveFailures = 0;
   const { seconds, phase } = describeCadence();
   appendLog(`Bot started (${config.environment}). Scanning every ${seconds}s (${phase}).`);
 
@@ -205,8 +313,6 @@ export function startBot() {
   runCycle().catch((err) => appendLog(`Cycle error: ${err.message}`, "error"));
   scheduleNextCycle();
 
-  // Independent, faster loop watching only positions already open - tight
-  // stop-loss reaction without re-scanning the market every 90 seconds.
   positionMonitorHandle = setInterval(() => {
     if (!loadState().positions.length) return;
     checkOpenPositions(loadConfig()).catch((err) => appendLog(`Monitor error: ${err.message}`, "error"));
