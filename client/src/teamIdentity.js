@@ -1,4 +1,4 @@
-/**
+/** 
  * Team identity: full name, sport emoji, and real team colors.
  *
  * Colors are packed as a single string table rather than a nested object so
