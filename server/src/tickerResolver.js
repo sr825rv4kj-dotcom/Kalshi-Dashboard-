@@ -134,23 +134,21 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
     return { ticker: null, reason: `${series}: every query shape returned 0 (${JSON.stringify(r?.tried ?? [])})` };
   }
 
-  // Local filtering: status first, then close time. Markets with no close time
-  // are kept rather than dropped - absent data is not a reason to skip a live game.
+  // Status is the only gate that matters. Kalshi's close_time is the settlement
+  // deadline, not kickoff - it sits days past the game - so filtering on it
+  // discarded every genuinely tradeable market. "active" already means the book
+  // is open right now, which is the whole question. Time survives only as a
+  // tiebreak when a team appears in more than one fixture.
   const target = new Date(commenceTime).getTime();
-  const lo = Date.now() - WINDOW_BEFORE_H * 3600 * 1000;
-  const hi = Date.now() + WINDOW_AFTER_H * 3600 * 1000;
-
   const tradeable = all.filter((m) => TRADEABLE.has(String(m.status || "").toLowerCase()));
-  const pool = (tradeable.length ? tradeable : all).filter((m) => {
-    const ms = closeMs(m);
-    return ms == null || (ms >= lo && ms <= hi);
-  });
+  const pool = tradeable.length ? tradeable : all;
 
   if (!pool.length) {
     const statuses = {};
     for (const m of all) statuses[m.status ?? "?"] = (statuses[m.status ?? "?"] || 0) + 1;
-    return { ticker: null, reason: `${series}: ${all.length} markets, none tradeable in window (statuses: ${JSON.stringify(statuses)})` };
+    return { ticker: null, reason: `${series}: ${all.length} markets, none with a tradeable status (${JSON.stringify(statuses)})` };
   }
+
 
   const words = normalize(teamName).split(" ").filter((w) => w.length > 2);
   const strong = words.filter((w) => !WEAK.has(w));
