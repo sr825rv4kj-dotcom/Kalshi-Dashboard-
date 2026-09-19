@@ -16,6 +16,7 @@ import GamesBoard from "./components/GamesBoard.jsx";
 import BackgroundSettings from "./components/BackgroundSettings.jsx";
 import BotConfigPanel from "./components/BotConfigPanel.jsx";
 import DiagnosticPanel from "./components/DiagnosticPanel.jsx";
+import SelfCheckPanel from "./components/SelfCheckPanel.jsx";
 import { getTodaysTheme, applyTheme, setTheme, getTheme, THEME_KEYS } from "./theme.js";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:4000";
@@ -28,7 +29,7 @@ function DashboardApp() {
   const [needsSetup, setNeedsSetup] = useState(false);
 
   // Set when you choose "Skip for now". Without it, the first failing Kalshi
-  // call bounced you straight back to the credentials screen - the error text
+  // call bounced straight back to the credentials screen - the error text
   // contains "credential"/"401", which used to re-arm setNeedsSetup below.
   const [skippedSetup, setSkippedSetup] = useState(false);
 
@@ -75,7 +76,6 @@ function DashboardApp() {
     } catch (err) {
       setError(err.message);
       // Only auto-redirect to setup if you haven't deliberately skipped it.
-      // The banner's "Update credentials" button is always available instead.
       if (!skippedSetup && /key|credential|401|403/i.test(err.message)) {
         setNeedsSetup(true);
       }
@@ -111,7 +111,9 @@ function DashboardApp() {
       <div className="masthead">
         <h1>Portfolio Ledger</h1>
         <span className="clock">
-          {lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "Syncing"}
+          {lastUpdated
+            ? `Updated ${lastUpdated.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+            : "Syncing"}
         </span>
       </div>
 
@@ -148,6 +150,7 @@ function DashboardApp() {
       </div>
 
       <BotControlPanel apiBase={API_BASE} />
+      <SelfCheckPanel apiBase={API_BASE} />
       <DiagnosticPanel apiBase={API_BASE} />
       <BotConfigPanel apiBase={API_BASE} />
       <GamesBoard apiBase={API_BASE} />
@@ -156,6 +159,7 @@ function DashboardApp() {
       <NotificationsPanel apiBase={API_BASE} />
       <CostTrackingPanel apiBase={API_BASE} />
       <ApiKeysPanel apiBase={API_BASE} />
+
       <div className="panel">
         <h2>Appearance</h2>
         <div className="env-pill-group" style={{ width: "fit-content" }}>
@@ -171,6 +175,7 @@ function DashboardApp() {
           ))}
         </div>
       </div>
+
       <BackgroundSettings apiBase={API_BASE} />
     </div>
   );
