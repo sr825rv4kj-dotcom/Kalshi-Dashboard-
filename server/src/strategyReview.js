@@ -16,6 +16,7 @@
  */
 
 import { getTradeLifecycles } from "./tradeLedgerStore.js";
+import { loadState } from "./stateStore.js";
 
 /** Below this, a bucket is reported but explicitly marked as not actionable. */
 const MIN_SAMPLE = 10;
@@ -179,6 +180,62 @@ function observations({ byExitFamily, byPriceBand, byTiming, overall }) {
   return out;
 }
 
+/**
+ * The last scan's refusal tally, flattened across sports and ordered by how
+ * much each gate is actually blocking. This is the answer to "why isn't it
+ * trading" - previously unanswerable without reading raw logs.
+ */
+const REASON_LABELS = {
+  "dropped:live": "live trading disabled",
+  "dropped:window": "outside the entry window",
+  "dropped:unresolved": "no matching Kalshi market",
+  "dropped:closed": "market not tradeable",
+  "dropped:duplicate": "already holding that game",
+  "dropped:error": "data fetch failed",
+  "no-price": "no usable price in the book",
+  "spread-too-wide": "book too wide to trust the quote",
+  "price-below-floor": "price under the floor (fee would dominate)",
+  "price-above-ceiling": "price over the ceiling (too little upside)",
+  "edge-implausible": "edge too large to be real",
+  "edge-too-small": "edge too small to clear the fee",
+  "ev-too-thin": "expected value under the per-contract floor",
+  "illiquid": "not enough resting size",
+  "size-zero": "bankroll cannot afford a contract",
+  "stale-quote": "sharp quote had gone stale",
+  "no-quote-timestamp": "feed carried no quote timestamp",
+  "model-disagrees": "sharp line contradicted the game state",
+  "no-live-score-match": "could not match a live score to that team",
+  "live-scores-unavailable": "live scores endpoint unavailable",
+  "no-model-for-sport": "no in-game model for that sport",
+  "unmodellable": "could not model the game state",
+  "no-fill": "order placed but nothing filled",
+  "skip-other": "other",
+};
+
+function lastScanSummary() {
+  let scans = {};
+  try { scans = loadState().lastScan || {}; } catch { return null; }
+  const sports = Object.keys(scans);
+  if (!sports.length) return null;
+
+  const totals = {};
+  let seen = 0, entered = 0, newest = null;
+  for (const [sport, row] of Object.entries(scans)) {
+    seen += row.seen || 0;
+    entered += row.entered || 0;
+    if (!newest || Date.parse(row.at) > Date.parse(newest)) newest = row.at;
+    for (const [code, n] of Object.entries(row.reasons || {})) {
+      totals[code] = (totals[code] || 0) + n;
+    }
+  }
+
+  const blockers = Object.entries(totals)
+    .map(([code, count]) => ({ code, count, label: REASON_LABELS[code] || code }))
+    .sort((a, b) => b.count - a.count);
+
+  return { at: newest, sports: sports.length, seen, entered, blockers };
+}
+
 export function buildStrategyReview() {
   const { completed, open } = getTradeLifecycles();
 
@@ -200,6 +257,7 @@ export function buildStrategyReview() {
     minSample: MIN_SAMPLE,
     overall,
     open: { count: open.length, exposureDollars: Number(openExposure.toFixed(2)) },
+    lastScan: lastScanSummary(),
     byExitFamily, byExitReason, byPriceBand, byEdgeBand, bySport, byTiming,
     observations: observations({ byExitFamily, byPriceBand, byTiming, overall }),
   };
