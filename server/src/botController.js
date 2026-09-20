@@ -23,6 +23,7 @@ let positionMonitorHandle = null;
 let consecutiveFailures = 0;
 let breakerOpenedAt = null;
 let breakerTrips = 0;
+let lastCapLogAt = 0;
 
 /**
  * How long the breaker stays shut before it will try again, doubling on each
@@ -518,7 +519,14 @@ export async function runCycle() {
     }
 
     if (atConcurrentPositionCap(config, bankroll)) {
-      appendLog(`At the concurrent position cap with ${loadState().positions.length} open - waiting for games to settle.`);
+      // Once every 10 minutes, not every 20-second scan. At peak cadence this
+      // wrote 180 identical lines an hour and pushed every useful line out of
+      // the 500-entry log buffer, which is how a readable log becomes useless.
+      const now = Date.now();
+      if (now - lastCapLogAt > 10 * 60 * 1000) {
+        lastCapLogAt = now;
+        appendLog(`At the concurrent position cap with ${loadState().positions.length} open - waiting for games to settle.`);
+      }
       return;
     }
 
