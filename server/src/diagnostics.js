@@ -184,23 +184,43 @@ export function registerDiagnosticRoutes(app) {
         return res.json({ ok: false, ...out });
       }
 
-      // 4. Place the order
-      const clientOrderId = `test_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            // 4. Place the order on Kalshi's v2 order API. The v1 endpoint now
+      //    returns HTTP 410 deprecated_v1_order_endpoint. Immediate-or-cancel
+      //    means the response itself reports the fill - no polling, and no
+      //    stray order left resting if it does not take.
       const orderBody = {
-        ticker, client_order_id: clientOrderId, side: "yes", action: "buy",
-        type: "limit", count: contracts, yes_price: limitCents,
+        ticker,
+        client_order_id: `test_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        side: "bid",
+        count: Number(contracts).toFixed(2),
+        price: (limitCents / 100).toFixed(2),
+        time_in_force: "immediate_or_cancel",
+        self_trade_prevention_type: "taker_at_cross",
+        post_only: false,
       };
-      step("placing", { orderBody });
+      step("placing", { endpoint: `${V2}/portfolio/events/orders`, orderBody });
 
       let placeRes;
       try {
-        placeRes = await kalshiPost(`${V2}/portfolio/orders`, orderBody);
+        placeRes = await kalshiPost(`${V2}/portfolio/events/orders`, orderBody);
       } catch (err) {
         step("place-failed", { error: err.message });
         return res.json({ ok: false, ...out });
       }
-      const orderId = placeRes.order?.order_id;
-      step("placed", { orderId, raw: placeRes });
+
+      const filled = Math.round(Number(placeRes.fill_count ?? 0)) || 0;
+      const avgPrice = Number(placeRes.average_fill_price);
+      step("fill", {
+        filled,
+        requested: contracts,
+        remaining: placeRes.remaining_count,
+        averageFillPriceCents: Number.isFinite(avgPrice) ? Math.round(avgPrice * 100) : null,
+        averageFeeCents: Number.isFinite(Number(placeRes.average_fee_paid))
+          ? Math.round(Number(placeRes.average_fee_paid) * 100) : null,
+        raw: placeRes,
+      });
+
+
 
       // 5. Check the fill
       await new Promise((r) => setTimeout(r, 3000));
