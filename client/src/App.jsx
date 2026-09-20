@@ -13,20 +13,26 @@ import CostTrackingPanel from "./components/CostTrackingPanel.jsx";
 import AuthGate from "./components/AuthGate.jsx";
 import NotificationsPanel from "./components/NotificationsPanel.jsx";
 import GamesBoard from "./components/GamesBoard.jsx";
-import BackgroundSettings from "./components/BackgroundSettings.jsx";
+import WallpaperPanel from "./components/WallpaperPanel.jsx";
 import BotConfigPanel from "./components/BotConfigPanel.jsx";
 import DiagnosticPanel from "./components/DiagnosticPanel.jsx";
 import SelfCheckPanel from "./components/SelfCheckPanel.jsx";
-import { getTodaysTheme, applyTheme, setTheme, getTheme, THEME_KEYS } from "./theme.js";
+import { applyWallpaper, readLocal, defaultSettings } from "./wallpapers.js";
 
 const RAW_BASE = import.meta.env.VITE_API_BASE;
 const API_BASE =
   typeof RAW_BASE === "string" && RAW_BASE && RAW_BASE !== "undefined" ? RAW_BASE : "";
 
-function DashboardApp() {
-  const [theme, setThemeState] = useState(() => getTodaysTheme());
-  useEffect(() => { applyTheme(theme); }, [theme]);
+// Paint the wallpaper from local storage before React renders anything. The
+// server copy arrives a moment later and takes over; without this the screen
+// flashes plain black on every load while that call is in flight.
+try {
+  applyWallpaper((readLocal() || defaultSettings()).active);
+} catch {
+  // a wallpaper must never be the reason the dashboard fails to start
+}
 
+function DashboardApp() {
   const [checkingConfig, setCheckingConfig] = useState(true);
   const [needsSetup, setNeedsSetup] = useState(false);
 
@@ -37,7 +43,6 @@ function DashboardApp() {
 
   const [balance, setBalance] = useState(null);
   const [positions, setPositions] = useState([]);
-  const [orders, setOrders] = useState([]);
   const [pnlSeries, setPnlSeries] = useState([]);
   const [error, setError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
@@ -59,25 +64,21 @@ function DashboardApp() {
   async function loadAll() {
     try {
       setError(null);
-      const [balanceRes, positionsRes, ordersRes, pnlRes] = await Promise.all([
+      const [balanceRes, positionsRes, pnlRes] = await Promise.all([
         fetch(`${API_BASE}/api/balance`).then((r) => r.json()),
         fetch(`${API_BASE}/api/positions`).then((r) => r.json()),
-        fetch(`${API_BASE}/api/orders?limit=25`).then((r) => r.json()),
         fetch(`${API_BASE}/api/pnl-history`).then((r) => r.json()),
       ]);
       if (balanceRes.error) throw new Error(balanceRes.error);
       if (positionsRes.error) throw new Error(positionsRes.error);
-      if (ordersRes.error) throw new Error(ordersRes.error);
       if (pnlRes.error) throw new Error(pnlRes.error);
 
       setBalance(balanceRes.balanceDollars);
       setPositions(positionsRes.positions ?? []);
-      setOrders(ordersRes.orders ?? []);
       setPnlSeries(pnlRes.series ?? []);
       setLastUpdated(new Date());
     } catch (err) {
       setError(err.message);
-      // Only auto-redirect to setup if you haven't deliberately skipped it.
       if (!skippedSetup && /key|credential|401|403/i.test(err.message)) {
         setNeedsSetup(true);
       }
@@ -142,14 +143,13 @@ function DashboardApp() {
       <BalanceBlock balance={balance} />
 
       <div className="chart-panel panel">
-        <h2>Cumulative P&L</h2>
+        <h2>Cumulative P&amp;L</h2>
         <PnlChart series={pnlSeries} />
       </div>
 
       <div className="grid">
         <div className="panel"><h2>Open Positions</h2><PositionsTable positions={positions} /></div>
-          <div className="panel"><h2>Statement</h2><OrdersTable /></div>
-
+        <div className="panel"><h2>Statement</h2><OrdersTable /></div>
       </div>
 
       <BotControlPanel apiBase={API_BASE} />
@@ -162,24 +162,7 @@ function DashboardApp() {
       <NotificationsPanel apiBase={API_BASE} />
       <CostTrackingPanel apiBase={API_BASE} />
       <ApiKeysPanel apiBase={API_BASE} />
-
-      <div className="panel">
-        <h2>Appearance</h2>
-        <div className="env-pill-group" style={{ width: "fit-content" }}>
-          {THEME_KEYS.map((key) => (
-            <button
-              key={key}
-              type="button"
-              className={`env-pill ${theme.key === key ? "env-pill-active" : ""}`}
-              onClick={() => setThemeState(setTheme(key))}
-            >
-              {getTheme(key).name}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <BackgroundSettings apiBase={API_BASE} />
+      <WallpaperPanel apiBase={API_BASE} />
     </div>
   );
 }
@@ -191,4 +174,3 @@ export default function App() {
     </AuthGate>
   );
 }
-
