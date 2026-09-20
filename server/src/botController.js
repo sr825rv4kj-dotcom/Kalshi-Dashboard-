@@ -233,11 +233,37 @@ async function bestYesBidCents(ticker) {
   }
 }
 
+/**
+ * Kalshi's fee rounds UP to a whole cent per contract, each way. On an 8c
+ * contract that is 1c in and 1c out - 25% of the stake in fees - while a 15%
+ * take-profit is only 1.2c of gross gain. Every "winner" at that price closed
+ * at a loss, which is where $2.21 went in ten round trips.
+ *
+ * So the exit target is the LARGER of the percentage target and the price that
+ * actually clears the round-trip fee plus a margin.
+ */
+function takeProfitTargetCents(entryCents, config) {
+  const pct = config.takeProfitPct ?? 0.12;
+  const multiplier = config.feeMultiplier ?? 0.07;
+  const minProfitCents = config.minProfitCentsPerContract ?? 1;
+
+  const feeAt = (cents) => {
+    const p = cents / 100;
+    return Math.ceil(multiplier * p * (1 - p) * 100); // whole cents, as Kalshi charges
+  };
+
+  const pctTarget = entryCents * (1 + pct);
+  const roundTripFee = feeAt(entryCents) + feeAt(Math.min(99, Math.round(pctTarget)));
+  const feeTarget = entryCents + roundTripFee + minProfitCents;
+
+  return Math.ceil(Math.max(pctTarget, feeTarget));
+}
+
 async function checkOpenPositions(config) {
   const state = loadState();
-  const takeProfitPct = config.takeProfitPct ?? 0.12;
   const trailPct = config.trailingStopPct ?? 0.08;
   let dirty = false;
+
 
   for (const position of [...state.positions]) {
     try {
@@ -255,10 +281,13 @@ async function checkOpenPositions(config) {
       }
       const offPeakPct = position.peakBidCents ? (position.peakBidCents - bestBid) / position.peakBidCents : 0;
 
-      if (gainPct >= takeProfitPct) {
+      const target = takeProfitTargetCents(entry, config);
+      if (bestBid >= target) {
         appendLog(
-          `${position.ticker} at ${bestBid}c vs ${entry}c entry (+${(gainPct * 100).toFixed(1)}%) - taking profit.`
+          `${position.ticker} at ${bestBid}c vs ${entry}c entry (+${(gainPct * 100).toFixed(1)}%, ` +
+          `target ${target}c clears fees) - taking profit.`
         );
+
         await exitPosition(position, "take-profit");
         recordExit(position.ticker);
         continue;
