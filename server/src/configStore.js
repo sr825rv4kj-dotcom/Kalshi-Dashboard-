@@ -29,7 +29,7 @@ import { CONFIG_DIR } from "./paths.js";
 const CONFIG_PATH = path.join(CONFIG_DIR, "bot-config.json");
 
 /** Bump this whenever a STRATEGY_KEYS default below changes meaningfully. */
-export const STRATEGY_VERSION = 4;
+export const STRATEGY_VERSION = 5;
 
 /**
  * Keys the migration is allowed to reset. Anything not listed here is the
@@ -108,17 +108,33 @@ export const DEFAULTS = {
   feeMultiplier: 0.07,
   circuitBreakerFailures: 3,
 
+  // Survival mode: flat bets and a stricter edge bar at a small balance.
+  //
+  // The concurrency cap was 3, and that number was chosen when the bot FLIPPED
+  // positions - a slot freed up in minutes, so it was never the binding
+  // constraint. Holding to settlement changed that completely: a slot is now
+  // occupied for a whole game, three-plus hours. On a full Sunday slate the bot
+  // filled all three slots in minutes and then logged "at the concurrent
+  // position cap" every twenty seconds for the rest of the afternoon, with
+  // $12.89 of $18.89 sitting idle through the busiest window of the week.
+  //
+  // Six slots puts ~64% of the balance to work and leaves a real buffer. Six
+  // at $2 is deliberately preferred over three at $4: identical exposure, but
+  // the outcome is spread across six independent games instead of three. With
+  // a small edge, diversification beats concentration every time.
   survivalMode: {
     balanceThreshold: 60,
     flatBetDollars: 2,
-    maxConcurrentPositions: 3,
+    maxConcurrentPositions: 6,
     edgeMultiplier: 1.25,
   },
 
   milestoneTiers: [
-    { at: 0,     kellyFraction: 0.25, maxConcurrentPositions: 3,  maxStakeDollars: 4,   reservePct: 0.00 },
-    { at: 100,   kellyFraction: 0.25, maxConcurrentPositions: 5,  maxStakeDollars: 15,  reservePct: 0.10 },
-    { at: 500,   kellyFraction: 0.25, maxConcurrentPositions: 8,  maxStakeDollars: 50,  reservePct: 0.20 },
+    // Raised across the board for the same reason as survival mode: a held
+    // position ties up its slot for the length of a game, not for minutes.
+    { at: 0,     kellyFraction: 0.25, maxConcurrentPositions: 6,  maxStakeDollars: 4,   reservePct: 0.00 },
+    { at: 100,   kellyFraction: 0.25, maxConcurrentPositions: 10, maxStakeDollars: 15,  reservePct: 0.10 },
+    { at: 500,   kellyFraction: 0.25, maxConcurrentPositions: 14, maxStakeDollars: 50,  reservePct: 0.20 },
     { at: 2500,  kellyFraction: 0.30, maxConcurrentPositions: 12, maxStakeDollars: 200, reservePct: 0.30 },
     { at: 10000, kellyFraction: 0.30, maxConcurrentPositions: 16, maxStakeDollars: 600, reservePct: 0.40 },
   ],
