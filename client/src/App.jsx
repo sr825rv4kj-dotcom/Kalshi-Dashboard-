@@ -17,6 +17,7 @@ import WallpaperPanel from "./components/WallpaperPanel.jsx";
 import BotConfigPanel from "./components/BotConfigPanel.jsx";
 import DiagnosticPanel from "./components/DiagnosticPanel.jsx";
 import SelfCheckPanel from "./components/SelfCheckPanel.jsx";
+import StrategyReviewPanel from "./components/StrategyReviewPanel.jsx";
 import { applyWallpaper, readLocal, defaultSettings } from "./wallpapers.js";
 
 const RAW_BASE = import.meta.env.VITE_API_BASE;
@@ -153,6 +154,7 @@ function DashboardApp() {
       </div>
 
       <BotControlPanel apiBase={API_BASE} />
+      <StrategyReviewPanel apiBase={API_BASE} />
       <SelfCheckPanel apiBase={API_BASE} />
       <DiagnosticPanel apiBase={API_BASE} />
       <BotConfigPanel apiBase={API_BASE} />
