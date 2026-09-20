@@ -42,17 +42,25 @@ export function getRecentTrades(limit = 100) {
 }
 
 /**
- * Pairs each entry with its matching exit (same ticker, first exit after
- * that entry) to produce completed round-trips with real cost, proceeds,
- * net P&L and ROI. Entries without a matching exit are still-open trades.
+ * Pairs each entry with its matching exit to produce completed round-trips
+ * with real cost, proceeds, net P&L and ROI.
  *
  * All dollar figures derive from actual fill prices and counts recorded at
  * execution time - nothing here is estimated or simulated.
  */
 export function getTradeLifecycles() {
   const ledger = loadLedger();
-  const entries = ledger.filter((t) => t.action === "enter" && t.filled > 0);
-  const exits = ledger.filter((t) => t.action === "exit" && t.filled > 0);
+
+  // Pair on LEDGER ORDER, not on a strict timestamp comparison. An exit that
+  // landed in the same second as its entry - routine with immediate-or-cancel
+  // orders - failed "exit.timestamp > entry.timestamp" and left the trade
+  // stranded as permanently open, with no cost, proceeds or ROI ever reported.
+  const entries = ledger
+    .map((t, i) => ({ ...t, _i: i }))
+    .filter((t) => t.action === "enter" && t.filled > 0);
+  const exits = ledger
+    .map((t, i) => ({ ...t, _i: i }))
+    .filter((t) => t.action === "exit" && t.filled > 0);
   const usedExitIndexes = new Set();
 
   const completed = [];
@@ -60,7 +68,7 @@ export function getTradeLifecycles() {
 
   for (const entry of entries) {
     const exitIndex = exits.findIndex(
-      (x, i) => !usedExitIndexes.has(i) && x.ticker === entry.ticker && new Date(x.timestamp) > new Date(entry.timestamp)
+      (x, i) => !usedExitIndexes.has(i) && x.ticker === entry.ticker && x._i > entry._i
     );
 
     const costDollars = (entry.filled * entry.priceCents) / 100;
