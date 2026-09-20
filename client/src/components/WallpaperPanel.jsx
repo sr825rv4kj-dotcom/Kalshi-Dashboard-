@@ -5,6 +5,49 @@ import {
 } from "../wallpapers.js";
 
 /**
+ * A live, animating thumbnail of one wallpaper.
+ *
+ * A still swatch is a poor way to choose a moving wallpaper - Ribbons and Ink
+ * look nearly identical frozen. Each tile runs the real effect at a small size
+ * and a low frame rate, so the grid shows what you are actually picking.
+ */
+function SwatchPreview({ def }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    let reduced = false;
+    try { reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches; } catch { /* ignore */ }
+
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const w = canvas.clientWidth || 96;
+    const h = canvas.clientHeight || 128;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const draw = def.make();
+    if (reduced) { draw(ctx, w, h, 0); return; }
+
+    // Ten frames a second is plenty for a thumbnail and leaves the main
+    // wallpaper the headroom it needs.
+    let raf = null, timer = null;
+    const t0 = performance.now();
+    const tick = () => {
+      draw(ctx, w, h, (performance.now() - t0) / 1000);
+      timer = setTimeout(() => { raf = requestAnimationFrame(tick); }, 100);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => { if (raf) cancelAnimationFrame(raf); if (timer) clearTimeout(timer); };
+  }, [def]);
+
+  return <canvas ref={ref} aria-hidden="true" />;
+}
+
+/**
  * Wallpaper picker.
  *
  * The built-in animations are drawn by the browser and always work. The URL
@@ -158,13 +201,9 @@ export default function WallpaperPanel({ apiBase }) {
             type="button"
             className={`wp-swatch ${activeKey === b.key ? "wp-swatch-active" : ""}`}
             onClick={() => choose({ type: "builtin", key: b.key })}
-            style={{
-              background: `${b.base}`,
-              backgroundImage: b.blobs
-                .map(([c, x, y]) => `radial-gradient(circle at ${x} ${y}, ${c} 0%, transparent 60%)`)
-                .join(", "),
-            }}
+            style={{ background: b.base }}
           >
+            <SwatchPreview def={b} />
             <span className="wp-swatch-name">{b.name}</span>
           </button>
         ))}
