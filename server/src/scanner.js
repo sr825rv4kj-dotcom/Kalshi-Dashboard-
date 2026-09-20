@@ -27,14 +27,14 @@ import { kalshiGet } from "./kalshiClient.js";
 import { getSharpProbabilities } from "./scraper.js";
 import { assessOpportunity } from "./riskManager.js";
 import { enterPosition } from "./executor.js";
-import { appendLog } from "./stateStore.js";
+import { appendLog, loadState, saveState } from "./stateStore.js";
 import { resolveTicker } from "./tickerResolver.js";
 import { getLiveScores, findLiveGameForTeam } from "./scoresFetcher.js";
 import { corroboratedProbability, fractionRemaining, paramsFor } from "./liveModel.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-20-live-corroborated";
+export const SCANNER_VERSION = "2026-09-20-tallied";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -174,6 +174,35 @@ async function priceFor(ticker, market) {
   return { askCents: 0, askSize: 0, bidCents: null, spreadCents: null, source: `book-empty (${shape})` };
 }
 
+/**
+ * Records why every candidate was refused, per scan, into state.
+ *
+ * The scan log only ever printed ONE example reason ("First: ..."), which made
+ * "why isn't it trading" unanswerable without reading raw logs and guessing.
+ * With every rejection carrying a code, the bottleneck becomes a number: 23
+ * markets seen, 14 outside the price band, 6 edge too small, 3 stale line. The
+ * gate to loosen stops being a matter of opinion.
+ */
+export function recordScanTally(sportKey, tally, seen, entered) {
+  try {
+    const state = loadState();
+    state.lastScan = state.lastScan || {};
+    state.lastScan[sportKey] = {
+      at: new Date().toISOString(),
+      seen, entered,
+      reasons: tally,
+    };
+    // Keep only sports seen in the last hour so this cannot grow unbounded.
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    for (const [k, v] of Object.entries(state.lastScan)) {
+      if (Date.parse(v.at) < cutoff) delete state.lastScan[k];
+    }
+    saveState(state);
+  } catch {
+    // telemetry must never be the reason a scan fails
+  }
+}
+
 export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, skipEvents }) {
   let probResult;
   try {
@@ -255,11 +284,13 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
         `${sportKey}: ${livePending.length} in-play market(s) skipped - no in-game model exists for this sport, ` +
         `so a stale line could not be detected.`, "warn"
       );
+      for (const c of viable) if (c.timing.live) bump("no-model-for-sport");
       viable = viable.filter((c) => !c.timing.live);
     } else {
       const { events, error } = await getLiveScores(sportKey);
       if (error && !events.length) {
         appendLog(`${sportKey}: live scores unavailable (${error}) - in-play markets skipped this cycle.`, "warn");
+        for (const c of viable) if (c.timing.live) bump("live-scores-unavailable");
         viable = viable.filter((c) => !c.timing.live);
       } else {
         const vetoed = [];
@@ -269,6 +300,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
           const game = findLiveGameForTeam(events, c.teamName);
           if (!game) {
             vetoed.push(`${c.teamName}: in play but no live score found - cannot check the line against the game`);
+            bump("no-live-score-match");
             return false;
           }
 
@@ -278,6 +310,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
           });
           if (!corr.usable) {
             vetoed.push(`${c.teamName}: in play, could not model the game state`);
+            bump("unmodellable");
             return false;
           }
 
@@ -288,6 +321,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
               `${(corr.modelProbability * 100).toFixed(0)}% (${game.homeScore}-${game.awayScore}, ` +
               `${(frac * 100).toFixed(0)}% left) - ${corr.disagreementPoints.toFixed(0)}pt gap exceeds ${maxDisagree}, line is stale`
             );
+            bump("model-disagrees");
             return false;
           }
 
@@ -313,7 +347,11 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
   );
 
   const rejected = [];
+  const tally = {};
+  const bump = (code) => { tally[code] = (tally[code] || 0) + 1; };
+  for (const [k, n] of Object.entries(drops)) if (n) bump(`dropped:${k}`);
   const maxSpread = config.maxSpreadCents ?? 6;
+  let entered = 0;
 
   for (const c of viable) {
     if (atCap()) {
@@ -324,6 +362,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
 
     const askCents = c.pricing.askCents;
     if (askCents <= 0 || askCents >= 100) {
+      bump("no-price");
       rejected.push(`${c.ticker}: ${c.pricing.source}`);
       continue;
     }
@@ -331,6 +370,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
     // A wide book means the quoted ask is not a price anyone is trading at,
     // and any edge measured against it is measurement error.
     if (maxSpread && c.pricing.spreadCents != null && c.pricing.spreadCents > maxSpread) {
+      bump("spread-too-wide");
       rejected.push(`${c.ticker}: ${c.pricing.spreadCents}c spread exceeds the ${maxSpread}c limit - the quote is not a real price`);
       continue;
     }
@@ -358,6 +398,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
     });
 
     if (assessment.action === "skip") {
+      bump(assessment.code || "skip-other");
       rejected.push(
         `${c.ticker} ${askCents}c [${c.pricing.source}] (sharp ${(c.trueProbability * 100).toFixed(1)}%): ${assessment.reason}`
       );
@@ -392,11 +433,20 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       commenceTime: c.commenceTime,
     });
 
-    if (result && result.filled > 0) openEvents.add(eventKeyOf(c.ticker));
+    if (result && result.filled > 0) { openEvents.add(eventKeyOf(c.ticker)); entered += 1; }
+    else bump("no-fill");
   }
 
-  if (rejected.length) {
-    appendLog(`${sportKey}: ${rejected.length} tradeable market(s) failed entry checks. First: ${rejected[0]}`);
+  const tallyLine = Object.entries(tally)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `${k} x${n}`)
+    .join(", ");
+  if (tallyLine) {
+    appendLog(`${sportKey}: entered ${entered}. Refusals - ${tallyLine}.`);
   }
+  if (rejected.length) {
+    appendLog(`${sportKey}: e.g. ${rejected[0]}`);
+  }
+  recordScanTally(sportKey, tally, teamEntries.length, entered);
   return false;
 }
