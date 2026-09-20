@@ -21,6 +21,30 @@ export const CONTROLLER_VERSION = "2026-09-20-hold-to-settlement";
 let intervalHandle = null;
 let positionMonitorHandle = null;
 let consecutiveFailures = 0;
+let breakerOpenedAt = null;
+let breakerTrips = 0;
+
+/**
+ * How long the breaker stays shut before it will try again, doubling on each
+ * consecutive trip so a genuine outage is not hammered, capped at an hour.
+ */
+function breakerCooldownMs(config) {
+  const base = (config.circuitBreakerCooldownMinutes ?? 10) * 60 * 1000;
+  return Math.min(base * Math.pow(2, Math.max(0, breakerTrips - 1)), 60 * 60 * 1000);
+}
+
+/** Breaker state, so the watchdog can report it instead of claiming health. */
+export function getBreakerStatus(config = null) {
+  const maxFailures = (config || loadConfig()).circuitBreakerFailures ?? 3;
+  const open = consecutiveFailures >= maxFailures;
+  if (!open) return { open: false, consecutiveFailures, trips: breakerTrips };
+  const cooldown = breakerCooldownMs(config || loadConfig());
+  const waited = breakerOpenedAt ? Date.now() - breakerOpenedAt : 0;
+  return {
+    open: true, consecutiveFailures, trips: breakerTrips,
+    retryInSeconds: Math.max(0, Math.round((cooldown - waited) / 1000)),
+  };
+}
 
 function loadTickerMap() {
   try {
@@ -405,10 +429,66 @@ export async function runCycle() {
   const config = loadConfig();
 
   const maxFailures = config.circuitBreakerFailures ?? 3;
+
+  // The breaker used to be a PERMANENT LATCH. Once it tripped, runCycle
+  // returned before doing any work - so it could never record the successful
+  // cycle that was the only thing able to reset it. Worse, the timer kept
+  // running, so isRunning() stayed true and the watchdog went on reporting
+  // "healthy" while the bot silently traded nothing until a human restarted
+  // it. One transient exchange outage was enough to end the day.
+  //
+  // It is now a proper breaker: it opens, waits, then half-opens and lets a
+  // single probe cycle through. A probe that succeeds clears everything; one
+  // that fails re-opens with a doubled cooldown, so a real outage is backed
+  // off rather than hammered.
   if (consecutiveFailures >= maxFailures) {
-    appendLog(`Circuit breaker open (${consecutiveFailures} consecutive failures) - skipping cycle.`, "error");
-    return;
+    const cooldown = breakerCooldownMs(config);
+    const waited = breakerOpenedAt ? Date.now() - breakerOpenedAt : Infinity;
+
+    if (waited < cooldown) {
+      appendLog(
+        `Circuit breaker open (${consecutiveFailures} consecutive failures) - ` +
+        `retrying in ${Math.ceil((cooldown - waited) / 60000)}m.`,
+        "error"
+      );
+      return;
+    }
+
+    // Half-open: allow exactly one attempt. Leaving the counter one below the
+    // limit means a single further failure re-opens it immediately.
+    appendLog(
+      `Circuit breaker half-open after ${Math.round(waited / 60000)}m - running one probe cycle. ` +
+      `If it succeeds, normal trading resumes.`,
+      "warn"
+    );
+    consecutiveFailures = maxFailures - 1;
   }
+
+  /**
+   * Clears the breaker. Called as soon as the exchange has actually answered,
+   * NOT at the end of runCycle - the reset used to live at the bottom of the
+   * function, after several legitimate early returns (no active sports, at the
+   * position cap, halted for the day, no tradable capital). A quiet night with
+   * no games therefore never cleared the counter, and a half-open probe that
+   * found nothing to trade counted as a failure even though the exchange had
+   * answered perfectly well. Connectivity is what this breaker guards, so
+   * connectivity is what clears it.
+   */
+  const markExchangeReachable = () => {
+    if (consecutiveFailures === 0 && breakerTrips === 0) return;
+    appendLog("Exchange reachable - circuit breaker cleared, normal trading resumed.");
+    consecutiveFailures = 0;
+    breakerOpenedAt = null;
+    breakerTrips = 0;
+    try {
+      const st = loadState();
+      if (st.circuitBreakerOpen) {
+        st.circuitBreakerOpen = false;
+        st.circuitBreakerReason = null;
+        saveState(st);
+      }
+    } catch { /* ignore */ }
+  };
 
   try {
     // Reconcile FIRST. A cap full of settled ghosts would otherwise make every
@@ -417,6 +497,7 @@ export async function runCycle() {
     if (settled) appendLog(`${settled} position(s) settled and cleared from tracking.`);
 
     const { halted, reason } = await checkDailyHalt(config);
+    markExchangeReachable();   // checkDailyHalt reads the balance - the exchange answered
     if (halted) {
       appendLog(`Skipping cycle - halted for today: ${reason}`);
       return;
@@ -467,12 +548,30 @@ export async function runCycle() {
       if (stop) break;
     }
 
-    consecutiveFailures = 0;
+    markExchangeReachable();
   } catch (err) {
     consecutiveFailures++;
     appendLog(`Cycle failed (${consecutiveFailures}/${maxFailures}): ${err.message}`, "error");
     if (consecutiveFailures >= maxFailures) {
-      appendLog("Circuit breaker tripped - trading paused. Restart the bot once the cause is fixed.", "error");
+      breakerOpenedAt = Date.now();
+      breakerTrips++;
+      // Persist it. watchdog.js has always read state.circuitBreakerOpen to
+      // decide whether to clear a latched breaker - and nothing ever wrote
+      // that flag, so its entire recovery branch was dead code. The bot's own
+      // half-open above is the primary recovery; this makes the watchdog's
+      // backstop real as well, and lets the dashboard show the state.
+      try {
+        const st = loadState();
+        st.circuitBreakerOpen = true;
+        st.circuitBreakerReason = err.message;
+        st.circuitBreakerAt = new Date().toISOString();
+        saveState(st);
+      } catch { /* logging must never be the thing that breaks the bot */ }
+      appendLog(
+        `Circuit breaker tripped (trip #${breakerTrips}) - pausing trading for ` +
+        `${Math.round(breakerCooldownMs(config) / 60000)}m, then it will retry on its own. No restart needed.`,
+        "error"
+      );
     }
   }
 }
@@ -520,6 +619,8 @@ export async function resumeTrading() {
 
 export function resetCircuitBreaker() {
   consecutiveFailures = 0;
+  breakerOpenedAt = null;
+  breakerTrips = 0;
   return { reset: true };
 }
 
@@ -536,6 +637,8 @@ export function startBot() {
   if (intervalHandle) return { alreadyRunning: true };
 
   consecutiveFailures = 0;
+  breakerOpenedAt = null;
+  breakerTrips = 0;
   const { seconds, phase } = describeCadence();
   appendLog(`Bot started (${config.environment}). Scanning every ${seconds}s (${phase}). Pre-game entries, held to settlement.`);
 
