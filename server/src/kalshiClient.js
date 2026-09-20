@@ -12,23 +12,31 @@ function getConfig() {
   };
 }
 
+/**
+ * Key file wins over the env var. This order matters: the env var is set once
+ * at deploy time and never changes, while the file is what the app writes when
+ * you save new credentials. With the old precedence, rotating your Kalshi key
+ * in the app updated the Key ID but kept signing with the stale env-var key -
+ * which Kalshi rejects as INCORRECT_API_KEY_SIGNATURE, with no clue why.
+ */
 function getPrivateKey() {
-  const { keyPath, keyPem } = getConfig();
   if (cachedPrivateKey) return cachedPrivateKey;
+  const { keyPath, keyPem } = getConfig();
 
-  if (keyPem) {
-    cachedPrivateKey = keyPem.replace(/\\n/g, "\n");
+  if (keyPath && fs.existsSync(keyPath)) {
+    cachedPrivateKey = fs.readFileSync(keyPath, "utf8");
     return cachedPrivateKey;
   }
 
-  if (!keyPath || !fs.existsSync(keyPath)) {
-    throw new Error(
-      `Kalshi private key not found. Set KALSHI_PRIVATE_KEY_PEM (recommended for Railway) or ` +
-      `KALSHI_PRIVATE_KEY_PATH to a file, or enter credentials in the app.`
-    );
+  if (keyPem) {
+    cachedPrivateKey = keyPem.replace(/\\n/g, "\n"); // literal and escaped newlines
+    return cachedPrivateKey;
   }
-  cachedPrivateKey = fs.readFileSync(keyPath, "utf8");
-  return cachedPrivateKey;
+
+  throw new Error(
+    "Kalshi private key not found. Enter your credentials in the app, or set " +
+    "KALSHI_PRIVATE_KEY_PEM as a fallback."
+  );
 }
 
 export function resetCredentialsCache() {
@@ -38,12 +46,46 @@ export function resetCredentialsCache() {
 export function hasCredentialsConfigured() {
   const { keyId, keyPath, keyPem } = getConfig();
   if (!keyId) return false;
-  if (keyPem) return true;
-  return Boolean(keyPath && fs.existsSync(keyPath));
+  if (keyPath && fs.existsSync(keyPath)) return true;
+  return Boolean(keyPem);
+}
+
+/**
+ * Reports which source the key came from and a fingerprint of its public half.
+ * No private key material is ever returned. Surfacing this is the difference
+ * between "401" and "you are signing with the wrong key".
+ */
+export function describeCredentials() {
+  const { keyId, keyPath, keyPem } = getConfig();
+  const usingFile = Boolean(keyPath && fs.existsSync(keyPath));
+
+  let fingerprint = null;
+  let keyError = null;
+  try {
+    const pub = crypto.createPublicKey(getPrivateKey());
+    fingerprint = crypto
+      .createHash("sha256")
+      .update(pub.export({ type: "spki", format: "der" }))
+      .digest("hex")
+      .slice(0, 16);
+  } catch (err) {
+    keyError = err.message;
+  }
+
+  return {
+    keyId: keyId ? `${keyId.slice(0, 8)}...` : null,
+    source: usingFile ? "saved in app" : keyPem ? "KALSHI_PRIVATE_KEY_PEM env var" : "none",
+    envVarAlsoSet: Boolean(keyPem),
+    keyFileExists: usingFile,
+    fingerprint,
+    keyError,
+  };
 }
 
 function signRequest(method, requestPath) {
   const { keyId } = getConfig();
+  if (!keyId) throw new Error("Kalshi API Key ID is not set. Enter your credentials in the app.");
+
   const timestamp = Date.now().toString();
   const message = timestamp + method.toUpperCase() + requestPath;
 
@@ -60,20 +102,20 @@ function signRequest(method, requestPath) {
   };
 }
 
+function root() {
+  return getConfig().baseUrl.replace("/trade-api/v2", "");
+}
+
 export async function kalshiGet(requestPath, query = "") {
-  const { baseUrl } = getConfig();
   const headers = signRequest("GET", requestPath);
-  const url = `${baseUrl.replace("/trade-api/v2", "")}${requestPath}${query}`;
-  const res = await fetch(url, { method: "GET", headers });
+  const res = await fetch(`${root()}${requestPath}${query}`, { method: "GET", headers });
   if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${await res.text()}`);
   return res.json();
 }
 
 export async function kalshiPost(requestPath, body) {
-  const { baseUrl } = getConfig();
   const headers = { ...signRequest("POST", requestPath), "Content-Type": "application/json" };
-  const url = `${baseUrl.replace("/trade-api/v2", "")}${requestPath}`;
-  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await fetch(`${root()}${requestPath}`, { method: "POST", headers, body: JSON.stringify(body) });
   const text = await res.text();
   const data = text ? JSON.parse(text) : {};
   if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
@@ -81,10 +123,8 @@ export async function kalshiPost(requestPath, body) {
 }
 
 export async function kalshiDelete(requestPath) {
-  const { baseUrl } = getConfig();
   const headers = signRequest("DELETE", requestPath);
-  const url = `${baseUrl.replace("/trade-api/v2", "")}${requestPath}`;
-  const res = await fetch(url, { method: "DELETE", headers });
+  const res = await fetch(`${root()}${requestPath}`, { method: "DELETE", headers });
   const text = await res.text();
   const data = text ? JSON.parse(text) : {};
   if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
