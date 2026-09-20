@@ -51,8 +51,8 @@ const FINGERPRINTS = [
   {
     file: "./executor.js",
     exportName: "EXECUTOR_VERSION",
-    equals: "2026-09-19-shard-routing-2",
-    missing: "executor.js is stale - it posts to Kalshi's retired v1 order endpoint, or cannot move collateral to the shard a market trades on.",
+    equals: "2026-09-19-shard-wait",
+    missing: "executor.js is stale - it does not wait for collateral to land on a market's exchange shard before ordering, so entries fail with insufficient_balance.",
   },
 ];
 
@@ -135,6 +135,15 @@ function checkConfig(config, bankroll) {
       level: "warn", area: "timing",
       detail: `entryWindowHours is ${config.entryWindowHours} - games outside that window are skipped before any price check.`,
       fix: "Set entryWindowHours to 0 to trade live games at any point.",
+    });
+  }
+
+  const ceiling = config.maxPlausibleEdge ?? 0.25;
+  if (!ceiling || ceiling > 0.5) {
+    f.push({
+      level: "warn", area: "data",
+      detail: `maxPlausibleEdge is ${ceiling ? (ceiling * 100).toFixed(0) + "%" : "off"} - the sharp line is pre-game while Kalshi's price is live, so a huge apparent edge usually means the game has turned and the line is stale.`,
+      fix: "Set maxPlausibleEdge to about 0.25 so blowout losers at single-digit prices are refused.",
     });
   }
 
