@@ -113,9 +113,22 @@ export function assessOpportunity({
   minLiquidity = 0,
   maxRiskPctPerTrade = 0.10,
   maxStakeDollars = null,
+  maxPlausibleEdge = 0.25,
   survivalMode = null,
 }) {
   const observedEdge = trueProbability - price;
+
+  // A sportsbook line is priced pre-game; Kalshi's price is live. When a game
+  // turns, Kalshi moves and the book does not, and the gap reads as an enormous
+  // edge on a team that is actually losing. An edge this large is virtually
+  // always stale data rather than mispricing, so it is refused rather than
+  // traded - this is the check that stops the bot buying blowout losers at 6c.
+  if (maxPlausibleEdge && observedEdge > maxPlausibleEdge) {
+    return {
+      action: "skip",
+      reason: `edge ${(observedEdge * 100).toFixed(1)}% exceeds the ${(maxPlausibleEdge * 100).toFixed(0)}% plausibility ceiling - the sharp line is almost certainly stale against a live price`,
+    };
+  }
 
   const inSurvivalMode = survivalMode && bankroll < survivalMode.balanceThreshold;
   const edgeMultiplier = inSurvivalMode ? survivalMode.edgeMultiplier || 1 : 1;
