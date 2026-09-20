@@ -6,6 +6,7 @@ import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker } from
 import { loadConfig, saveConfig, setEnvironment } from "../configStore.js";
 import { loadState, getRecentLog } from "../stateStore.js";
 import { getRecentTrades, getTradeStats, getTradeLifecycles } from "../tradeLedgerStore.js";
+import { buildStrategyReview } from "../strategyReview.js";
 import { getRecentScores, findScoreForTeam } from "../scoresFetcher.js";
 import { getSharpProbabilities } from "../scraper.js";
 import { resolveTicker } from "../tickerResolver.js";
@@ -153,6 +154,19 @@ export function registerBotRoutes(app) {
    * that named nothing useful. /api/diagnose/v2 in diagnostics.js is the
    * deeper report; this stays for compatibility.
    */
+  /**
+   * Groups completed trades by the dimensions the strategy has knobs for -
+   * exit behaviour, entry price band, edge size, in-play vs pre-game - so
+   * thresholds can be tuned against results instead of argument.
+   */
+  app.get("/api/strategy-review", (_req, res) => {
+    try {
+      res.json(buildStrategyReview());
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.get("/api/diagnose", async (_req, res) => {
     const report = { config: {}, pool: [], activeSports: [], sports: [] };
 
