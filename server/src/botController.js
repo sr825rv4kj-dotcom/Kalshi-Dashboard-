@@ -10,11 +10,13 @@ import { currentCadenceSeconds, describeCadence } from "./cadence.js";
 import { scanSport } from "./scanner.js";
 import { notifyMilestone, notifyDailyHalt, notifyDailySummary } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
-import { getRecentTrades } from "./tradeLedgerStore.js";
+import { getRecentTrades, recordTrade } from "./tradeLedgerStore.js";
 
 const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
-const POSITION_MONITOR_INTERVAL_MS = 45 * 1000;
+const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
+
+export const CONTROLLER_VERSION = "2026-09-20-hold-to-settlement";
 
 let intervalHandle = null;
 let positionMonitorHandle = null;
@@ -31,17 +33,16 @@ function loadTickerMap() {
 }
 
 /**
- * Milestone tiers. Crossing a milestone used to send a message and change
- * nothing. Now it governs how the bot trades: more size, more concurrency,
- * and a reserve that sizing is not allowed to touch.
+ * Milestone tiers. Crossing a milestone governs how the bot trades: more size,
+ * more concurrency, and a reserve that sizing is not allowed to touch.
  */
 export function tierFor(bankroll, config) {
   const tiers = config.milestoneTiers || [
-    { at: 0,     kellyFraction: 0.10, maxConcurrentPositions: 2, maxStakeDollars: 2,   reservePct: 0.00 },
-    { at: 100,   kellyFraction: 0.15, maxConcurrentPositions: 3, maxStakeDollars: 8,   reservePct: 0.10 },
-    { at: 500,   kellyFraction: 0.20, maxConcurrentPositions: 5, maxStakeDollars: 30,  reservePct: 0.20 },
-    { at: 2500,  kellyFraction: 0.25, maxConcurrentPositions: 8, maxStakeDollars: 120, reservePct: 0.30 },
-    { at: 10000, kellyFraction: 0.25, maxConcurrentPositions: 12, maxStakeDollars: 400, reservePct: 0.40 },
+    { at: 0,     kellyFraction: 0.25, maxConcurrentPositions: 3,  maxStakeDollars: 4,   reservePct: 0.00 },
+    { at: 100,   kellyFraction: 0.25, maxConcurrentPositions: 5,  maxStakeDollars: 15,  reservePct: 0.10 },
+    { at: 500,   kellyFraction: 0.25, maxConcurrentPositions: 8,  maxStakeDollars: 50,  reservePct: 0.20 },
+    { at: 2500,  kellyFraction: 0.30, maxConcurrentPositions: 12, maxStakeDollars: 200, reservePct: 0.30 },
+    { at: 10000, kellyFraction: 0.30, maxConcurrentPositions: 16, maxStakeDollars: 600, reservePct: 0.40 },
   ];
   let active = tiers[0];
   for (const t of tiers) if (bankroll >= t.at) active = t;
@@ -86,7 +87,7 @@ async function checkDailySummary(config, currentBalance) {
   await notifyDailySummary({
     botToken, chatId,
     tradesEntered: todays.filter((t) => t.action === "enter").length,
-    tradesExited: todays.filter((t) => t.action === "exit").length,
+    tradesExited: todays.filter((t) => t.action === "exit" || t.action === "settle").length,
     currentBalance,
     environment: config.environment,
   }).catch(() => {});
@@ -116,11 +117,6 @@ function openEventKeys() {
   return new Set(loadState().positions.map((p) => eventKeyOf(p.ticker)));
 }
 
-/**
- * Marks a game as just-exited. Without this the bot bought Montana at 8c,
- * stopped out at 5c, and the next 20-second scan bought it again at 8c -
- * four laps of a collapsing longshot, paying the fee every time.
- */
 function recordExit(ticker) {
   const state = loadState();
   state.recentExits = state.recentExits || {};
@@ -130,7 +126,7 @@ function recordExit(ticker) {
 
 /** Games exited within the cooldown, which this cycle must leave alone. */
 function cooledDownEventKeys(config) {
-  const minutes = config.reentryCooldownMinutes ?? 30;
+  const minutes = config.reentryCooldownMinutes ?? 60;
   if (!minutes) return new Set();
   const cutoff = Date.now() - minutes * 60 * 1000;
   const recent = loadState().recentExits || {};
@@ -139,6 +135,98 @@ function cooledDownEventKeys(config) {
     if (new Date(iso).getTime() >= cutoff) keys.add(key);
   }
   return keys;
+}
+
+/**
+ * SETTLEMENT RECONCILIATION.
+ *
+ * Positions were only ever removed from local state by exitPosition. That was
+ * survivable while the bot flipped everything before the whistle. It is fatal
+ * once positions are held to settlement: Kalshi settles the contract, the
+ * exchange forgets it, and the local record sits there forever. The concurrent
+ * position cap fills with games that finished days ago and the bot silently
+ * stops trading - no error, no log, just nothing.
+ *
+ * So every cycle, local positions are reconciled against what Kalshi actually
+ * reports. Anything the exchange no longer holds has settled, and is closed out
+ * locally at its true settled value so the statement shows real profit and loss.
+ */
+async function reconcileSettledPositions() {
+  const state = loadState();
+  if (!state.positions.length) return { settled: 0 };
+
+  let live;
+  try {
+    const data = await kalshiGet(`${V2}/portfolio/positions`);
+    live = data.market_positions ?? [];
+  } catch (err) {
+    // Cannot tell what is still open - do nothing rather than wrongly close.
+    appendLog(`Could not reconcile positions (${err.message}) - leaving local records untouched.`, "warn");
+    return { settled: 0, error: err.message };
+  }
+
+  const heldNow = new Map();
+  for (const p of live) {
+    const count = p.position_fp != null ? Number(p.position_fp) : (p.position ?? 0);
+    if (count !== 0) heldNow.set(p.ticker, p);
+  }
+
+  const stillOpen = [];
+  let settledCount = 0;
+
+  for (const position of state.positions) {
+    if (heldNow.has(position.ticker)) { stillOpen.push(position); continue; }
+
+    // Gone from the exchange: it settled. Read the real outcome so the ledger
+    // records what actually happened rather than an assumption.
+    let settlementCents = null;
+    try {
+      const res = await kalshiGet(`${V2}/markets/${position.ticker}`);
+      const result = String(res.market?.result || "").toLowerCase();
+      if (result === "yes") settlementCents = 100;
+      else if (result === "no") settlementCents = 0;
+    } catch {
+      // leave null - recorded as unknown rather than guessed
+    }
+
+    const outcome =
+      settlementCents === 100 ? "settled-win" :
+      settlementCents === 0 ? "settled-loss" : "settled-unknown";
+
+    recordTrade({
+      action: "exit",
+      ticker: position.ticker,
+      side: "yes",
+      contracts: position.contracts,
+      priceCents: position.entryPriceCents,
+      exitPriceCents: settlementCents,
+      filled: position.contracts,
+      reason: outcome,
+      edgePct: null,
+      environment: loadConfig().environment,
+      teamName: position.teamName ?? null,
+      sportKey: position.sportKey ?? null,
+      commenceTime: position.commenceTime ?? null,
+    });
+
+    const net = settlementCents == null
+      ? "outcome unavailable"
+      : `$${(((settlementCents - position.entryPriceCents) * position.contracts) / 100).toFixed(2)}`;
+    appendLog(
+      `${position.ticker} settled ${settlementCents == null ? "(result unreadable)" : settlementCents === 100 ? "YES - won" : "NO - lost"}: ` +
+      `${position.contracts} contracts @ ${position.entryPriceCents}c entry, net ${net}. No exit fee - settlement is free.`
+    );
+    settledCount++;
+  }
+
+  if (settledCount) {
+    const fresh = loadState();
+    const settledKeys = new Set(state.positions.filter((p) => !heldNow.has(p.ticker)).map((p) => `${p.ticker}|${p.openedAt}`));
+    fresh.positions = fresh.positions.filter((p) => !settledKeys.has(`${p.ticker}|${p.openedAt}`));
+    saveState(fresh);
+  }
+
+  return { settled: settledCount };
 }
 
 /**
@@ -162,15 +250,12 @@ async function checkDailyHalt(config) {
   if (state.dayStartDate !== today) {
     state.dayStartDate = today;
     state.dayStartEquity = equity;
-    state.dayStartBalance = equity; // kept for the existing status display
+    state.dayStartBalance = equity;
     state.haltedForDay = false;
     state.haltReason = null;
     saveState(state);
   }
 
-  // A baseline saved before this change was cash-only, and any halt derived
-  // from it measured spending rather than loss. Migrate it and clear that halt
-  // once, so the bot is not locked out for a day it never lost money.
   if (state.dayStartEquity == null) {
     state.dayStartEquity = equity;
     state.dayStartBalance = equity;
@@ -185,7 +270,7 @@ async function checkDailyHalt(config) {
   if (state.haltedForDay) return { halted: true, reason: state.haltReason };
 
   const baseline = state.dayStartEquity || equity;
-  const drawdown = (baseline - equity) / baseline;
+  const drawdown = baseline > 0 ? (baseline - equity) / baseline : 0;
   if (drawdown >= config.dailyLossHaltPct) {
     state.haltedForDay = true;
     state.haltReason =
@@ -201,13 +286,7 @@ async function checkDailyHalt(config) {
   return { halted: false, currentBalance: cash, equity, positionsValue: positions };
 }
 
-/**
- * Best resting YES bid, in cents - what the position could be sold into now.
- * This read book.orderbook.yes, a key Kalshi no longer returns: the book comes
- * back under orderbook_fp with sides named yes_dollars/no_dollars, quoted in
- * dollars. The old read produced null every time, so every position skipped
- * its take-profit and stop-loss checks.
- */
+/** Best resting YES bid, in cents - what the position could be sold into now. */
 async function bestYesBidCents(ticker) {
   try {
     const book = await kalshiGet(`${V2}/markets/${ticker}/orderbook`);
@@ -233,107 +312,71 @@ async function bestYesBidCents(ticker) {
 }
 
 /**
- * Kalshi's fee rounds UP to a whole cent per contract, each way. On an 8c
- * contract that is 1c in and 1c out - 25% of the stake in fees - while a 15%
- * take-profit is only 1.2c of gross gain. Every "winner" at that price closed
- * at a loss.
+ * EXIT POLICY - the single biggest change in this file.
  *
- * So the exit target is the LARGER of the percentage target and the price that
- * actually clears the round-trip fee plus a margin.
+ * Kalshi charges a fee on every trade and charges NOTHING at settlement. A
+ * contract bought and held pays one fee; a contract bought and sold back pays
+ * two. Measured at the prices this bot trades:
+ *
+ *   - holding to settlement beats flipping at the old take-profit target by
+ *     +4 to +7c per contract
+ *   - the old 5% stop-loss cost 12-25% of stake every time it fired, and the
+ *     FEES were the larger half of that: 1-3c of price move, 4c of fees
+ *   - on a live binary, a 5% swing is one possession, so that stop was firing
+ *     on noise and paying 4c to do it
+ *
+ * So there is no take-profit, no trailing stop and no percentage stop-loss.
+ * Positions are held until the game settles.
+ *
+ * ONE exception, and it is risk control rather than expected value: a genuine
+ * blowout. When the price has collapsed far enough that the original thesis is
+ * dead and only a sliver of value is left, that sliver is recovered rather than
+ * ridden to zero. The thresholds are deliberately deep so this fires on routs,
+ * not on a bad quarter.
+ *
+ * `exitBelowCost` has been removed outright. It compared the bid to the entry
+ * price, and the bid is ALWAYS below the entry price immediately after buying,
+ * because you buy at the ask. Enabling it would have exited every position at a
+ * guaranteed loss 3 minutes after opening it.
  */
-function takeProfitTargetCents(entryCents, config) {
-  const pct = config.takeProfitPct ?? 0.12;
-  const multiplier = config.feeMultiplier ?? 0.07;
-  const minProfitCents = config.minProfitCentsPerContract ?? 1;
+function blowoutExitDecision(position, bestBid, config) {
+  if (config.holdToSettlement === false) return null;      // explicit opt-out
+  if (bestBid == null) return null;
 
-  const feeAt = (cents) => {
-    const p = cents / 100;
-    return Math.ceil(multiplier * p * (1 - p) * 100); // whole cents, as Kalshi charges
-  };
+  const floorCents = config.blowoutExitBelowCents ?? 12;
+  const collapsePct = config.blowoutExitCollapsePct ?? 0.6;
+  const entry = position.entryPriceCents;
+  if (!entry) return null;
 
-  const pctTarget = entryCents * (1 + pct);
-  const roundTripFee = feeAt(entryCents) + feeAt(Math.min(99, Math.round(pctTarget)));
-  const feeTarget = entryCents + roundTripFee + minProfitCents;
-
-  return Math.ceil(Math.max(pctTarget, feeTarget));
+  const collapse = (entry - bestBid) / entry;
+  if (bestBid <= floorCents && collapse >= collapsePct) {
+    return `blowout: ${bestBid}c is ${(collapse * 100).toFixed(0)}% below the ${entry}c entry and under the ${floorCents}c floor - recovering the remainder rather than riding it to zero`;
+  }
+  return null;
 }
 
 async function checkOpenPositions(config) {
   const state = loadState();
-  const trailPct = config.trailingStopPct ?? 0.08;
-  let dirty = false;
+  if (!state.positions.length) return;
 
   for (const position of [...state.positions]) {
     try {
       const bestBid = await bestYesBidCents(position.ticker);
-      if (bestBid == null) continue;
-
-      const entry = position.entryPriceCents;
-      const gainPct = (bestBid - entry) / entry;
-      const adverseMovePct = (entry - bestBid) / entry;
-
-      // Track the high-water mark so the trailing stop has a reference.
-      if (position.peakBidCents == null || bestBid > position.peakBidCents) {
-        position.peakBidCents = bestBid;
-        dirty = true;
-      }
-      const offPeakPct = position.peakBidCents ? (position.peakBidCents - bestBid) / position.peakBidCents : 0;
-
-      const target = takeProfitTargetCents(entry, config);
-      if (bestBid >= target) {
-        appendLog(
-          `${position.ticker} at ${bestBid}c vs ${entry}c entry (+${(gainPct * 100).toFixed(1)}%, ` +
-          `target ${target}c clears fees) - taking profit.`
-        );
-        await exitPosition(position, "take-profit");
-        recordExit(position.ticker);
-        continue;
-      }
-
-      // Only trails once the position has actually been in profit.
-      if (position.peakBidCents > entry && offPeakPct >= trailPct) {
-        appendLog(
-          `${position.ticker} fell ${(offPeakPct * 100).toFixed(1)}% from its ${position.peakBidCents}c peak - trailing out.`,
-          "warn"
-        );
-        await exitPosition(position, "trailing-stop");
-        recordExit(position.ticker);
-        continue;
-      }
-
-      if (config.exitBelowCost && bestBid * position.contracts < entry * position.contracts) {
-        appendLog(
-          `${position.ticker} worth ${bestBid}c vs ${entry}c paid - exiting below cost.`, "warn"
-        );
-        await exitPosition(position, "below-cost");
-        recordExit(position.ticker);
-        continue;
-      }
-
-      if (adverseMovePct >= config.perPositionStopLossPct) {
-        appendLog(`${position.ticker} down ${(adverseMovePct * 100).toFixed(1)}% from entry - cutting loss.`, "warn");
-        await exitPosition(position, "stop-loss");
+      const decision = blowoutExitDecision(position, bestBid, config);
+      if (decision) {
+        appendLog(`${position.ticker} - ${decision}`, "warn");
+        await exitPosition(position, "blowout-exit");
         recordExit(position.ticker);
       }
     } catch (err) {
       appendLog(`Error checking ${position.ticker}: ${err.message}`, "error");
     }
   }
-
-  if (dirty) {
-    const fresh = loadState();
-    for (const p of fresh.positions) {
-      const match = state.positions.find((s) => s.ticker === p.ticker && s.openedAt === p.openedAt);
-      if (match && match.peakBidCents != null) p.peakBidCents = match.peakBidCents;
-    }
-    saveState(fresh);
-  }
 }
 
 export async function runCycle() {
   const config = loadConfig();
 
-  // Circuit breaker: stop hammering the exchange after repeated failures.
   const maxFailures = config.circuitBreakerFailures ?? 3;
   if (consecutiveFailures >= maxFailures) {
     appendLog(`Circuit breaker open (${consecutiveFailures} consecutive failures) - skipping cycle.`, "error");
@@ -341,6 +384,11 @@ export async function runCycle() {
   }
 
   try {
+    // Reconcile FIRST. A cap full of settled ghosts would otherwise make every
+    // check below report "at capacity" and skip the scan.
+    const { settled } = await reconcileSettledPositions();
+    if (settled) appendLog(`${settled} position(s) settled and cleared from tracking.`);
+
     const { halted, reason } = await checkDailyHalt(config);
     if (halted) {
       appendLog(`Skipping cycle - halted for today: ${reason}`);
@@ -361,6 +409,11 @@ export async function runCycle() {
       return;
     }
 
+    if (atConcurrentPositionCap(config, bankroll)) {
+      appendLog(`At the concurrent position cap with ${loadState().positions.length} open - waiting for games to settle.`);
+      return;
+    }
+
     const activeSports = await discoverActiveSports();
     if (!activeSports.length) {
       appendLog("No active sports returned by the odds provider.", "warn");
@@ -370,9 +423,6 @@ export async function runCycle() {
     const skipEvents = openEventKeys();
     const cooling = cooledDownEventKeys(config);
     for (const k of cooling) skipEvents.add(k);
-    if (cooling.size) {
-      appendLog(`${cooling.size} game(s) in re-entry cooldown - not re-trading them this cycle.`);
-    }
 
     for (const sportKey of activeSports) {
       const stop = await scanSport({
@@ -419,7 +469,7 @@ export function startBot() {
 
   consecutiveFailures = 0;
   const { seconds, phase } = describeCadence();
-  appendLog(`Bot started (${config.environment}). Scanning every ${seconds}s (${phase}).`);
+  appendLog(`Bot started (${config.environment}). Scanning every ${seconds}s (${phase}). Pre-game entries, held to settlement.`);
 
   const state = loadState();
   state.running = true;
