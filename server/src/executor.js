@@ -20,7 +20,30 @@ const V2 = "/trade-api/v2";
  */
 const ORDERS_PATH = `${V2}/portfolio/events/orders`;
 
-export const EXECUTOR_VERSION = "2026-09-19-orders-v2";
+export const EXECUTOR_VERSION = "2026-09-19-shard-routing";
+
+const ALLOCATION_PATH = `${V2}/portfolio/target_balance_allocation`;
+
+/**
+ * Kalshi splits collateral across exchange shards. A market names its shard in
+ * market.exchange_index, and an order against a shard holding no collateral is
+ * rejected with insufficient_shard_balance - even when the account has cash,
+ * because the cash is sitting on a different shard. This tracks which shard the
+ * balance was last moved to so it is only reallocated when it actually needs to
+ * move, rather than on every order.
+ */
+let allocatedShard = null;
+
+async function allocateAllTo(exchangeIndex) {
+  await kalshiPost(ALLOCATION_PATH, {
+    allocations: [{ exchange_index: exchangeIndex, percent: 100 }],
+    resting_margin_reservation: "max",
+  });
+  allocatedShard = exchangeIndex;
+  appendLog(`Moved free collateral to exchange shard ${exchangeIndex}.`);
+  // Allocation is asynchronous; give the exchange a moment to settle it.
+  await new Promise((r) => setTimeout(r, 2000));
+}
 
 function newClientOrderId() {
   return `dash_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -53,7 +76,7 @@ function dollarsToCents(raw) {
  * Any unfilled remainder is cancelled by the exchange, so nothing is left
  * resting on the book.
  */
-async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = false }) {
+async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = false, exchangeIndex = null }) {
   const body = {
     ticker,
     client_order_id: newClientOrderId(),
@@ -65,8 +88,23 @@ async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = fals
     post_only: false,
   };
   if (reduceOnly) body.reduce_only = true;
+  if (exchangeIndex != null) body.exchange_index = exchangeIndex;
 
-  const res = await kalshiPost(ORDERS_PATH, body);
+  let res;
+  try {
+    res = await kalshiPost(ORDERS_PATH, body);
+  } catch (err) {
+    // The shard holding this market has no collateral. Move the free balance
+    // there and try once more; a second failure is a real rejection.
+    if (String(err.message).includes("insufficient_shard_balance") && exchangeIndex != null) {
+      appendLog(`Shard ${exchangeIndex} has no collateral for ${ticker} - reallocating.`, "warn");
+      await allocateAllTo(exchangeIndex);
+      body.client_order_id = newClientOrderId();
+      res = await kalshiPost(ORDERS_PATH, body);
+    } else {
+      throw err;
+    }
+  }
 
   const filled = Math.round(Number(res.fill_count ?? 0));
   const avgCents = dollarsToCents(res.average_fill_price);
@@ -83,7 +121,7 @@ async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = fals
 }
 
 export async function enterPosition({
-  ticker, side, priceCents, contracts,
+  ticker, side, priceCents, contracts, exchangeIndex = null,
   reason = null, edgePct = null, teamName = null, sportKey = null, commenceTime = null,
 }) {
   if (contracts <= 0) return { filled: 0 };
@@ -102,7 +140,10 @@ export async function enterPosition({
 
   let result;
   try {
-    result = await placeIOC({ ticker, side: "bid", limitCents, contracts });
+    if (exchangeIndex != null && allocatedShard != null && allocatedShard !== exchangeIndex) {
+      await allocateAllTo(exchangeIndex);
+    }
+    result = await placeIOC({ ticker, side: "bid", limitCents, contracts, exchangeIndex });
   } catch (err) {
     appendLog(`Entry order rejected for ${ticker}: ${err.message}`, "error");
     throw err;
@@ -114,7 +155,7 @@ export async function enterPosition({
     const state = loadState();
     state.positions.push({
       ticker, side: "yes", entryPriceCents: fillPrice, contracts: filled,
-      openedAt: new Date().toISOString(), teamName, sportKey, commenceTime,
+      openedAt: new Date().toISOString(), teamName, sportKey, commenceTime, exchangeIndex,
     });
     saveState(state);
     appendLog(`Filled ${filled}x ${ticker} @ ${fillPrice}c` + (result.feeCents != null ? ` (fee ${result.feeCents}c/contract)` : ""));
@@ -139,6 +180,7 @@ export async function enterPosition({
 
 export async function exitPosition(position, reason) {
   const { ticker, contracts } = position;
+  const exchangeIndex = position.exchangeIndex ?? null;
   const config = loadConfig();
   // Sell UNDER the best bid so the order crosses and takes.
   const slippage = config.exitSlippageCents ?? 1;
@@ -179,7 +221,7 @@ export async function exitPosition(position, reason) {
 
     const limitCents = clampPrice(bestBid - slippage);
     try {
-      const res = await placeIOC({ ticker, side: "ask", limitCents, contracts: remaining, reduceOnly: true });
+      const res = await placeIOC({ ticker, side: "ask", limitCents, contracts: remaining, reduceOnly: true, exchangeIndex });
       if (res.filled > 0) {
         lastExitPriceCents = res.priceCents;
         remaining -= res.filled;
