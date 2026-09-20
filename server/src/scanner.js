@@ -5,16 +5,17 @@
  * ticker, prices it from the order book, and enters positions that clear the
  * edge check.
  *
- * The change that matters here: a game already in progress is now identified
- * and refused. The sportsbook line this bot reads is priced BEFORE kickoff and
- * never updates in play, while Kalshi's price moves with every possession.
- * Comparing them mid-game does not find mispricing - it finds teams the live
- * market has already marked down, and buys them.
+ * LIVE GAMES ARE TRADED. An earlier version refused any game already in
+ * progress. That was based on a wrong assumption - that the sharp line freezes
+ * at kickoff - when in fact the odds feed serves live in-play prices and marks
+ * in-play events by commence_time. There is no waiting period: if a game is on
+ * and the book is quoting it, the bot can trade it.
  *
- * Simulated over 200,000 opportunities at a realistic live/pre-game mix, the
- * old behaviour took 33,004 trades at -1.92c per contract of true expected
- * value. Refusing live games and holding to settlement takes 2,187 trades at
- * +1.80c. Fewer trades, opposite sign.
+ * What is refused is a STALE QUOTE. A book that has suspended its market leaves
+ * its last price on the wire, where it is indistinguishable from a live one,
+ * while the exchange keeps moving - and that gap reads as a huge edge on a team
+ * that just fell behind. Every quote now carries its age, and the entry gate
+ * refuses quotes that have gone quiet: tight in play, loose before kickoff.
  */
 
 import { kalshiGet } from "./kalshiClient.js";
@@ -26,7 +27,7 @@ import { resolveTicker } from "./tickerResolver.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-20-pregame-hold";
+export const SCANNER_VERSION = "2026-09-20-live-fresh";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -49,11 +50,10 @@ export function entryTiming(commenceTime, { entryWindowHours = 8, minMinutesBefo
 
   const minutesUntilStart = (startMs - Date.now()) / 60000;
 
+  // In play. Always eligible - freshness, not the clock, decides whether the
+  // quote is any good, and that is checked at the entry gate.
   if (minutesUntilStart <= 0) {
-    return {
-      ok: false, live: true, minutesUntilStart,
-      reason: `game started ${Math.abs(minutesUntilStart).toFixed(0)}m ago - a pre-game line cannot price a live market`,
-    };
+    return { ok: true, live: true, minutesUntilStart };
   }
   if (minutesUntilStart < minMinutesBeforeStart) {
     return {
@@ -184,7 +184,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
   const drops = { live: 0, window: 0, unresolved: 0, closed: 0, error: 0, duplicate: 0 };
   let sampleReason = null;
   const openEvents = skipEvents instanceof Set ? skipEvents : new Set();
-  const allowLive = config.allowLiveGames === true;
+  const allowLive = config.allowLiveGames !== false;   // live trading is ON unless switched off
 
   const prepared = await Promise.all(teamEntries.map(async ([teamName, info]) => {
     const { trueProbability, commenceTime } = info;
@@ -194,14 +194,12 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       minMinutesBeforeStart: config.minMinutesBeforeStart ?? 0,
     });
 
-    // A live game is dropped before any Kalshi call - it cannot be traded off
-    // this data source, so resolving and pricing it only burns rate limit.
     if (timing.live && !allowLive) {
       drops.live++;
-      if (!sampleReason) sampleReason = `${teamName}: ${timing.reason}`;
+      if (!sampleReason) sampleReason = `${teamName}: live trading switched off in config`;
       return null;
     }
-    if (!timing.ok && !timing.live) { drops.window++; return null; }
+    if (!timing.ok) { drops.window++; return null; }
 
     let ticker = tickerMap[teamName];
     if (!ticker) {
@@ -227,7 +225,10 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       }
 
       const pricing = await priceFor(ticker, market);
-      return { teamName, trueProbability, commenceTime, ticker, market, timing, pricing };
+      return {
+        teamName, trueProbability, commenceTime, ticker, market, timing, pricing,
+        lineAgeSeconds: info.lineAgeSeconds ?? null,
+      };
     } catch (err) {
       drops.error++;
       if (!sampleReason) sampleReason = `${teamName}: ${err.message}`;
@@ -238,7 +239,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
   const viable = prepared.filter(Boolean);
   appendLog(
     `${sportKey}: ${teamEntries.length} lines -> ${viable.length} tradeable ` +
-    `(dropped: ${drops.live} already started, ${drops.unresolved} unresolved, ${drops.window} out-of-window, ` +
+    `(dropped: ${drops.live} live-disabled, ${drops.unresolved} unresolved, ${drops.window} out-of-window, ` +
     `${drops.closed} not-tradeable, ${drops.duplicate} already held, ${drops.error} fetch error)` +
     (sampleReason ? ` | e.g. ${sampleReason}` : "")
   );
@@ -282,6 +283,9 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       minEvCentsPerContract: config.minEvCentsPerContract ?? 2,
       isLiveGame: c.timing.live,
       allowLiveGames: allowLive,
+      lineAgeSeconds: c.lineAgeSeconds,
+      maxLineAgeSecondsLive: config.maxLineAgeSecondsLive ?? 180,
+      maxLineAgeSecondsPregame: config.maxLineAgeSecondsPregame ?? 1800,
       survivalMode: config.survivalMode,
     });
 
@@ -292,7 +296,10 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       continue;
     }
 
-    const startsIn = c.timing.minutesUntilStart != null ? `${c.timing.minutesUntilStart.toFixed(0)}m to start` : "start time unknown";
+    const startsIn = c.timing.live
+      ? `LIVE ${Math.abs(c.timing.minutesUntilStart ?? 0).toFixed(0)}m in` +
+        (c.lineAgeSeconds != null ? `, quote ${Math.round(c.lineAgeSeconds)}s old` : "")
+      : (c.timing.minutesUntilStart != null ? `${c.timing.minutesUntilStart.toFixed(0)}m to start` : "start time unknown");
     appendLog(
       `Candidate ${c.ticker} (${c.teamName}): sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ` +
       `[${c.pricing.source}], edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}%, ` +
@@ -307,7 +314,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       exchangeIndex: c.market?.exchange_index ?? null,
       contracts: assessment.sizing.contracts,
       reason:
-        `Pre-game edge via ${probResult.provider} on "${c.teamName}" ` +
+        `${c.timing.live ? "In-play" : "Pre-game"} edge via ${probResult.provider} on "${c.teamName}" ` +
         `(sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c, ` +
         `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract, held to settlement)`,
       edgePct: assessment.edgeCheck.observedEdge * 100,
