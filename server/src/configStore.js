@@ -29,7 +29,7 @@ import { CONFIG_DIR } from "./paths.js";
 const CONFIG_PATH = path.join(CONFIG_DIR, "bot-config.json");
 
 /** Bump this whenever a STRATEGY_KEYS default below changes meaningfully. */
-export const STRATEGY_VERSION = 3;
+export const STRATEGY_VERSION = 4;
 
 /**
  * Keys the migration is allowed to reset. Anything not listed here is the
@@ -37,6 +37,7 @@ export const STRATEGY_VERSION = 3;
  */
 export const STRATEGY_KEYS = [
   "allowLiveGames", "holdToSettlement", "entryWindowHours", "minMinutesBeforeStart",
+  "maxLineAgeSecondsLive", "maxLineAgeSecondsPregame",
   "minEntryPriceCents", "maxEntryPriceCents", "maxPlausibleEdge", "minEvCentsPerContract",
   "maxSpreadCents", "minLiquidity", "kellyFraction", "maxRiskPctPerTrade",
   "perPositionStopLossPct", "takeProfitPct", "trailingStopPct", "exitBelowCost",
@@ -50,19 +51,27 @@ export const DEFAULTS = {
   confirmedProductionAt: null,
 
   // --- What the bot is allowed to trade ---------------------------------
-  // Live games are OFF. The sharp line this bot reads is priced before
-  // kickoff and never updates in play, so mid-game it is not finding
-  // mispricing - it is buying the teams the live market has marked down.
-  // Simulated over 200,000 opportunities at a realistic mix, live trading
-  // ran at -1.92c per contract of true expected value.
-  allowLiveGames: false,
+  // LIVE GAMES ARE ON. There is no waiting period: if a game is running and
+  // the book is quoting it, it is tradeable. An earlier build refused in-play
+  // games on the assumption that the sharp line freezes at kickoff - that was
+  // wrong, the odds feed serves live in-play prices.
+  allowLiveGames: true,
+
+  // The real guard, and the one that replaced it: quote freshness. A book that
+  // has SUSPENDED its market leaves the last price on the wire, looking exactly
+  // like a live quote, while the exchange keeps moving - and that gap reads as
+  // a huge edge on a team that just fell behind. In play a quote older than
+  // this is treated as suspended. Before kickoff a line legitimately sits
+  // still, so the tolerance is wide.
+  maxLineAgeSecondsLive: 180,        // 3 minutes
+  maxLineAgeSecondsPregame: 1800,    // 30 minutes
 
   // Hold to settlement. Kalshi charges a fee on every trade and nothing at
   // settlement, so a flip costs two fees and a hold costs one. Worth +4 to
   // +7c per contract at the prices traded here.
   holdToSettlement: true,
 
-  entryWindowHours: 8,          // how far ahead of kickoff a line is worth reading
+  entryWindowHours: 8,          // how far AHEAD of kickoff to look; does not limit live games
   minMinutesBeforeStart: 0,     // raise this to stop entering right on the whistle
 
   // --- Price band --------------------------------------------------------
@@ -184,7 +193,9 @@ export function describeStrategy() {
   return {
     strategyVersion: c.strategyVersion ?? STRATEGY_VERSION,
     migratedAt: c.strategyMigratedAt ?? null,
-    liveGames: c.allowLiveGames ? "ENABLED" : "refused (pre-game lines cannot price a live market)",
+    liveGames: c.allowLiveGames !== false
+      ? `ENABLED - in-play quotes accepted up to ${c.maxLineAgeSecondsLive}s old`
+      : "switched off in config",
     exitPolicy: c.holdToSettlement === false
       ? "active exits enabled"
       : `held to settlement; only exit is a blowout below ${c.blowoutExitBelowCents}c`,
