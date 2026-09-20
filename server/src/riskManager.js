@@ -193,7 +193,7 @@ export function assessOpportunity({
   // minutes is not quoting. Before kickoff it is loose, because a pre-game line
   // legitimately sits still.
   if (isLiveGame && !allowLiveGames) {
-    return { action: "skip", reason: "live trading is switched off in config (allowLiveGames)" };
+    return { action: "skip", code: "live-disabled", reason: "live trading is switched off in config (allowLiveGames)" };
   }
 
   const maxAge = isLiveGame ? maxLineAgeSecondsLive : maxLineAgeSecondsPregame;
@@ -205,12 +205,14 @@ export function assessOpportunity({
       if (isLiveGame) {
         return {
           action: "skip",
+          code: "no-quote-timestamp",
           reason: "game is in play and this feed carries no quote timestamp - a suspended book cannot be told from a live one, so it is not traded",
         };
       }
     } else if (lineAgeSeconds > maxAge) {
       return {
         action: "skip",
+        code: "stale-quote",
         reason: `sharp quote is ${Math.round(lineAgeSeconds)}s old, past the ${maxAge}s limit for ` +
           `${isLiveGame ? "an in-play" : "a pre-game"} market - the book has likely suspended it while the exchange kept moving`,
       };
@@ -224,12 +226,14 @@ export function assessOpportunity({
     const fee = feeCentsAt(priceCents, multiplier);
     return {
       action: "skip",
+      code: "price-below-floor",
       reason: `price ${priceCents}c is below the ${minEntryPriceCents}c floor - the ${fee}c fee is ${((fee / priceCents) * 100).toFixed(0)}% of the stake`,
     };
   }
   if (maxEntryPriceCents && priceCents > maxEntryPriceCents) {
     return {
       action: "skip",
+      code: "price-above-ceiling",
       reason: `price ${priceCents}c is above the ${maxEntryPriceCents}c ceiling - too little upside left to cover being wrong`,
     };
   }
@@ -241,6 +245,7 @@ export function assessOpportunity({
   if (maxPlausibleEdge && observedEdge > maxPlausibleEdge) {
     return {
       action: "skip",
+      code: "edge-implausible",
       reason: `edge ${(observedEdge * 100).toFixed(1)}% exceeds the ${(maxPlausibleEdge * 100).toFixed(0)}% plausibility ceiling - a gap that size is a stale or mismatched line, not a mispricing`,
     };
   }
@@ -257,6 +262,7 @@ export function assessOpportunity({
   if (margin <= 0) {
     return {
       action: "skip",
+      code: "edge-too-small",
       reason: `edge ${(observedEdge * 100).toFixed(2)}% below the ${(requiredEdge * 100).toFixed(2)}% needed to clear the ${feeCentsAt(priceCents, multiplier)}c fee` +
         (inSurvivalMode ? " (survival mode - stricter bar)" : ""),
     };
@@ -268,6 +274,7 @@ export function assessOpportunity({
   if (minEvCentsPerContract && evCents < minEvCentsPerContract) {
     return {
       action: "skip",
+      code: "ev-too-thin",
       reason: `expected value ${evCents.toFixed(2)}c per contract is below the ${minEvCentsPerContract}c floor - the edge is real but too thin to be worth the capital`,
     };
   }
@@ -292,7 +299,7 @@ export function assessOpportunity({
     });
   }
 
-  if (sizing.contracts <= 0) return { action: "skip", reason: sizing.reason };
+  if (sizing.contracts <= 0) return { action: "skip", code: "size-zero", reason: sizing.reason };
 
   // --- Gate 6: the book can actually fill this size ---
   const liquidityOk = passesLiquidityFilter({
@@ -301,6 +308,7 @@ export function assessOpportunity({
   if (!liquidityOk) {
     return {
       action: "skip",
+      code: "illiquid",
       reason: `insufficient liquidity (${restingContracts} resting, need ${Math.ceil(sizing.contracts * 1.5)} to fill ${sizing.contracts} contracts)`,
     };
   }
