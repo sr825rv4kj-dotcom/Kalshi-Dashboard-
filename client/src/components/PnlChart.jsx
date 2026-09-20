@@ -1,217 +1,136 @@
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 
-function Row({ label, value, tone }) {
-  return (
-    <div className="trade-row">
-      <span>{label}</span>
-      <span className={tone || ""}>{String(value ?? "—")}</span>
-    </div>
-  );
+/**
+ * Cumulative profit and loss, drawn from Kalshi's own settlement records.
+ *
+ * This file had been overwritten at some point with a copy of DiagnosticPanel,
+ * so the dashboard was rendering the diagnostic twice and the P&L chart did
+ * not exist at all. Rendering the built page is what surfaced it - a nested
+ * panel where a chart should have been.
+ *
+ * The series matters more now than it used to: positions are held to
+ * settlement, so settlements ARE the record of what the bot made rather than a
+ * footnote to a stream of flips.
+ */
+
+const W = 640;
+const H = 190;
+const PAD = { top: 14, right: 10, bottom: 22, left: 10 };
+
+function money(n) {
+  const v = Number(n) || 0;
+  const sign = v < 0 ? "-" : "";
+  return `${sign}$${Math.abs(v).toFixed(2)}`;
 }
 
-export default function DiagnosticPanel({ apiBase }) {
-  const [report, setReport] = useState(null);
-  const [trade, setTrade] = useState(null);
-  const [running, setRunning] = useState(false);
-  const [error, setError] = useState(null);
+export default function PnlChart({ series }) {
+  const [hover, setHover] = useState(null);
 
-  /** Reads as text first so a crashed server shows its real error, not a parser message. */
-  async function readJson(res) {
-    const text = await res.text();
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new Error(`Server returned ${res.status}: ${text.slice(0, 300)}`);
-    }
+  const points = useMemo(() => {
+    const rows = Array.isArray(series) ? series.filter((s) => Number.isFinite(Number(s.cumulativePnl))) : [];
+    if (!rows.length) return null;
+
+    const values = rows.map((r) => Number(r.cumulativePnl));
+    // Always include zero, so a line that is entirely negative still reads as
+    // below the break-even axis rather than floating in the middle.
+    const lo = Math.min(0, ...values);
+    const hi = Math.max(0, ...values);
+    const span = hi - lo || 1;
+
+    const innerW = W - PAD.left - PAD.right;
+    const innerH = H - PAD.top - PAD.bottom;
+    const x = (i) => PAD.left + (rows.length === 1 ? innerW / 2 : (i / (rows.length - 1)) * innerW);
+    const y = (v) => PAD.top + innerH - ((v - lo) / span) * innerH;
+
+    return {
+      rows,
+      coords: rows.map((r, i) => ({ x: x(i), y: y(Number(r.cumulativePnl)), row: r })),
+      zeroY: y(0),
+      last: values[values.length - 1],
+      lo, hi,
+    };
+  }, [series]);
+
+  if (!points) {
+    return (
+      <div className="empty-state">
+        No settled trades yet. Positions are held to settlement, so this fills in
+        as games finish.
+      </div>
+    );
   }
 
-  async function runDiagnostic() {
-    setRunning(true); setError(null); setReport(null); setTrade(null);
-    try {
-      const res = await fetch(`${apiBase}/api/diagnose/v2`);
-      const data = await readJson(res);
-      if (data.error && !data.partial) throw new Error(data.error);
-      setReport(data);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setRunning(false);
-    }
-  }
+  const { coords, zeroY, last } = points;
+  const up = last >= 0;
+  const stroke = up ? "var(--green)" : "var(--red)";
+  const gradId = up ? "pnlUp" : "pnlDown";
 
-  async function runTestTrade() {
-    setRunning(true); setError(null); setReport(null); setTrade(null);
-    try {
-      const res = await fetch(`${apiBase}/api/test-trade`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contracts: 1, maxPriceCents: 95 }),
-      });
-      setTrade(await readJson(res));
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setRunning(false);
-    }
-  }
-
-  const s = report?.stages || {};
+  const line = coords.map((c, i) => `${i ? "L" : "M"}${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(" ");
+  const area =
+    `${line} L${coords[coords.length - 1].x.toFixed(1)},${zeroY.toFixed(1)} ` +
+    `L${coords[0].x.toFixed(1)},${zeroY.toFixed(1)} Z`;
 
   return (
-    <div className="panel">
-      <h2>Diagnostic</h2>
-      <p className="setup-copy">
-        Runs every stage of the trade path and reports the exact verdict at each
-        one - which key is signing, what Kalshi returns, whether tickers resolve,
-        the live price, and why the risk manager would take or skip the trade.
-      </p>
-
-      <button type="button" onClick={runDiagnostic} disabled={running}>
-        {running ? "Working..." : "Run diagnostic scan"}
-      </button>
-
-      <button
-        type="button"
-        className="ledger-toggle"
-        style={{ marginTop: 10 }}
-        onClick={runTestTrade}
-        disabled={running}
-      >
-        Place 1-contract test trade (real money)
-      </button>
-      <div className="ledger-reason" style={{ marginTop: 6 }}>
-        Buys one YES contract at the ask on the first live market it can price,
-        with no edge check. Up to about $0.95 plus fees. This proves whether
-        orders reach the exchange.
+    <div>
+      <div className="pnl-headline">
+        <span className={`pnl-total ${up ? "pos" : "neg"}`}>{money(last)}</span>
+        <span className="pnl-caption">{coords.length} settled {coords.length === 1 ? "trade" : "trades"}</span>
       </div>
 
-      {error && <div className="error-banner" style={{ marginTop: 16 }}>{error}</div>}
+      <svg
+        className="pnl-svg"
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={`Cumulative profit and loss, currently ${money(last)}`}
+        onMouseLeave={() => setHover(null)}
+      >
+        <defs>
+          <linearGradient id="pnlUp" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--green)" stopOpacity="0.34" />
+            <stop offset="100%" stopColor="var(--green)" stopOpacity="0" />
+          </linearGradient>
+          <linearGradient id="pnlDown" x1="0" y1="1" x2="0" y2="0">
+            <stop offset="0%" stopColor="var(--red)" stopOpacity="0.34" />
+            <stop offset="100%" stopColor="var(--red)" stopOpacity="0" />
+          </linearGradient>
+        </defs>
 
-      {/* ---- Test trade result ---- */}
-      {trade && (
-        <div className="bot-subsection">
-          <div className="ledger-card">
-            <div className="ledger-card-head">
-              <span>Test trade</span>
-              <span className={trade.ok ? "pos" : "neg"}>{trade.ok ? "FILLED" : "NOT FILLED"}</span>
-            </div>
-            <Row label="Ticker" value={trade.ticker} />
-            <Row label="Filled" value={trade.filled} tone={trade.filled ? "pos" : "neg"} />
-            <Row label="Limit price" value={trade.limitCents != null ? `${trade.limitCents}c` : "—"} />
-            {trade.error && <div className="trade-card-reason neg">{trade.error}</div>}
-          </div>
+        {/* break-even */}
+        <line
+          x1={PAD.left} y1={zeroY} x2={W - PAD.right} y2={zeroY}
+          stroke="var(--label-tertiary)" strokeWidth="1" strokeDasharray="3 4" vectorEffect="non-scaling-stroke"
+        />
 
-          {(trade.steps ?? []).map((st, i) => (
-            <div key={i} className="ledger-card">
-              <div className="ledger-card-head">
-                <span>{st.name}</span>
-                <span className={st.error ? "neg" : ""}>{st.error ? "error" : "ok"}</span>
-              </div>
-              {st.error && <div className="trade-card-reason neg">{st.error}</div>}
-              <pre
-                style={{
-                  whiteSpace: "pre-wrap", wordBreak: "break-word",
-                  fontFamily: "ui-monospace, Menlo, monospace", fontSize: 11,
-                  margin: "8px 0 0", opacity: 0.85,
-                }}
-              >
-                {JSON.stringify(st, null, 1).slice(0, 1500)}
-              </pre>
-            </div>
-          ))}
-        </div>
-      )}
+        <path d={area} fill={`url(#${gradId})`} />
+        <path
+          d={line} fill="none" stroke={stroke} strokeWidth="2"
+          strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke"
+        />
 
-      {/* ---- Diagnostic report ---- */}
-      {report && (
-        <div className="bot-subsection">
-          <h3>Credentials</h3>
-          <Row label="Key ID" value={s.credentials?.keyId} />
-          <Row label="Key source" value={s.credentials?.source} />
-          <Row label="Fingerprint" value={s.credentials?.fingerprint} />
-          {s.credentials?.envVarAlsoSet && (
-            <div className="trade-card-reason neg">
-              KALSHI_PRIVATE_KEY_PEM is still set in Railway - delete it.
-            </div>
-          )}
-          {s.credentials?.keyError && <div className="trade-card-reason neg">{s.credentials.keyError}</div>}
+        {coords.map((c, i) => (
+          <circle
+            key={i} cx={c.x} cy={c.y} r={hover === i ? 5 : 3}
+            fill={stroke} stroke="var(--bg)" strokeWidth="1.5" vectorEffect="non-scaling-stroke"
+            onMouseEnter={() => setHover(i)}
+            onClick={() => setHover(hover === i ? null : i)}
+            style={{ cursor: "pointer" }}
+          />
+        ))}
+      </svg>
 
-          <h3 style={{ marginTop: 16 }}>Kalshi</h3>
-          <Row label="Reachable" value={s.kalshi?.ok ? "yes" : "no"} tone={s.kalshi?.ok ? "pos" : "neg"} />
-          {s.kalshi?.ok
-            ? <Row label="Balance" value={`$${(s.kalshi.balanceDollars ?? 0).toFixed(2)}`} />
-            : <div className="trade-card-reason neg">{s.kalshi?.error}</div>}
-
-          <h3 style={{ marginTop: 16 }}>Capital</h3>
-          <Row label="Tradable" value={`$${(s.config?.tradableBankroll ?? 0).toFixed(2)}`} />
-          <Row label="Reserved" value={`$${(s.config?.reserve ?? 0).toFixed(2)}`} />
-          <Row label="Kelly fraction" value={s.config?.tier?.kellyFraction} />
-          <Row label="Max stake" value={`$${s.config?.tier?.maxStakeDollars ?? "—"}`} />
-          <Row label="Max concurrent" value={s.config?.tier?.maxConcurrentPositions} />
-          <Row label="Open positions" value={s.config?.openPositions} />
-          <Row label="Take profit" value={`${((s.config?.takeProfitPct ?? 0) * 100).toFixed(0)}%`} />
-          <Row label="Trailing stop" value={`${((s.config?.trailingStopPct ?? 0) * 100).toFixed(0)}%`} />
-          <Row label="Entry cross" value={`${s.config?.entrySlippageCents}c`} />
-
-          {(report.sports ?? []).map((sp) => (
-            <div key={sp.sportKey} className="trade-card" style={{ marginTop: 16 }}>
-              <div className="trade-card-team">{sp.sportKey}</div>
-
-              {sp.odds?.ok ? (
-                <>
-                  <Row label="Odds provider" value={sp.odds.provider} />
-                  <Row label="Teams with lines" value={sp.odds.teamsFound} tone={sp.odds.teamsFound ? "pos" : "neg"} />
-                  <Row label="Quota left" value={sp.odds.quotaRemaining} />
-                </>
-              ) : (
-                <div className="trade-card-reason neg">Odds failed: {sp.odds?.error}</div>
-              )}
-
-              {sp.kalshiFetch && (
-                <div style={{ marginTop: 10 }}>
-                  <Row label="Winning query" value={sp.kalshiFetch.winner} tone={sp.kalshiFetch.total ? "pos" : "neg"} />
-                  <Row label="Markets returned" value={sp.kalshiFetch.total} />
-                  <Row label="Statuses" value={JSON.stringify(sp.kalshiFetch.statuses)} />
-                </div>
-              )}
-
-              {(sp.samples ?? []).map((sm, i) => (
-                <div key={i} style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--separator)" }}>
-                  <Row label="Team" value={sm.teamName} />
-                  <Row label="Sharp prob" value={`${(sm.trueProbability * 100).toFixed(1)}%`} />
-                  <Row label="Ticker" value={sm.ticker || "not resolved"} tone={sm.ticker ? "pos" : "neg"} />
-                  {!sm.ticker && <div className="trade-card-reason">{sm.resolveReason}</div>}
-                  {sm.marketStatus && <Row label="Status" value={sm.marketStatus} />}
-                  {sm.yesAsk != null && (
-                    <>
-                      <Row
-                        label="Ask"
-                        value={sm.yesAsk > 0 ? `${sm.yesAsk}c (${sm.yesAskSize} resting)` : "none"}
-                        tone={sm.yesAsk > 0 ? "pos" : "neg"}
-                      />
-                      <Row label="Price source" value={sm.priceSource} />
-                      <Row label="Book" value={`${sm.bookKeys} | ${sm.bookCounts}`} />
-                    </>
-                  )}
-                  {sm.verdict && (
-                    <Row label="Verdict" value={sm.verdict} tone={sm.verdict === "candidate" ? "pos" : "neg"} />
-                  )}
-                  {sm.verdictReason && <div className="trade-card-reason neg">{sm.verdictReason}</div>}
-                  {sm.edge && (
-                    <Row
-                      label="Edge vs required"
-                      value={`${(sm.edge.observedEdge * 100).toFixed(2)}% vs ${(sm.edge.requiredEdge * 100).toFixed(2)}%`}
-                      tone={sm.edge.qualifies ? "pos" : "neg"}
-                    />
-                  )}
-                  {sm.sizing && (
-                    <Row label="Would buy" value={`${sm.sizing.contracts} contracts ($${(sm.sizing.dollarsAtRisk ?? 0).toFixed(2)})`} />
-                  )}
-                  {sm.error && <div className="trade-card-reason neg">{sm.error}</div>}
-                </div>
-              ))}
-            </div>
-          ))}
+      {hover != null && coords[hover] && (
+        <div className="pnl-tip">
+          <strong>{coords[hover].row.ticker}</strong>
+          <span className={Number(coords[hover].row.pnl) >= 0 ? "pos" : "neg"}>
+            {money(coords[hover].row.pnl)}
+          </span>
+          <span className="muted">
+            running {money(coords[hover].row.cumulativePnl)}
+            {coords[hover].row.date
+              ? ` · ${new Date(coords[hover].row.date).toLocaleDateString([], { month: "short", day: "numeric" })}`
+              : ""}
+          </span>
         </div>
       )}
     </div>
