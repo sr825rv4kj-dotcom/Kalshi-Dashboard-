@@ -1,7 +1,24 @@
 /**
  * scraper.js
  *
- * Sharp-line ingestion. Everything downstream - the edge, the size, the
+ * Sharp-line ingestion.
+ *
+ * CORRECTION - live games. An earlier version of this system refused to trade
+ * any game already in progress, on the stated grounds that the sharp line was
+ * "frozen at kickoff and never updates in play". That was an assumption, and it
+ * was wrong. The Odds API's /odds endpoint explicitly returns "upcoming AND
+ * LIVE games with recent odds", and marks in-play events by commence_time being
+ * in the past. Live lines were available the whole time.
+ *
+ * The real hazard is narrower and it is measurable: a line that has not been
+ * REFRESHED recently. Books suspend markets during a possession, at a review,
+ * between innings. While suspended, the last posted price stays on the wire and
+ * looks exactly like a live quote. Comparing that to a Kalshi price that HAS
+ * moved is what manufactures a huge phantom edge on a team that is losing.
+ *
+ * So the guard is freshness, not whether the clock is running. Every price now
+ * carries the age of the quote it came from, and the entry gate refuses stale
+ * quotes - hard during play, loosely before kickoff. Everything downstream - the edge, the size, the
  * decision to trade at all - is measured against the probabilities this file
  * produces, so an error here is not a small error.
  *
@@ -86,6 +103,17 @@ async function fromTheOddsApi(sportKey) {
     const byTeam = new Map();
     const booksUsed = [];
 
+    // Market-level last_update is the live one; the bookmaker-level field is
+    // deprecated upstream and is only a fallback here.
+    const ageOf = (book, market) => {
+      const iso = market?.last_update ?? book?.last_update;
+      if (!iso) return null;                       // unknown - treated as stale in play
+      const ms = Date.parse(iso);
+      if (!Number.isFinite(ms)) return null;
+      return Math.max(0, (Date.now() - ms) / 1000);
+    };
+    const ages = [];
+
     for (const book of sharpBooks) {
       const h2h = (book.markets || []).find((m) => m.key === "h2h");
       if (!h2h || !Array.isArray(h2h.outcomes) || h2h.outcomes.length < 2) continue;
@@ -97,6 +125,7 @@ async function fromTheOddsApi(sportKey) {
       if (!fair) continue;                       // implausible overround - drop this book
 
       booksUsed.push(book.key);
+      ages.push(ageOf(book, h2h));
       h2h.outcomes.forEach((o, i) => {
         const name = o.name.toLowerCase();
         if (!byTeam.has(name)) byTeam.set(name, []);
@@ -105,6 +134,12 @@ async function fromTheOddsApi(sportKey) {
     }
 
     if (!booksUsed.length) { rejected.badOverround++; continue; }
+
+    // Freshest quote across the books used. If any book is actively updating,
+    // that is the one whose price we are really reading.
+    const known = ages.filter((a) => a != null);
+    const lineAgeSeconds = known.length ? Math.min(...known) : null;
+    const isLive = Date.parse(event.commence_time) < Date.now();
 
     for (const [name, values] of byTeam) {
       const consensus = median(values);
@@ -117,6 +152,8 @@ async function fromTheOddsApi(sportKey) {
         provider: "the-odds-api",
         eventId: event.id,
         commenceTime: event.commence_time,
+        lineAgeSeconds,
+        isLive,
       };
     }
   }
@@ -172,6 +209,11 @@ async function fromOddsPapi(sportKey, tournamentId) {
         provider: "oddspapi",
         eventId: fixture.fixtureId,
         commenceTime: fixture.startTime,
+        // OddsPapi documents no per-quote timestamp, so the age is unknown.
+        // Unknown age is allowed before kickoff and refused in play, where a
+        // suspended market is indistinguishable from a live one without it.
+        lineAgeSeconds: null,
+        isLive: Date.parse(fixture.startTime) < Date.now(),
       };
     });
   }
