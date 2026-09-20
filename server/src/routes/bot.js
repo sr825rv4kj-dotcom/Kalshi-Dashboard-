@@ -2,7 +2,7 @@
  * Bot control, trade history and the original diagnostic scan.
  */
 import { kalshiGet } from "../kalshiClient.js";
-import { startBot, stopBot, isRunning } from "../botController.js";
+import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker } from "../botController.js";
 import { loadConfig, saveConfig, setEnvironment } from "../configStore.js";
 import { loadState, getRecentLog } from "../stateStore.js";
 import { getRecentTrades, getTradeStats, getTradeLifecycles } from "../tradeLedgerStore.js";
@@ -74,6 +74,24 @@ export function registerBotRoutes(app) {
   app.post("/api/bot/start", (_req, res) => {
     try {
       res.json(startBot());
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * Clears a day halt and re-bases the drawdown baseline to current equity.
+   *
+   * Without this the only way out of a halt was to wait for the server's
+   * calendar day to roll over - which on a UTC host is mid-afternoon local
+   * time, and meant a loss taken under a strategy that has since been replaced
+   * went on blocking the replacement from ever trading.
+   */
+  app.post("/api/bot/resume", async (_req, res) => {
+    try {
+      const result = await resumeTrading();
+      resetCircuitBreaker();
+      res.json(result);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
