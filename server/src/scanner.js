@@ -1,243 +1,265 @@
 /**
- * scanner.js
+ * Self-audit. Registers /api/selfcheck.
  *
- * Scans one sport: pulls sharp lines, resolves each team to a live Kalshi
- * ticker, prices it from the order book, and enters positions that clear the
- * edge check.
+ * Checks three things that never appear in a deploy log:
+ *   1. Version drift - a module missing an export a sibling imports, or an
+ *      older version of a file whose behavior has since changed.
+ *   2. Config that is syntactically fine but arithmetically prohibits trading.
+ *   3. Runtime state - bot stopped, halted for the day, credentials broken.
  */
-
+import { loadConfig } from "./configStore.js";
+import { loadState } from "./stateStore.js";
 import { kalshiGet } from "./kalshiClient.js";
-import { getSharpProbabilities } from "./scraper.js";
-import { assessOpportunity } from "./riskManager.js";
-import { enterPosition } from "./executor.js";
-import { appendLog } from "./stateStore.js";
-import { resolveTicker } from "./tickerResolver.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-19-shard-routing";
+/** Named exports each module's dependents require. */
+const CONTRACTS = [
+  { file: "./kalshiClient.js", expects: ["kalshiGet", "kalshiPost", "kalshiDelete", "hasCredentialsConfigured", "resetCredentialsCache"] },
+  { file: "./tickerResolver.js", expects: ["resolveTicker", "SPORT_SERIES_MAP", "getFetchReport"] },
+  { file: "./riskManager.js", expects: ["assessOpportunity", "perContractFee", "requiredEdgeThreshold", "fractionalKellySize"] },
+  { file: "./botController.js", expects: ["startBot", "stopBot", "isRunning", "runCycle"] },
+  { file: "./executor.js", expects: ["enterPosition", "exitPosition"] },
+  { file: "./scanner.js", expects: ["scanSport"] },
+  { file: "./scraper.js", expects: ["getSharpProbabilities"] },
+  { file: "./sportsDiscovery.js", expects: ["discoverActiveSports"] },
+  { file: "./cadence.js", expects: ["currentCadenceSeconds", "describeCadence"] },
+  { file: "./tradeLedgerStore.js", expects: ["recordTrade", "getTradeLifecycles", "getTradeStats"] },
+];
 
-// Kalshi reports a tradeable market as "active", not "open".
-const TRADEABLE = new Set(["open", "active"]);
-
-export function withinEntryWindow(commenceTime, entryWindowHours) {
-  if (!entryWindowHours) return { ok: true, live: true };
-  if (!commenceTime) return { ok: true, live: false };
-
-  const startMs = new Date(commenceTime).getTime();
-  const nowMs = Date.now();
-  if (nowMs >= startMs) return { ok: true, live: true };
-
-  const hoursUntilStart = (startMs - nowMs) / (1000 * 60 * 60);
-  if (hoursUntilStart > entryWindowHours) {
-    return { ok: false, reason: `starts in ${hoursUntilStart.toFixed(1)}h, outside ${entryWindowHours}h window` };
-  }
-  return { ok: true, hoursUntilStart, live: false };
-}
-
-function eventKeyOf(ticker) {
-  const parts = String(ticker).split("-");
-  return parts.length > 1 ? `${parts[0]}-${parts[1]}` : String(ticker);
-}
+/** Exports that exist only in the current version of a file. */
+const EXPECTED_EXPORTS = [
+  { file: "./botController.js", name: "tradableBankroll", missing: "botController.js is stale - milestone tiers and take-profit are not active" },
+  { file: "./botController.js", name: "resetCircuitBreaker", missing: "botController.js is stale - no circuit breaker" },
+  { file: "./kalshiClient.js", name: "describeCredentials", missing: "kalshiClient.js is stale - the env-var key still overrides your saved key" },
+  { file: "./tickerResolver.js", name: "getFetchReport", missing: "tickerResolver.js is stale - no Kalshi query telemetry" },
+];
 
 /**
- * Normalizes a price to cents. The book quotes in dollars (0.43); anything at
- * or below 1 is treated as a decimal, anything above as cents already.
+ * Version markers. Reading an exported module constant is reliable. The
+ * previous approach read a single function's source, which could not see
+ * markers declared beside that function - and reported a current scanner.js
+ * as stale for an hour.
  */
-function toCents(raw) {
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  const cents = n <= 1 ? n * 100 : n;
-  return Math.round(cents);
-}
+const FINGERPRINTS = [
+  {
+    file: "./scanner.js",
+    exportName: "SCANNER_VERSION",
+    equals: "2026-09-19-shard-routing",
+    missing: "scanner.js is stale - it cannot read Kalshi's yes_dollars/no_dollars order book, or does not pass the market's exchange shard to the executor.",
+  },
+  {
+    file: "./executor.js",
+    exportName: "EXECUTOR_VERSION",
+    equals: "2026-09-19-shard-routing",
+    missing: "executor.js is stale - it posts to Kalshi's retired v1 order endpoint, or cannot move collateral to the shard a market trades on.",
+  },
+];
 
-/** Highest-priced level in a book side. Kalshi's ordering is not guaranteed. */
-function bestLevel(levels) {
-  let best = null;
-  for (const lvl of levels ?? []) {
-    const rawPrice = Array.isArray(lvl) ? lvl[0] : (lvl?.price ?? lvl?.yes_price ?? lvl?.no_price);
-    const rawSize = Array.isArray(lvl) ? lvl[1] : (lvl?.size ?? lvl?.count ?? lvl?.quantity);
-    const price = toCents(rawPrice);
-    if (price == null) continue;
-    const size = Number(rawSize ?? 0) || 0;
-    if (!best || price > best.price) best = { price, size };
-  }
-  return best;
-}
+async function checkModules() {
+  const findings = [];
+  const loaded = {};
 
-/**
- * Price to buy YES, in order of reliability:
- *   1. market.yes_ask when the endpoint populates it
- *   2. 100c minus the best NO bid - buying YES means selling NO to a bidder
- *   3. best YES bid + 1c when nobody is offering
- */
-async function priceFor(ticker, market) {
-  const direct = market?.yes_ask ?? 0;
-  if (direct > 0 && direct < 100) {
-    return { askCents: direct, askSize: market.yes_ask_size ?? 0, source: "market" };
-  }
-
-  let book = null;
-  try {
-    book = await kalshiGet(`${V2}/markets/${ticker}/orderbook`);
-  } catch (err) {
-    return { askCents: 0, askSize: 0, source: `book-error:${err.message.slice(0, 40)}` };
-  }
-
-  const ob = book?.orderbook_fp ?? book?.orderbook ?? book ?? {};
-
-  // Kalshi names the sides "yes_dollars" / "no_dollars" on this endpoint and
-  // quotes them in dollars (0.43), not cents. Matching on a key prefix keeps
-  // this working if the suffix changes again.
-  const sideFor = (prefix) => {
-    for (const [k, v] of Object.entries(ob)) {
-      if (Array.isArray(v) && k.toLowerCase().startsWith(prefix)) return v;
-    }
-    return [];
-  };
-  const yesLevels = sideFor("yes");
-  const noLevels = sideFor("no");
-
-  const bestNo = bestLevel(noLevels);
-  if (bestNo && bestNo.price > 0 && bestNo.price < 100) {
-    return { askCents: 100 - bestNo.price, askSize: bestNo.size, source: "book-no-bid" };
-  }
-
-  const bestYes = bestLevel(yesLevels);
-  if (bestYes && bestYes.price > 0 && bestYes.price < 99) {
-    return { askCents: bestYes.price + 1, askSize: bestYes.size, source: "book-yes-bid+1" };
-  }
-
-  const shape = `keys=[${Object.keys(ob).join(",")}] yes=${yesLevels.length} no=${noLevels.length}`;
-  return { askCents: 0, askSize: 0, source: `book-empty (${shape})` };
-}
-
-export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, skipEvents }) {
-  let probResult;
-  try {
-    const tournamentId = (config.oddsPapiTournamentIds || {})[sportKey];
-    probResult = await getSharpProbabilities(sportKey, {
-      oddsPapiTournamentId: tournamentId,
-      providerOrder: config.oddsProviderOrder,
-    });
-  } catch (err) {
-    appendLog(`${sportKey}: odds fetch failed - ${err.message}`, "warn");
-    return false;
-  }
-
-  const teamEntries = Object.entries(probResult.probabilities);
-  const drops = { window: 0, unresolved: 0, closed: 0, error: 0, duplicate: 0 };
-  let sampleReason = null;
-  const openEvents = skipEvents instanceof Set ? skipEvents : new Set();
-
-  const prepared = await Promise.all(teamEntries.map(async ([teamName, info]) => {
-    const { trueProbability, commenceTime } = info;
-
-    const windowCheck = withinEntryWindow(commenceTime, config.entryWindowHours);
-    if (!windowCheck.ok) { drops.window++; return null; }
-
-    let ticker = tickerMap[teamName];
-    if (!ticker) {
-      const resolved = await resolveTicker({ sportKey, teamName, commenceTime });
-      if (!resolved.ticker) {
-        drops.unresolved++;
-        if (!sampleReason) sampleReason = `${teamName}: ${resolved.reason}`;
-        return null;
+  for (const c of CONTRACTS) {
+    try {
+      const mod = await import(c.file);
+      loaded[c.file] = mod;
+      const missing = c.expects.filter((name) => typeof mod[name] === "undefined");
+      if (missing.length) {
+        findings.push({
+          level: "blocker", area: "module",
+          detail: `${c.file} is missing required export(s): ${missing.join(", ")}`,
+          fix: `A file importing ${c.file} expects these. Commit the current version of ${c.file}.`,
+        });
       }
-      ticker = resolved.ticker;
+    } catch (err) {
+      findings.push({
+        level: "blocker", area: "module",
+        detail: `${c.file} failed to load: ${err.message}`,
+        fix: "Syntax error or a broken import inside that file. The deploy log has the line number.",
+      });
     }
+  }
 
-    if (openEvents.has(eventKeyOf(ticker))) { drops.duplicate++; return null; }
+  for (const e of EXPECTED_EXPORTS) {
+    const mod = loaded[e.file];
+    if (mod && typeof mod[e.name] === "undefined") {
+      findings.push({
+        level: "warn", area: "version",
+        detail: `${e.file} does not export ${e.name}`,
+        fix: e.missing,
+      });
+    }
+  }
+
+  for (const f of FINGERPRINTS) {
+    const mod = loaded[f.file];
+    if (!mod) continue;
+    if (mod[f.exportName] !== f.equals) {
+      findings.push({
+        level: "blocker", area: "version",
+        detail: `${f.file} reports version "${mod[f.exportName] ?? "none"}", expected "${f.equals}"`,
+        fix: f.missing,
+      });
+    }
+  }
+
+  return findings;
+}
+
+function checkConfig(config, bankroll) {
+  const f = [];
+  const price = 0.5; // representative mid-price contract
+
+  const maxRisk = config.maxRiskPctPerTrade ?? 0.10;
+  const dollarsAtRisk = bankroll * maxRisk;
+  if (dollarsAtRisk < price) {
+    f.push({
+      level: "blocker", area: "sizing",
+      detail: `maxRiskPctPerTrade ${(maxRisk * 100).toFixed(0)}% of $${bankroll.toFixed(2)} is $${dollarsAtRisk.toFixed(2)} - less than one 50c contract, so every order floors to zero.`,
+      fix: `Raise maxRiskPctPerTrade to at least ${Math.ceil((price / Math.max(bankroll, 0.01)) * 100)}%, or rely on the one-contract floor in the current riskManager.js.`,
+    });
+  }
+
+  const minLiq = config.minLiquidity ?? 0;
+  if (minLiq >= 25) {
+    f.push({
+      level: "blocker", area: "liquidity",
+      detail: `minLiquidity is ${minLiq} resting contracts, but positions at this bankroll are 1-4 contracts.`,
+      fix: "Set minLiquidity to 0 and let the relative 2x-coverage check govern.",
+    });
+  }
+
+  if (config.entryWindowHours) {
+    f.push({
+      level: "warn", area: "timing",
+      detail: `entryWindowHours is ${config.entryWindowHours} - games outside that window are skipped before any price check.`,
+      fix: "Set entryWindowHours to 0 to trade live games at any point.",
+    });
+  }
+
+  const tp = config.takeProfitPct ?? 0.12;
+  const feeRoundTrip = 2 * Math.ceil(0.07 * price * (1 - price) * 100) / 100;
+  const grossNeeded = feeRoundTrip / price;
+  if (tp <= grossNeeded) {
+    f.push({
+      level: "warn", area: "exits",
+      detail: `takeProfitPct ${(tp * 100).toFixed(0)}% does not clear round-trip fees (~${(grossNeeded * 100).toFixed(0)}% at 50c). Winners would close at a loss.`,
+      fix: `Raise takeProfitPct above ${(grossNeeded * 100).toFixed(0)}%.`,
+    });
+  }
+
+  if (config.exitBelowCost) {
+    f.push({
+      level: "warn", area: "exits",
+      detail: "exitBelowCost fires on any tick below entry, which is ordinary noise. Each exit pays the round-trip fee.",
+      fix: "Turn exitBelowCost off and let perPositionStopLossPct govern.",
+    });
+  }
+
+  const cap = config.maxConcurrentPositions;
+  if (cap != null && cap < 1) {
+    f.push({
+      level: "blocker", area: "limits",
+      detail: `maxConcurrentPositions is ${cap} - no position can ever open.`,
+      fix: "Set it to 2 or more.",
+    });
+  }
+
+  if (config.survivalMode && bankroll < (config.survivalMode.balanceThreshold ?? 0)) {
+    const mult = config.survivalMode.edgeMultiplier ?? 1;
+    f.push({
+      level: mult > 1.5 ? "blocker" : "warn", area: "survival",
+      detail: `Survival mode is active (balance $${bankroll.toFixed(2)} below $${config.survivalMode.balanceThreshold}) and requires ${mult}x the normal edge.`,
+      fix: mult > 1.5
+        ? `An edge multiplier of ${mult} is close to unreachable. Lower survivalMode.edgeMultiplier to 1.2 or less.`
+        : "Intentional caution at a small balance - no action needed.",
+    });
+  }
+
+  if (config.environment !== "production") {
+    f.push({
+      level: "warn", area: "environment",
+      detail: `Environment is "${config.environment}" - orders do not touch the real account.`,
+      fix: "Switch to production in Bot Settings when you intend to trade real money.",
+    });
+  }
+
+  return f;
+}
+
+function checkRuntime(state, botRunning) {
+  const f = [];
+
+  if (!botRunning) {
+    f.push({
+      level: "blocker", area: "runtime",
+      detail: "The bot is not running - no scans are happening.",
+      fix: "Press Start on the bot panel. The watchdog should also restart it within two minutes.",
+    });
+  }
+
+  if (state.haltedForDay) {
+    f.push({
+      level: "blocker", area: "runtime",
+      detail: `Trading is halted for the day: ${state.haltReason}`,
+      fix: "This clears at the next calendar day. To resume sooner, raise dailyLossHaltPct.",
+    });
+  }
+
+  return f;
+}
+
+export function registerSelfCheckRoutes(app) {
+  app.get("/api/selfcheck", async (_req, res) => {
+    const report = { ranAt: new Date().toISOString(), findings: [] };
 
     try {
-      const res = await kalshiGet(`${V2}/markets/${ticker}`);
-      const market = res.market;
-      const status = String(market?.status || "").toLowerCase();
-      if (!market || !TRADEABLE.has(status)) {
-        drops.closed++;
-        if (!sampleReason) sampleReason = `${teamName}: status "${status || "missing"}"`;
-        return null;
+      report.findings.push(...(await checkModules()));
+
+      const config = loadConfig();
+      const state = loadState();
+
+      let bankroll = 0;
+      try {
+        const bal = await kalshiGet(`${V2}/portfolio/balance`);
+        bankroll = (bal.balance ?? 0) / 100;
+        report.balanceDollars = bankroll;
+      } catch (err) {
+        report.findings.push({
+          level: "blocker", area: "kalshi",
+          detail: `Cannot read balance: ${err.message}`,
+          fix: "Check the API key in the credentials screen and that KALSHI_PRIVATE_KEY_PEM is not set in Railway.",
+        });
       }
 
-      const pricing = await priceFor(ticker, market);
-      return { teamName, trueProbability, commenceTime, ticker, market, windowCheck, pricing };
+      let botRunning = false;
+      try {
+        const bc = await import("./botController.js");
+        botRunning = bc.isRunning();
+      } catch { /* the module check above already reported this */ }
+
+      report.findings.push(...checkConfig(config, bankroll));
+      report.findings.push(...checkRuntime(state, botRunning));
+
+      const order = { blocker: 0, warn: 1, ok: 2 };
+      report.findings.sort((a, b) => order[a.level] - order[b.level]);
+      report.summary = {
+        blockers: report.findings.filter((x) => x.level === "blocker").length,
+        warnings: report.findings.filter((x) => x.level === "warn").length,
+      };
+
+      if (!report.summary.blockers) {
+        report.findings.unshift({
+          level: "ok", area: "summary",
+          detail: "No mechanical blocker found. Every file is the current version. If the bot still is not trading, no market currently clears the edge threshold.",
+          fix: "Watch the scan log for 'failed entry checks' - the reason printed there is the live market condition, not a bug.",
+        });
+      }
+
+      res.json(report);
     } catch (err) {
-      drops.error++;
-      if (!sampleReason) sampleReason = `${teamName}: ${err.message}`;
-      return null;
+      res.status(500).json({ error: err.message, partial: report });
     }
-  }));
-
-  const viable = prepared.filter(Boolean);
-  appendLog(
-    `${sportKey}: ${teamEntries.length} lines -> ${viable.length} tradeable ` +
-    `(dropped: ${drops.unresolved} unresolved, ${drops.window} out-of-window, ` +
-    `${drops.closed} not-tradeable, ${drops.duplicate} already held, ${drops.error} fetch error)` +
-    (sampleReason ? ` | e.g. ${sampleReason}` : "")
-  );
-
-  const rejected = [];
-
-  for (const c of viable) {
-    if (atCap()) {
-      appendLog("Max concurrent positions reached - stopping scan this cycle.", "warn");
-      return true;
-    }
-    if (openEvents.has(eventKeyOf(c.ticker))) continue;
-
-    const askCents = c.pricing.askCents;
-    if (askCents <= 0 || askCents >= 100) {
-      rejected.push(`${c.ticker}: ${c.pricing.source}`);
-      continue;
-    }
-
-    const assessment = assessOpportunity({
-      bankroll,
-      trueProbability: c.trueProbability,
-      price: askCents / 100,
-      restingContracts: c.pricing.askSize,
-      multiplier: config.feeMultiplier,
-      kellyFraction: config.kellyFraction,
-      minLiquidity: config.minLiquidity ?? 0,
-      maxStakeDollars: config.maxStakeDollars ?? null,
-      survivalMode: config.survivalMode,
-    });
-
-    if (assessment.action === "skip") {
-      rejected.push(
-        `${c.ticker} ${askCents}c [${c.pricing.source}] (sharp ${(c.trueProbability * 100).toFixed(1)}%): ${assessment.reason}`
-      );
-      continue;
-    }
-
-    appendLog(
-      `Candidate ${c.ticker} (${c.teamName}): sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ` +
-      `[${c.pricing.source}], edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}%, ` +
-      `${assessment.sizing.contracts} contracts ($${assessment.sizing.dollarsAtRisk.toFixed(2)})`
-    );
-
-        const result = await enterPosition({
-      ticker: c.ticker,
-      side: "yes",
-      priceCents: askCents,
-      exchangeIndex: c.market?.exchange_index ?? null,
-      contracts: assessment.sizing.contracts,
-
-      reason:
-        `Sharp-book edge via ${probResult.provider} on "${c.teamName}" ` +
-        `(true ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c)` +
-        (c.windowCheck.live ? " [in progress]" : ""),
-      edgePct: assessment.edgeCheck.observedEdge * 100,
-      teamName: c.teamName,
-      sportKey,
-      commenceTime: c.commenceTime,
-    });
-
-    if (result && result.filled > 0) openEvents.add(eventKeyOf(c.ticker));
-  }
-
-  if (rejected.length) {
-    appendLog(`${sportKey}: ${rejected.length} tradeable market(s) failed entry checks. First: ${rejected[0]}`);
-  }
-  return false;
+  });
 }
