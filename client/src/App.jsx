@@ -148,7 +148,8 @@ function DashboardApp() {
 
       <div className="grid">
         <div className="panel"><h2>Open Positions</h2><PositionsTable positions={positions} /></div>
-        <div className="panel"><h2>Recent Orders</h2><OrdersTable orders={orders} /></div>
+          <div className="panel"><h2>Statement</h2><OrdersTable /></div>
+
       </div>
 
       <BotControlPanel apiBase={API_BASE} />
