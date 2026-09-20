@@ -20,28 +20,57 @@ const V2 = "/trade-api/v2";
  */
 const ORDERS_PATH = `${V2}/portfolio/events/orders`;
 
-export const EXECUTOR_VERSION = "2026-09-19-shard-routing-2";
+export const EXECUTOR_VERSION = "2026-09-19-shard-wait";
 
 const ALLOCATION_PATH = `${V2}/portfolio/target_balance_allocation`;
 
 /**
  * Kalshi splits collateral across exchange shards. A market names its shard in
  * market.exchange_index, and an order against a shard holding no collateral is
- * rejected - even when the account has cash, because the cash is sitting on a
- * different shard. This tracks which shard the balance was last moved to so it
- * is only reallocated when it actually needs to move.
+ * rejected even when the account has cash, because the cash is sitting on a
+ * different shard. This tracks which shard the balance was last moved to.
  */
 let allocatedShard = null;
 
-async function allocateAllTo(exchangeIndex) {
+/** Per-shard balance in dollars, from balance_breakdown. */
+async function shardBalanceDollars(exchangeIndex) {
+  try {
+    const bal = await kalshiGet(`${V2}/portfolio/balance`);
+    const rows = bal.balance_breakdown ?? [];
+    for (const r of rows) {
+      if (Number(r.exchange_index) === Number(exchangeIndex)) return Number(r.balance) || 0;
+    }
+    return 0;
+  } catch {
+    return null; // unknown - caller should not block on it
+  }
+}
+
+/**
+ * Target allocation is asynchronous: Kalshi accepts the request and moves the
+ * money afterwards. Firing the order two seconds later simply failed again with
+ * insufficient_balance, so this waits for the shard to actually hold what the
+ * order needs before returning.
+ */
+async function allocateAllTo(exchangeIndex, needDollars = 0) {
   await kalshiPost(ALLOCATION_PATH, {
     allocations: [{ exchange_index: exchangeIndex, percent: 100 }],
     resting_margin_reservation: "max",
   });
   allocatedShard = exchangeIndex;
-  appendLog(`Moved free collateral to exchange shard ${exchangeIndex}.`);
-  // Allocation is asynchronous; give the exchange a moment to settle it.
-  await new Promise((r) => setTimeout(r, 2000));
+
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const have = await shardBalanceDollars(exchangeIndex);
+    if (have == null) break;                       // cannot read - proceed and let the order decide
+    if (have >= needDollars) {
+      appendLog(`Collateral on shard ${exchangeIndex}: $${have.toFixed(2)} (needed $${needDollars.toFixed(2)}).`);
+      return true;
+    }
+  }
+
+  appendLog(`Shard ${exchangeIndex} still short of $${needDollars.toFixed(2)} after waiting.`, "warn");
+  return false;
 }
 
 function newClientOrderId() {
@@ -100,7 +129,8 @@ async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = fals
     const isBalanceIssue = /insufficient_(shard_)?balance/.test(String(err.message));
     if (isBalanceIssue && exchangeIndex != null) {
       appendLog(`Shard ${exchangeIndex} has no collateral for ${ticker} - reallocating.`, "warn");
-      await allocateAllTo(exchangeIndex);
+      const needDollars = (clampPrice(limitCents) / 100) * Number(contracts) * 1.15; // + fee headroom
+      await allocateAllTo(exchangeIndex, needDollars);
       body.client_order_id = newClientOrderId();
       res = await kalshiPost(ORDERS_PATH, body);
     } else {
@@ -143,7 +173,7 @@ export async function enterPosition({
   let result;
   try {
     if (exchangeIndex != null && allocatedShard != null && allocatedShard !== exchangeIndex) {
-      await allocateAllTo(exchangeIndex);
+      await allocateAllTo(exchangeIndex, (limitCents / 100) * contracts * 1.15);
     }
     result = await placeIOC({ ticker, side: "bid", limitCents, contracts, exchangeIndex });
   } catch (err) {
