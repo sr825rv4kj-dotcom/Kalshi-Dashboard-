@@ -69,3 +69,88 @@ export function findScoreForTeam(events, teamName) {
     commenceTime: match.commence_time,
   };
 }
+
+/**
+ * LIVE scores, for the in-play win-probability model.
+ *
+ * Separate from getRecentScores above because the requirements are opposite:
+ * that one serves settled trades and caches for an hour, this one has to be
+ * fresh enough to price a game in progress.
+ *
+ * COST. /scores is billed separately from /odds, so this is kept cheap:
+ *   - cached per sport for LIVE_CACHE_MS, so a 20-second scan cadence makes
+ *     at most one call every 90 seconds per sport
+ *   - daysFrom=1, the smallest window that still covers today's slate
+ *   - only ever called by the scanner when an in-play candidate actually
+ *     exists, so a pre-game-only slate costs nothing
+ */
+const LIVE_CACHE_MS = 90 * 1000;
+const liveCache = new Map(); // sportKey -> { events, fetchedAt }
+
+export async function getLiveScores(sportKey) {
+  const apiKey = process.env.THE_ODDS_API_KEY;
+  if (!apiKey) return { events: [], error: "THE_ODDS_API_KEY not set" };
+
+  const cached = liveCache.get(sportKey);
+  if (cached && Date.now() - cached.fetchedAt < LIVE_CACHE_MS) {
+    return { events: cached.events, cached: true };
+  }
+
+  try {
+    const res = await fetch(`${ODDS_API_BASE}/sports/${sportKey}/scores?apiKey=${apiKey}&daysFrom=1`);
+    if (!res.ok) return { events: cached?.events ?? [], error: `live scores ${res.status}` };
+    const events = await res.json();
+    liveCache.set(sportKey, { events, fetchedAt: Date.now() });
+    return { events, quotaRemaining: res.headers.get("x-requests-remaining") };
+  } catch (err) {
+    // Serve the last good copy rather than nothing - a 90s-old score is a far
+    // better input than refusing to model the game at all.
+    return { events: cached?.events ?? [], error: err.message };
+  }
+}
+
+/** Loose two-way name match, same approach the ticker resolver uses. */
+function namesMatch(a, b) {
+  const x = String(a || "").toLowerCase().trim();
+  const y = String(b || "").toLowerCase().trim();
+  if (!x || !y) return false;
+  return x === y || x.includes(y) || y.includes(x);
+}
+
+/**
+ * Current margin for `teamName` in an IN-PROGRESS game, from that team's own
+ * point of view: positive means ahead.
+ *
+ * Returns null when the game is not found, is already completed, or has no
+ * usable scores - all of which the caller must treat as "cannot model", never
+ * as a zero lead.
+ */
+export function findLiveGameForTeam(events, teamName) {
+  if (!teamName) return null;
+
+  const match = (events || []).find((e) => {
+    if (e.completed) return null;
+    if (!Array.isArray(e.scores) || !e.scores.length) return false;
+    return namesMatch(e.home_team, teamName) || namesMatch(e.away_team, teamName);
+  });
+  if (!match) return null;
+
+  const scoreFor = (name) => {
+    const row = (match.scores || []).find((s) => namesMatch(s.name, name));
+    const n = row ? Number(row.score) : NaN;
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const home = scoreFor(match.home_team);
+  const away = scoreFor(match.away_team);
+  if (home == null || away == null) return null;
+
+  const isHome = namesMatch(match.home_team, teamName);
+  return {
+    homeTeam: match.home_team, awayTeam: match.away_team,
+    homeScore: home, awayScore: away,
+    lead: isHome ? home - away : away - home,
+    commenceTime: match.commence_time,
+    lastUpdate: match.last_update ?? null,
+  };
+}
