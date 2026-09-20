@@ -64,12 +64,31 @@ async function tick() {
 
   // 3. Everything is running and unblocked. Say so once an hour rather than
   //    every two minutes, so the log stays readable.
+  // A bot whose circuit breaker is open still has a running timer, so
+  // isRunning() is true and this used to report "healthy" while it was
+  // trading nothing at all. That is the one state most worth surfacing, so
+  // it is named rather than hidden behind the word healthy.
+  const breaker = typeof bc.getBreakerStatus === "function"
+    ? bc.getBreakerStatus(config)
+    : { open: Boolean(state.circuitBreakerOpen) };
+
   const now = Date.now();
-  if (!tick.lastHealthy || now - tick.lastHealthy > 60 * 60 * 1000) {
+  const interval = breaker.open ? 10 * 60 * 1000 : 60 * 60 * 1000;
+  if (!tick.lastHealthy || now - tick.lastHealthy > interval) {
     tick.lastHealthy = now;
-    appendLog(
-      `Watchdog: healthy - bot running (${config.environment}), ${state.positions.length} open position(s).`
-    );
+    if (breaker.open) {
+      appendLog(
+        `Watchdog: bot running but CIRCUIT BREAKER OPEN` +
+        (breaker.trips ? ` (trip #${breaker.trips})` : "") +
+        (breaker.retryInSeconds != null ? ` - retries on its own in ${Math.ceil(breaker.retryInSeconds / 60)}m` : "") +
+        `. ${state.circuitBreakerReason ? `Last error: ${state.circuitBreakerReason}` : ""}`,
+        "error"
+      );
+    } else {
+      appendLog(
+        `Watchdog: healthy - bot running (${config.environment}), ${state.positions.length} open position(s).`
+      );
+    }
   }
 }
 
