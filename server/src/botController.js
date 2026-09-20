@@ -339,7 +339,7 @@ async function checkDailyHalt(config) {
 }
 
 /** Best resting YES bid, in cents - what the position could be sold into now. */
-async function bestYesBidCents(ticker) {
+async function yesQuote(ticker) {
   try {
     const book = await kalshiGet(`${V2}/markets/${ticker}/orderbook`);
     const ob = book?.orderbook_fp ?? book?.orderbook ?? book ?? {};
@@ -349,17 +349,30 @@ async function bestYesBidCents(ticker) {
       if (Array.isArray(v) && k.toLowerCase().startsWith("yes")) { levels = v; break; }
     }
 
-    let best = null;
-    for (const lvl of levels) {
-      const raw = Array.isArray(lvl) ? lvl[0] : lvl?.price;
-      const n = Number(raw);
-      if (!Number.isFinite(n) || n <= 0) continue;
-      const cents = Math.round(n <= 1 ? n * 100 : n);
-      if (best == null || cents > best) best = cents;
+    const bestOf = (side) => {
+      let best = null;
+      for (const lvl of side) {
+        const raw = Array.isArray(lvl) ? lvl[0] : lvl?.price;
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n <= 0) continue;
+        const cents = Math.round(n <= 1 ? n * 100 : n);
+        if (best == null || cents > best) best = cents;
+      }
+      return best;
+    };
+
+    let noLevels = [];
+    for (const [k, v] of Object.entries(ob)) {
+      if (Array.isArray(v) && k.toLowerCase().startsWith("no")) { noLevels = v; break; }
     }
-    return best;
+
+    const bid = bestOf(levels);
+    const bestNo = bestOf(noLevels);
+    // Buying YES means selling NO to a bidder, so the YES ask is 100 - best NO bid.
+    const ask = bestNo != null && bestNo > 0 && bestNo < 100 ? 100 - bestNo : null;
+    return { bid, ask, spread: bid != null && ask != null ? ask - bid : null };
   } catch {
-    return null;
+    return { bid: null, ask: null, spread: null };
   }
 }
 
@@ -391,20 +404,93 @@ async function bestYesBidCents(ticker) {
  * because you buy at the ask. Enabling it would have exited every position at a
  * guaranteed loss 3 minutes after opening it.
  */
-function blowoutExitDecision(position, bestBid, config) {
-  if (config.holdToSettlement === false) return null;      // explicit opt-out
+function blowoutExitDecision(position, quote, config) {
+  if (config.holdToSettlement === false) return null;
+  const bestBid = quote?.bid;
   if (bestBid == null) return null;
 
   const floorCents = config.blowoutExitBelowCents ?? 12;
   const collapsePct = config.blowoutExitCollapsePct ?? 0.6;
   const entry = position.entryPriceCents;
-  if (!entry) return null;
+  if (!entry || !floorCents) return null;
 
   const collapse = (entry - bestBid) / entry;
-  if (bestBid <= floorCents && collapse >= collapsePct) {
-    return `blowout: ${bestBid}c is ${(collapse * 100).toFixed(0)}% below the ${entry}c entry and under the ${floorCents}c floor - recovering the remainder rather than riding it to zero`;
+  if (!(bestBid <= floorCents && collapse >= collapsePct)) return null;
+
+  /**
+   * The collapse test alone is not enough, and this is what it cost to learn:
+   *
+   *   HOU bought 5 @ 34c. Price collapsed, the rule fired, and it sold at the
+   *   10c BID while the ask was still ~17c - a 7c spread on a 10c contract,
+   *   a 41% discount to the mid. It took $0.45 for something worth about
+   *   $0.70 held, because SETTLEMENT IS FREE and selling pays both a fee and
+   *   the entire spread.
+   *
+   * On a cheap contract the spread is proportionally enormous, so dumping into
+   * the bid is nearly always value-destroying. The exit now also requires the
+   * book to be TIGHT - only then is the bid close enough to fair value to be
+   * worth taking. A wide book means there is no real buyer, and the right move
+   * is to let it settle for nothing rather than pay to get out.
+   */
+  const maxSpread = config.blowoutExitMaxSpreadCents ?? 2;
+  if (quote.spread == null) {
+    return null; // cannot see the other side - do not dump blind
   }
-  return null;
+  if (quote.spread > maxSpread) {
+    return null;
+  }
+
+  return `blowout: ${bestBid}c is ${(collapse * 100).toFixed(0)}% below the ${entry}c entry, ` +
+    `under the ${floorCents}c floor, and the book is tight (${quote.spread}c spread) - ` +
+    `taking the bid rather than riding it to zero`;
+}
+
+/**
+ * CEILING EXIT - bank a position that is all but settled.
+ *
+ * Holding to settlement is right almost everywhere, because settlement is free
+ * and selling pays a fee. At the very top of the range that stops being true,
+ * for three reasons that all point the same way:
+ *
+ *   1. The trade is over. A contract bid at 97c has 3c of upside left. It is
+ *      not an investment any more, it is a receivable.
+ *   2. It is occupying a slot, and the slot cap is the thing that has actually
+ *      been blocking new trades on a busy slate. The cash inside it earns
+ *      nothing until the whistle, which can be hours away.
+ *   3. The risk is wildly asymmetric. Five contracts held at 97c risk $4.85 to
+ *      win $0.15, and 3% of the time the whole $4.85 is gone. Selling banks
+ *      $4.80 with certainty.
+ *
+ * The cost is exactly 1c per contract - the exit fee - anywhere in the 92-99c
+ * range. Redeploying even $1.50 into an ordinary +2c edge is worth about 6c,
+ * several times what the exit costs.
+ *
+ * A spread guard is kept for symmetry with the blowout exit, but it is close to
+ * unreachable here and that is worth being straight about: a bid of 97c cannot
+ * have an ask more than 3c away, because the ask cannot exceed 100c. What
+ * actually protects this exit is the price itself. Selling at a 97c BID is
+ * banking 96c against a hold worth 97c - a bounded 1c give-up no matter what
+ * the other side of the book looks like. That is the opposite of the HOU exit,
+ * where a 10c bid sat 7c under the ask and selling meant taking a 41% discount.
+ */
+function ceilingExitDecision(position, quote, config) {
+  const at = config.ceilingExitAtCents ?? 97;
+  if (!at) return null;
+
+  const bid = quote?.bid;
+  if (bid == null || bid < at) return null;
+
+  const maxSpread = config.ceilingExitMaxSpreadCents ?? 3;
+  if (quote.spread != null && quote.spread > maxSpread) return null;
+  // Note: an unreadable spread does NOT block this exit, unlike the blowout
+  // rule. At 97c+ the bid alone caps the downside at 1c, so refusing to act on
+  // a missing ask would leave capital parked for no protection.
+
+  const entry = position.entryPriceCents || 0;
+  const gain = entry ? (((bid - entry) / entry) * 100).toFixed(0) : "?";
+  return `ceiling: ${bid}c bid is at or above the ${at}c take-out level ` +
+    `(entry ${entry}c, +${gain}%) - banking it and freeing the slot rather than ` +
+    `risking ${bid}c to win the last ${100 - bid}c`;
 }
 
 async function checkOpenPositions(config) {
@@ -413,8 +499,18 @@ async function checkOpenPositions(config) {
 
   for (const position of [...state.positions]) {
     try {
-      const bestBid = await bestYesBidCents(position.ticker);
-      const decision = blowoutExitDecision(position, bestBid, config);
+      const quote = await yesQuote(position.ticker);
+
+      // Winners first: a position at the ceiling is the cheapest slot to free.
+      const ceiling = ceilingExitDecision(position, quote, config);
+      if (ceiling) {
+        appendLog(`${position.ticker} - ${ceiling}`);
+        await exitPosition(position, "ceiling-exit");
+        recordExit(position.ticker);
+        continue;
+      }
+
+      const decision = blowoutExitDecision(position, quote, config);
       if (decision) {
         appendLog(`${position.ticker} - ${decision}`, "warn");
         await exitPosition(position, "blowout-exit");
