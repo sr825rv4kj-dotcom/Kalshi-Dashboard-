@@ -92,6 +92,33 @@ export default function StrategyReviewPanel({ apiBase }) {
 
       {error && <div className="error-banner" style={{ marginTop: 14 }}>{error}</div>}
 
+      {data?.lastScan && (
+        <div className="bot-subsection">
+          <div className="field-label">Why it is not trading right now</div>
+          <div className="sr-scan-head">
+            Last scan saw <strong>{data.lastScan.seen}</strong> line(s) across{" "}
+            <strong>{data.lastScan.sports}</strong> sport(s) and entered{" "}
+            <strong className={data.lastScan.entered ? "pos" : "neg"}>{data.lastScan.entered}</strong>.
+          </div>
+          {data.lastScan.blockers.length === 0 ? (
+            <div className="empty-state">Nothing was refused - the bot is taking everything that qualifies.</div>
+          ) : (
+            <div className="sr-table">
+              {data.lastScan.blockers.map((b) => (
+                <div key={b.code} className="sr-blocker">
+                  <span className="sr-blocker-n">{b.count}</span>
+                  <span className="sr-blocker-label">{b.label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="sr-hint">
+            The top row is the gate doing the most blocking. If it is a threshold
+            you set, that is the one to loosen.
+          </div>
+        </div>
+      )}
+
       {data && (
         <>
           <div className="sr-summary">
