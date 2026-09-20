@@ -493,4 +493,10 @@ input[type="file"] { width: 100%; font-size: 15px; color: var(--label-secondary)
   letter-spacing: 0.06em; color: var(--kx-green); margin-left: 8px;
 }
 .kx-side-swatch { border-left-width: 3px; border-left-style: solid; }
+/* ---- Per-order P&L ---- */
+.kx-order-pnl {
+  font-size: 16px; font-weight: 700;
+  font-variant-numeric: tabular-nums; margin-top: 4px;
+}
+.kx-order-body .kx-order-sub { margin-top: 4px; }
 
