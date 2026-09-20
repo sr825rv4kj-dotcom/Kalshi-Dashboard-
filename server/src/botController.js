@@ -32,8 +32,8 @@ function loadTickerMap() {
 
 /**
  * Milestone tiers. Crossing a milestone used to send a message and change
- * nothing. Now it actually governs how the bot trades: more size, more
- * concurrency, and a reserve that sizing is not allowed to touch.
+ * nothing. Now it governs how the bot trades: more size, more concurrency,
+ * and a reserve that sizing is not allowed to touch.
  */
 export function tierFor(bankroll, config) {
   const tiers = config.milestoneTiers || [
@@ -117,9 +117,9 @@ function openEventKeys() {
 }
 
 /**
- * Marks a game as just-exited. Without this the bot bought, hit take-profit
- * seconds later, sold, and the very next scan saw the same edge and bought
- * again - a buy/sell loop on one game paying the round-trip fee every lap.
+ * Marks a game as just-exited. Without this the bot bought Montana at 8c,
+ * stopped out at 5c, and the next 20-second scan bought it again at 8c -
+ * four laps of a collapsing longshot, paying the fee every time.
  */
 function recordExit(ticker) {
   const state = loadState();
@@ -144,9 +144,8 @@ function cooledDownEventKeys(config) {
 /**
  * Total account equity: cash plus the market value of open positions. The
  * drawdown check used cash alone, which meant buying contracts - converting
- * cash into positions - registered as a loss. Three small entries moved cash
- * from $19.67 to $16.7 and halted the bot for the day at "15% drawdown" with
- * nothing actually lost. Equity is the only measure that answers "am I down?"
+ * cash into positions - registered as a loss and halted the bot for the day
+ * with nothing actually lost.
  */
 async function readEquity() {
   const data = await kalshiGet(`${V2}/portfolio/balance`);
@@ -170,8 +169,8 @@ async function checkDailyHalt(config) {
   }
 
   // A baseline saved before this change was cash-only, and any halt derived
-  // from it measured spending rather than loss. Migrate the baseline and clear
-  // that halt once, so the bot is not locked out for a day it never lost money.
+  // from it measured spending rather than loss. Migrate it and clear that halt
+  // once, so the bot is not locked out for a day it never lost money.
   if (state.dayStartEquity == null) {
     state.dayStartEquity = equity;
     state.dayStartBalance = equity;
@@ -206,8 +205,8 @@ async function checkDailyHalt(config) {
  * Best resting YES bid, in cents - what the position could be sold into now.
  * This read book.orderbook.yes, a key Kalshi no longer returns: the book comes
  * back under orderbook_fp with sides named yes_dollars/no_dollars, quoted in
- * dollars. The old read produced null every time, so every position skipped its
- * take-profit and stop-loss checks and simply rode to settlement.
+ * dollars. The old read produced null every time, so every position skipped
+ * its take-profit and stop-loss checks.
  */
 async function bestYesBidCents(ticker) {
   try {
@@ -237,7 +236,7 @@ async function bestYesBidCents(ticker) {
  * Kalshi's fee rounds UP to a whole cent per contract, each way. On an 8c
  * contract that is 1c in and 1c out - 25% of the stake in fees - while a 15%
  * take-profit is only 1.2c of gross gain. Every "winner" at that price closed
- * at a loss, which is where $2.21 went in ten round trips.
+ * at a loss.
  *
  * So the exit target is the LARGER of the percentage target and the price that
  * actually clears the round-trip fee plus a margin.
@@ -264,7 +263,6 @@ async function checkOpenPositions(config) {
   const trailPct = config.trailingStopPct ?? 0.08;
   let dirty = false;
 
-
   for (const position of [...state.positions]) {
     try {
       const bestBid = await bestYesBidCents(position.ticker);
@@ -287,7 +285,6 @@ async function checkOpenPositions(config) {
           `${position.ticker} at ${bestBid}c vs ${entry}c entry (+${(gainPct * 100).toFixed(1)}%, ` +
           `target ${target}c clears fees) - taking profit.`
         );
-
         await exitPosition(position, "take-profit");
         recordExit(position.ticker);
         continue;
