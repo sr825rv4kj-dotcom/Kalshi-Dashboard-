@@ -188,10 +188,17 @@ export function registerSettingsRoutes(app) {
 
   app.get("/api/background", (_req, res) => res.json(getBackground()));
 
+  /**
+   * Wallpaper settings. This used to destructure `dataUrl` and forward only
+   * that, which silently discarded the whole new payload - the selected
+   * wallpaper, the saved library and the rotation setting all looked saved in
+   * the browser and were never written to the server. The body is forwarded
+   * whole; backgroundStore validates and sanitizes it, and still accepts the
+   * old bare-{dataUrl} shape from an older client.
+   */
   app.post("/api/background", (req, res) => {
     try {
-      const { dataUrl } = req.body || {};
-      res.json(saveBackground(dataUrl));
+      res.json(saveBackground(req.body || {}));
     } catch (err) {
       res.status(400).json({ error: err.message });
     }
