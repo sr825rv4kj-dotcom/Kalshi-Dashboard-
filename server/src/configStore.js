@@ -29,7 +29,7 @@ import { CONFIG_DIR } from "./paths.js";
 const CONFIG_PATH = path.join(CONFIG_DIR, "bot-config.json");
 
 /** Bump this whenever a STRATEGY_KEYS default below changes meaningfully. */
-export const STRATEGY_VERSION = 5;
+export const STRATEGY_VERSION = 7;
 
 /**
  * Keys the migration is allowed to reset. Anything not listed here is the
@@ -41,7 +41,9 @@ export const STRATEGY_KEYS = [
   "minEntryPriceCents", "maxEntryPriceCents", "maxPlausibleEdge", "minEvCentsPerContract",
   "maxSpreadCents", "minLiquidity", "kellyFraction", "maxRiskPctPerTrade",
   "perPositionStopLossPct", "takeProfitPct", "trailingStopPct", "exitBelowCost",
-  "blowoutExitBelowCents", "blowoutExitCollapsePct", "reentryCooldownMinutes",
+  "blowoutExitBelowCents", "blowoutExitCollapsePct", "blowoutExitMaxSpreadCents",
+  "ceilingExitAtCents", "ceilingExitMaxSpreadCents",
+  "maxModelDisagreementPoints", "reentryCooldownMinutes",
   "dailyLossHaltPct", "feeMultiplier", "circuitBreakerFailures", "maxConcurrentPositions",
   "survivalMode", "milestoneTiers",
 ];
@@ -99,9 +101,31 @@ export const DEFAULTS = {
   trailingStopPct: null,
   exitBelowCost: false,         // compared bid to entry; the bid is ALWAYS below entry right after buying
 
+  // CEILING EXIT. Once a contract is bid at or above this, the trade is over -
+  // there is almost no upside left, it is holding a slot the cap needs, and the
+  // risk is absurdly one-sided: 5 contracts at 97c risk $4.85 to win $0.15, and
+  // 3% of the time the whole $4.85 is gone. Selling costs exactly 1c per
+  // contract anywhere in the 92-99c range, which redeploying more than covers.
+  //
+  // Set this to 99 to only take out near-certainties, or lower it toward 95 to
+  // free capital sooner and carry less tail risk. The give-up is 1c either way.
+  ceilingExitAtCents: 97,
+  ceilingExitMaxSpreadCents: 3,
+
   // The one real exit: a rout. Deep enough that it fires on blowouts, not noise.
+  //
+  // It fired on HOU and lost money doing it: it sold 5 contracts at the 10c BID
+  // while the ask was ~17c, taking $0.45 for something worth about $0.70 held.
+  // Settlement is free; selling pays a fee AND the whole spread, which on a 10c
+  // contract is proportionally enormous. So the exit now also requires a TIGHT
+  // book - proof there is a real buyer near fair value, not a void to dump into.
   blowoutExitBelowCents: 12,
   blowoutExitCollapsePct: 0.6,
+  blowoutExitMaxSpreadCents: 2,
+
+  // How far an in-play sharp line may sit from the in-game model before it is
+  // treated as a stale pre-game number rather than a live quote.
+  maxModelDisagreementPoints: 12,
 
   reentryCooldownMinutes: 60,
   dailyLossHaltPct: 0.15,
@@ -214,7 +238,7 @@ export function describeStrategy() {
       : "switched off in config",
     exitPolicy: c.holdToSettlement === false
       ? "active exits enabled"
-      : `held to settlement; only exit is a blowout below ${c.blowoutExitBelowCents}c`,
+      : `held to settlement, except a take-out at ${c.ceilingExitAtCents}c+ and a blowout below ${c.blowoutExitBelowCents}c`,
     priceBand: `${c.minEntryPriceCents}c - ${c.maxEntryPriceCents}c`,
     minEv: `${c.minEvCentsPerContract}c per contract`,
     sizing: `${(c.kellyFraction * 100).toFixed(0)}% Kelly, max ${(c.maxRiskPctPerTrade * 100).toFixed(0)}% of bankroll per trade`,
