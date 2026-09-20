@@ -41,9 +41,17 @@ function bestLevel(levels) {
 /** Reads the book and returns the ask plus the raw shape, for inspection. */
 async function bookPrice(ticker) {
   const book = await kalshiGet(`${V2}/markets/${ticker}/orderbook`);
-  const ob = book?.orderbook_fp ?? book?.orderbook ?? book ?? {};
-  const noLevels = ob.no ?? ob.no_levels ?? [];
-  const yesLevels = ob.yes ?? ob.yes_levels ?? [];
+    const ob = book?.orderbook_fp ?? book?.orderbook ?? book ?? {};
+
+  const sideFor = (prefix) => {
+    for (const [k, v] of Object.entries(ob)) {
+      if (Array.isArray(v) && k.toLowerCase().startsWith(prefix)) return v;
+    }
+    return [];
+  };
+  const noLevels = sideFor("no");
+  const yesLevels = sideFor("yes");
+
 
   const bestNo = bestLevel(noLevels);
   const bestYes = bestLevel(yesLevels);
