@@ -267,10 +267,37 @@ async function checkDailyHalt(config) {
     saveState(state);
   }
 
-  if (state.haltedForDay) return { halted: true, reason: state.haltReason };
-
   const baseline = state.dayStartEquity || equity;
   const drawdown = baseline > 0 ? (baseline - equity) / baseline : 0;
+
+  // A halt is a STATE, not a verdict carved in stone. This used to return the
+  // stored flag and the stored sentence without ever looking at them again, so
+  // a halt written under an old limit outlived the limit that caused it: the
+  // bot sat blocked reporting "hit the 10% halt limit" while the configured
+  // limit was 15% and the actual drawdown was 10.5% - under the rules actually
+  // in force, nothing was wrong. It could not clear until the server's calendar
+  // day rolled over, which on a UTC host is mid-afternoon local time.
+  //
+  // So the halt is re-checked against the CURRENT limit and the CURRENT equity
+  // every cycle. Hysteresis at 90% of the limit stops it flapping on and off
+  // around the boundary: it halts at the limit and only resumes once the
+  // drawdown has genuinely pulled back from it.
+  if (state.haltedForDay) {
+    const resumeBelow = config.dailyLossHaltPct * 0.9;
+    if (drawdown < resumeBelow) {
+      appendLog(
+        `Resuming: drawdown is ${(drawdown * 100).toFixed(1)}%, back under the ` +
+        `${(config.dailyLossHaltPct * 100).toFixed(0)}% limit (resume threshold ${(resumeBelow * 100).toFixed(1)}%). ` +
+        `Previous halt: ${state.haltReason}`
+      );
+      state.haltedForDay = false;
+      state.haltReason = null;
+      saveState(state);
+    } else {
+      return { halted: true, reason: state.haltReason };
+    }
+  }
+
   if (drawdown >= config.dailyLossHaltPct) {
     state.haltedForDay = true;
     state.haltReason =
@@ -448,6 +475,47 @@ export async function runCycle() {
       appendLog("Circuit breaker tripped - trading paused. Restart the bot once the cause is fixed.", "error");
     }
   }
+}
+
+/**
+ * Clears a day halt on demand and re-bases the drawdown baseline to the
+ * account's current equity.
+ *
+ * The automatic re-check above handles a halt whose limit has moved. This is
+ * for the other case: a halt that is arithmetically correct but no longer
+ * meaningful - a loss taken under a strategy that has since been replaced, or
+ * a baseline set before capital was deliberately withdrawn. Without it the only
+ * way to trade again was to wait for the server's calendar day to turn over.
+ */
+export async function resumeTrading() {
+  const state = loadState();
+  const previous = state.haltReason;
+
+  let equity = null;
+  try {
+    ({ equity } = await readEquity());
+  } catch (err) {
+    // Cannot read the account - clear the halt but leave the baseline alone
+    // rather than re-basing it to a number we could not verify.
+    state.haltedForDay = false;
+    state.haltReason = null;
+    saveState(state);
+    appendLog(`Halt cleared manually. Could not read equity to re-base the baseline (${err.message}).`, "warn");
+    return { resumed: true, baselineReset: false, previousHalt: previous };
+  }
+
+  state.haltedForDay = false;
+  state.haltReason = null;
+  state.dayStartEquity = equity;
+  state.dayStartBalance = equity;
+  state.dayStartDate = new Date().toDateString();
+  saveState(state);
+
+  appendLog(
+    `Trading resumed manually. Drawdown baseline re-based to $${equity.toFixed(2)}.` +
+    (previous ? ` Cleared halt: ${previous}` : "")
+  );
+  return { resumed: true, baselineReset: true, baselineEquity: equity, previousHalt: previous };
 }
 
 export function resetCircuitBreaker() {
