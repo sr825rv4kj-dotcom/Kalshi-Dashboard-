@@ -200,6 +200,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       kellyFraction: config.kellyFraction,
       minLiquidity: config.minLiquidity ?? 0,
       maxStakeDollars: config.maxStakeDollars ?? null,
+      maxPlausibleEdge: config.maxPlausibleEdge ?? 0.25,
       survivalMode: config.survivalMode,
     });
 
