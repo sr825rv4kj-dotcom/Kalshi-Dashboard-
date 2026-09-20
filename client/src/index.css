@@ -1147,3 +1147,35 @@ select option { background: #12161f; color: var(--label); }
   font-style: normal;
   color: var(--orange);
 }
+
+/* Why-it-is-not-trading tally */
+.sr-scan-head {
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--label-secondary);
+  margin-bottom: 11px;
+}
+.sr-scan-head strong { color: var(--label); font-variant-numeric: tabular-nums; }
+
+.sr-blocker {
+  display: flex;
+  align-items: baseline;
+  gap: 11px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--separator);
+  font-size: 13px;
+}
+.sr-blocker:last-child { border-bottom: none; }
+.sr-blocker:first-child .sr-blocker-n { background: color-mix(in srgb, var(--orange) 26%, transparent); color: var(--orange); }
+
+.sr-blocker-n {
+  flex-shrink: 0;
+  min-width: 30px;
+  padding: 2px 7px;
+  border-radius: 7px;
+  background: var(--fill);
+  text-align: center;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
+.sr-blocker-label { color: var(--label-secondary); line-height: 1.45; }
