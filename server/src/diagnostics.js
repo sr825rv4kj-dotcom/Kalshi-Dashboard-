@@ -9,7 +9,7 @@
  */
 import fs from "fs";
 import crypto from "crypto";
-import { kalshiGet, kalshiPost, kalshiDelete } from "./kalshiClient.js";
+import { kalshiGet, kalshiPost } from "./kalshiClient.js";
 import { tradableBankroll } from "./botController.js";
 import { loadConfig } from "./configStore.js";
 import { loadState } from "./stateStore.js";
@@ -41,8 +41,9 @@ function bestLevel(levels) {
 /** Reads the book and returns the ask plus the raw shape, for inspection. */
 async function bookPrice(ticker) {
   const book = await kalshiGet(`${V2}/markets/${ticker}/orderbook`);
-    const ob = book?.orderbook_fp ?? book?.orderbook ?? book ?? {};
+  const ob = book?.orderbook_fp ?? book?.orderbook ?? book ?? {};
 
+  // Kalshi names the sides "yes_dollars" / "no_dollars" and quotes in dollars.
   const sideFor = (prefix) => {
     for (const [k, v] of Object.entries(ob)) {
       if (Array.isArray(v) && k.toLowerCase().startsWith(prefix)) return v;
@@ -51,7 +52,6 @@ async function bookPrice(ticker) {
   };
   const noLevels = sideFor("no");
   const yesLevels = sideFor("yes");
-
 
   const bestNo = bestLevel(noLevels);
   const bestYes = bestLevel(yesLevels);
@@ -166,6 +166,7 @@ export function registerDiagnosticRoutes(app) {
       const market = mRes.market || {};
       step("market", {
         ticker, status: market.status,
+        exchange_index: market.exchange_index,
         yes_ask: market.yes_ask, yes_bid: market.yes_bid,
         title: market.title, subtitle: market.yes_sub_title,
       });
@@ -184,7 +185,7 @@ export function registerDiagnosticRoutes(app) {
         return res.json({ ok: false, ...out });
       }
 
-            // 4. Place the order on Kalshi's v2 order API. The v1 endpoint now
+      // 4. Place the order on Kalshi's v2 order API. The v1 endpoint now
       //    returns HTTP 410 deprecated_v1_order_endpoint. Immediate-or-cancel
       //    means the response itself reports the fill - no polling, and no
       //    stray order left resting if it does not take.
@@ -198,6 +199,7 @@ export function registerDiagnosticRoutes(app) {
         self_trade_prevention_type: "taker_at_cross",
         post_only: false,
       };
+      if (market.exchange_index != null) orderBody.exchange_index = market.exchange_index;
       step("placing", { endpoint: `${V2}/portfolio/events/orders`, orderBody });
 
       let placeRes;
@@ -219,28 +221,6 @@ export function registerDiagnosticRoutes(app) {
           ? Math.round(Number(placeRes.average_fee_paid) * 100) : null,
         raw: placeRes,
       });
-
-
-
-      // 5. Check the fill
-      await new Promise((r) => setTimeout(r, 3000));
-      const statusRes = await kalshiGet(`${V2}/portfolio/orders/${orderId}`);
-      const order = statusRes.order || {};
-      const filled = order.taker_fill_count ?? order.filled_count ?? 0;
-      step("fill", {
-        filled, requested: contracts, status: order.status,
-        average_fill_price: order.average_fill_price, raw: order,
-      });
-
-      // 6. Cancel anything unfilled so a stray order is not left resting
-      if (filled < contracts && orderId) {
-        try {
-          await kalshiDelete(`${V2}/portfolio/orders/${orderId}`);
-          step("cancelled-remainder", { cancelled: contracts - filled });
-        } catch (err) {
-          step("cancel-failed", { error: err.message });
-        }
-      }
 
       return res.json({ ok: filled > 0, ticker, filled, limitCents, ...out });
     } catch (err) {
@@ -319,6 +299,7 @@ export function registerDiagnosticRoutes(app) {
               const m = await kalshiGet(`${V2}/markets/${resolved.ticker}`);
               const market = m.market || {};
               sample.marketStatus = market.status;
+              sample.exchangeIndex = market.exchange_index ?? null;
 
               const priced = await bookPrice(resolved.ticker);
               sample.yesAsk = priced.askCents;
