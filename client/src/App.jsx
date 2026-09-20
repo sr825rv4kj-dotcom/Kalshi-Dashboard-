@@ -19,7 +19,9 @@ import DiagnosticPanel from "./components/DiagnosticPanel.jsx";
 import SelfCheckPanel from "./components/SelfCheckPanel.jsx";
 import { getTodaysTheme, applyTheme, setTheme, getTheme, THEME_KEYS } from "./theme.js";
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:4000";
+const RAW_BASE = import.meta.env.VITE_API_BASE;
+const API_BASE =
+  typeof RAW_BASE === "string" && RAW_BASE && RAW_BASE !== "undefined" ? RAW_BASE : "";
 
 function DashboardApp() {
   const [theme, setThemeState] = useState(() => getTodaysTheme());
