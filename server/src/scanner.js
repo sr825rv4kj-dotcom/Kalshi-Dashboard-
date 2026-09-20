@@ -15,7 +15,7 @@ import { resolveTicker } from "./tickerResolver.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-19-shard-routing";
+export const SCANNER_VERSION = "2026-09-19-fee-aware";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -201,6 +201,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       minLiquidity: config.minLiquidity ?? 0,
       maxStakeDollars: config.maxStakeDollars ?? null,
       maxPlausibleEdge: config.maxPlausibleEdge ?? 0.25,
+      minEntryPriceCents: config.minEntryPriceCents ?? 20,
       survivalMode: config.survivalMode,
     });
 
