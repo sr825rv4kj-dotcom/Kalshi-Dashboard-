@@ -34,7 +34,7 @@ const EXPECTED_EXPORTS = [
   { file: "./botController.js", name: "resetCircuitBreaker", missing: "botController.js is stale - no circuit breaker" },
   { file: "./kalshiClient.js", name: "describeCredentials", missing: "kalshiClient.js is stale - the env-var key still overrides your saved key" },
   { file: "./tickerResolver.js", name: "getFetchReport", missing: "tickerResolver.js is stale - no Kalshi query telemetry" },
-  { file: "./scanner.js", name: "entryTiming", missing: "scanner.js is stale - it cannot tell a live game from a pre-game one, so it is still trading in-progress games against frozen pre-game lines" },
+  { file: "./scanner.js", name: "entryTiming", missing: "scanner.js is stale - it cannot tell a live game from a pre-game one, so it cannot apply the right quote-freshness limit to either" },
   { file: "./scraper.js", name: "devig", missing: "scraper.js is stale - the bookmaker margin is not being removed, which reports 2-4% of edge that does not exist on every single market" },
   { file: "./riskManager.js", name: "evPerContractCents", missing: "riskManager.js is stale - it still prices a round trip and demands roughly double the edge actually needed, rejecting most profitable entries" },
   { file: "./configStore.js", name: "STRATEGY_VERSION", missing: "configStore.js is stale - strategy defaults still come only from the volume file, so a deploy that changes how the bot trades changes nothing" },
@@ -50,8 +50,8 @@ const FINGERPRINTS = [
   {
     file: "./scanner.js",
     exportName: "SCANNER_VERSION",
-    equals: "2026-09-20-pregame-hold",
-    missing: "scanner.js is stale - it is still entering live games off pre-game sharp lines, which measured at -1.92c per contract of expected value.",
+    equals: "2026-09-20-live-fresh",
+    missing: "scanner.js is stale - it either refuses live games outright, or enters them without checking whether the sharp quote is still being refreshed.",
   },
   {
     file: "./executor.js",
