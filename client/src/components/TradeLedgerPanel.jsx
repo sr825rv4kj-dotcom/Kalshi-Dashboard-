@@ -13,72 +13,83 @@ function when(iso) {
   });
 }
 
-/** One side of a game: color bar, full name, score, price pill. */
-function SideRow({ name, sportKey, score, priceCents, held }) {
-  const id = teamIdentity(name, sportKey);
-  return (
-    <div className={`kx-side ${held ? "kx-side-held" : ""}`}>
-      <span className="kx-side-swatch" style={{ background: id.primary, borderColor: id.secondary }} />
-      <span className="kx-side-name">{id.name}</span>
-      {score != null && <span className="kx-side-score">{score}</span>}
-      {priceCents != null && (
-        <span className="kx-pill">{priceCents}¢</span>
-      )}
-    </div>
-  );
+/**
+ * Works out both sides of the game and which one the bot held.
+ * finalScore carries the real home/away names and scores from the odds
+ * provider; teamName is the side actually bought. When scores have not been
+ * fetched yet, the opponent is unknown and only the held side is shown.
+ */
+function gameSides(trade) {
+  const fs = trade.finalScore;
+  const held = (trade.teamName || "").toLowerCase();
+
+  if (!fs || !fs.homeTeam) {
+    return { sides: [{ name: trade.teamName, score: null, isHeld: true }], final: false };
+  }
+
+  const isHeldHome =
+    fs.homeTeam.toLowerCase().includes(held) || held.includes(fs.homeTeam.toLowerCase());
+
+  return {
+    final: Boolean(fs.completed),
+    sides: [
+      { name: fs.awayTeam, score: fs.awayScore, isHeld: !isHeldHome },
+      { name: fs.homeTeam, score: fs.homeScore, isHeld: isHeldHome },
+    ],
+  };
 }
 
-/** The Kalshi-style card head: sport tile, matchup, status. */
-function CardHead({ sportKey, title, status, live }) {
+/** One side of a game: color bar, full name, final score, and the price paid. */
+function SideRow({ name, sportKey, score, isHeld, priceCents }) {
+  const id = teamIdentity(name, sportKey);
   return (
-    <div className="kx-head">
-      <div className="kx-tile">{sportEmoji(sportKey)}</div>
-      <div className="kx-head-text">
-        <div className="kx-title">{title}</div>
-        <div className="kx-status">
-          {live && <span className="kx-dot" />}
-          <span className={live ? "kx-live" : ""}>{status}</span>
-          <span className="kx-sep">·</span>
-          <span>{sportLabel(sportKey)}</span>
-        </div>
-      </div>
+    <div className={`kx-side ${isHeld ? "kx-side-held" : ""}`} style={{ opacity: isHeld ? 1 : 0.62 }}>
+      <span className="kx-side-swatch" style={{ background: id.primary, borderColor: id.secondary }} />
+      <span className="kx-side-name">
+        {id.name}
+        {isHeld && <span className="kx-held-tag"> held</span>}
+      </span>
+      {score != null && <span className="kx-side-score">{score}</span>}
+      {isHeld && priceCents != null && <span className="kx-pill">{priceCents}¢</span>}
     </div>
   );
 }
 
 function ClosedCard({ t }) {
   const win = (t.netDollars ?? 0) > 0;
-  const opponent = t.opponentName || null;
-  const title = opponent ? `${t.teamName} vs ${opponent}` : t.teamName;
+  const { sides, final } = gameSides(t);
+  const title = sides.length > 1 ? `${sides[0].name} vs ${sides[1].name}` : t.teamName;
 
   return (
     <div className={`kx-card ${win ? "kx-card-win" : "kx-card-loss"}`}>
-      <CardHead
-        sportKey={t.sportKey}
-        title={title}
-        status={t.finalScore ? "Final" : "Closed"}
-        live={false}
-      />
+      <div className="kx-head">
+        <div className="kx-tile">{sportEmoji(t.sportKey)}</div>
+        <div className="kx-head-text">
+          <div className="kx-title">{title}</div>
+          <div className="kx-status">
+            <span>{final ? "Final" : "Closed"}</span>
+            <span className="kx-sep">·</span>
+            <span>{sportLabel(t.sportKey)}</span>
+            <span className="kx-sep">·</span>
+            <span>{when(t.exitTimestamp)}</span>
+          </div>
+        </div>
+      </div>
 
-      <SideRow
-        name={t.teamName}
-        sportKey={t.sportKey}
-        score={t.finalScore?.score}
-        priceCents={t.entryPriceCents}
-        held
-      />
-      {opponent && (
+      {sides.map((s, i) => (
         <SideRow
-          name={opponent}
+          key={i}
+          name={s.name}
           sportKey={t.sportKey}
-          score={t.finalScore?.opponentScore}
-          priceCents={null}
+          score={s.score}
+          isHeld={s.isHeld}
+          priceCents={t.entryPriceCents}
         />
-      )}
+      ))}
 
       <div className="kx-stats">
-        <div><span>Invested</span><strong>{money(t.costDollars)}</strong></div>
-        <div><span>Returned</span><strong>{money(t.proceedsDollars)}</strong></div>
+        <div><span>Entered</span><strong>{money(t.costDollars)}</strong></div>
+        <div><span>Exited</span><strong>{money(t.proceedsDollars)}</strong></div>
         <div>
           <span>{win ? "Won" : "Lost"}</span>
           <strong className={win ? "kx-pos" : "kx-neg"}>{money(t.netDollars)}</strong>
@@ -97,30 +108,48 @@ function ClosedCard({ t }) {
         <span>In {t.entryPriceCents}¢ → Out {t.exitPriceCents}¢</span>
         <span className="kx-sep">·</span>
         <span>{when(t.entryTimestamp)} → {when(t.exitTimestamp)}</span>
+        {t.edgePct != null && (
+          <>
+            <span className="kx-sep">·</span>
+            <span>edge {t.edgePct.toFixed(1)}% at entry</span>
+          </>
+        )}
       </div>
 
-      <div className="kx-reason"><b>Entry:</b> {t.entryReason || "—"}</div>
-      <div className="kx-reason"><b>Exit:</b> {t.exitReason || "—"}</div>
+      <div className="kx-reason"><b>Why it entered:</b> {t.entryReason || "—"}</div>
+      <div className="kx-reason"><b>Why it exited:</b> {t.exitReason || "—"}</div>
       <div className="kx-ticker">{t.ticker}</div>
     </div>
   );
 }
 
 function OpenCard({ t }) {
+  const id = teamIdentity(t.teamName, t.sportKey);
   return (
     <div className="kx-card kx-card-open">
-      <CardHead sportKey={t.sportKey} title={t.teamName} status="Position open" live />
+      <div className="kx-head">
+        <div className="kx-tile">{sportEmoji(t.sportKey)}</div>
+        <div className="kx-head-text">
+          <div className="kx-title">{id.name}</div>
+          <div className="kx-status">
+            <span className="kx-dot" />
+            <span className="kx-live">Open</span>
+            <span className="kx-sep">·</span>
+            <span>{sportLabel(t.sportKey)}</span>
+          </div>
+        </div>
+      </div>
 
-      <SideRow name={t.teamName} sportKey={t.sportKey} priceCents={t.priceCents} held />
+      <SideRow name={t.teamName} sportKey={t.sportKey} isHeld priceCents={t.priceCents} />
 
       <div className="kx-stats">
-        <div><span>Invested</span><strong>{money(t.costDollars)}</strong></div>
+        <div><span>Entered</span><strong>{money(t.costDollars)}</strong></div>
         <div><span>Contracts</span><strong>{t.filled}</strong></div>
         <div><span>Entry</span><strong>{t.priceCents}¢</strong></div>
         <div><span>Opened</span><strong>{when(t.timestamp)}</strong></div>
       </div>
 
-      <div className="kx-reason"><b>Entry:</b> {t.reason || "—"}</div>
+      <div className="kx-reason"><b>Why it entered:</b> {t.reason || "—"}</div>
       <div className="kx-ticker">{t.ticker}</div>
     </div>
   );
@@ -141,6 +170,7 @@ function Section({ title, count, children, defaultOpen }) {
 }
 
 export default function TradeLedgerPanel({ apiBase }) {
+  const base = typeof apiBase === "string" && apiBase !== "undefined" ? apiBase : "";
   const [data, setData] = useState({ completed: [], open: [], stats: null });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -148,7 +178,7 @@ export default function TradeLedgerPanel({ apiBase }) {
   async function load() {
     try {
       setError(null);
-      const res = await fetch(`${apiBase}/api/trade-lifecycles?withScores=true`);
+      const res = await fetch(`${base}/api/trade-lifecycles?withScores=true`);
       const json = await res.json();
       if (json.error) throw new Error(json.error);
       setData({ completed: json.completed ?? [], open: json.open ?? [], stats: json.stats ?? null });
