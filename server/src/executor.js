@@ -20,17 +20,16 @@ const V2 = "/trade-api/v2";
  */
 const ORDERS_PATH = `${V2}/portfolio/events/orders`;
 
-export const EXECUTOR_VERSION = "2026-09-19-shard-routing";
+export const EXECUTOR_VERSION = "2026-09-19-shard-routing-2";
 
 const ALLOCATION_PATH = `${V2}/portfolio/target_balance_allocation`;
 
 /**
  * Kalshi splits collateral across exchange shards. A market names its shard in
  * market.exchange_index, and an order against a shard holding no collateral is
- * rejected with insufficient_shard_balance - even when the account has cash,
- * because the cash is sitting on a different shard. This tracks which shard the
- * balance was last moved to so it is only reallocated when it actually needs to
- * move, rather than on every order.
+ * rejected - even when the account has cash, because the cash is sitting on a
+ * different shard. This tracks which shard the balance was last moved to so it
+ * is only reallocated when it actually needs to move.
  */
 let allocatedShard = null;
 
@@ -94,9 +93,12 @@ async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = fals
   try {
     res = await kalshiPost(ORDERS_PATH, body);
   } catch (err) {
-    // The shard holding this market has no collateral. Move the free balance
-    // there and try once more; a second failure is a real rejection.
-    if (String(err.message).includes("insufficient_shard_balance") && exchangeIndex != null) {
+    // Kalshi reports a shard with no collateral as either
+    // insufficient_shard_balance (404) or the generic insufficient_balance
+    // (400). Both mean the same thing when the account plainly has cash:
+    // the money is sitting on a different shard than this market trades on.
+    const isBalanceIssue = /insufficient_(shard_)?balance/.test(String(err.message));
+    if (isBalanceIssue && exchangeIndex != null) {
       appendLog(`Shard ${exchangeIndex} has no collateral for ${ticker} - reallocating.`, "warn");
       await allocateAllTo(exchangeIndex);
       body.client_order_id = newClientOrderId();
