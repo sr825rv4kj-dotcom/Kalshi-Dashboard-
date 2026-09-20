@@ -141,11 +141,30 @@ function checkConfig(config, bankroll) {
     });
   }
 
+  // Live trading status. This used to warn that entryWindowHours blocked live
+  // games and advise setting it to 0 - advice that is now simply wrong.
+  // entryWindowHours only limits how far AHEAD of kickoff to look; a game that
+  // has already started is always eligible, and quote freshness decides it.
+  if (config.allowLiveGames === false) {
+    f.push({
+      level: "warn", area: "live",
+      detail: "Live trading is switched OFF - games already in progress are skipped no matter how good the price is.",
+      fix: "Set allowLiveGames to true to trade in-play markets.",
+    });
+  } else {
+    f.push({
+      level: "ok", area: "live",
+      detail: `Live trading is ON. In-play markets are traded with no waiting period, provided the sharp quote was refreshed within ${config.maxLineAgeSecondsLive ?? 180}s ` +
+        `(pre-game allowance ${config.maxLineAgeSecondsPregame ?? 1800}s). A stale quote means the book has suspended its market while the exchange kept moving.`,
+      fix: "No action needed. Raise maxLineAgeSecondsLive to accept older in-play quotes, lower it to be stricter.",
+    });
+  }
+
   if (config.entryWindowHours) {
     f.push({
-      level: "warn", area: "timing",
-      detail: `entryWindowHours is ${config.entryWindowHours} - games outside that window are skipped before any price check.`,
-      fix: "Set entryWindowHours to 0 to trade live games at any point.",
+      level: "ok", area: "timing",
+      detail: `entryWindowHours is ${config.entryWindowHours} - that is how far AHEAD of kickoff a pre-game line is read. It does not limit live games, which are always eligible.`,
+      fix: "No action needed. Raise it to look further ahead at pre-game markets.",
     });
   }
 
@@ -153,7 +172,7 @@ function checkConfig(config, bankroll) {
   if (!ceiling || ceiling > 0.5) {
     f.push({
       level: "warn", area: "data",
-      detail: `maxPlausibleEdge is ${ceiling ? (ceiling * 100).toFixed(0) + "%" : "off"} - the sharp line is pre-game while Kalshi's price is live, so a huge apparent edge usually means the game has turned and the line is stale.`,
+      detail: `maxPlausibleEdge is ${ceiling ? (ceiling * 100).toFixed(0) + "%" : "off"} - a sharp book and a live exchange that far apart means one of the two feeds is wrong, not that free money is on the screen.`,
       fix: "Set maxPlausibleEdge to about 0.25 so blowout losers at single-digit prices are refused.",
     });
   }
