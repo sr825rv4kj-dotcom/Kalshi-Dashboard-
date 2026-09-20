@@ -43,8 +43,9 @@ const EXPECTED_EXPORTS = [
  */
 const FINGERPRINTS = [
   {
-    file: "./scanner.js", exportName: "SCANNER_VERSION", equals: "2026-09-19-book-pricing",
-    missing: "scanner.js is stale - it cannot price from the order book, so every entry fails on 'no ask price'.",
+        file: "./scanner.js", exportName: "SCANNER_VERSION", equals: "2026-09-19-orderbook-fp",
+
+    missing: "scanner.js is stale - it cannot price from the order book, so every entry fails on 'no ask price'.",=
   },
 ];
 
