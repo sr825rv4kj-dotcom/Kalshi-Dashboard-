@@ -15,7 +15,7 @@ import { loadConfig } from "./configStore.js";
 import { hasAccount, createAccount, verifyLogin, verifyToken } from "./authStore.js";
 import { registerPortfolioRoutes } from "./routes/portfolio.js";
 import { registerBotRoutes } from "./routes/bot.js";
-import { registerSettingsRoutes } from "./routes/settings.js";
+import { registerSettingsRoutes } from "./routes/primarysettings.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
