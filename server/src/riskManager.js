@@ -166,24 +166,55 @@ export function assessOpportunity({
   maxEntryPriceCents = 88,
   minEvCentsPerContract = 2,
   isLiveGame = false,
-  allowLiveGames = false,
+  allowLiveGames = true,
+  lineAgeSeconds = null,
+  maxLineAgeSecondsLive = 180,
+  maxLineAgeSecondsPregame = 1800,
   survivalMode = null,
 }) {
   const observedEdge = trueProbability - price;
   const priceCents = Math.round(price * 100);
 
-  // --- Gate 1: never trade a game already in progress off a pre-game line ---
-  // The sportsbook line this bot reads is priced BEFORE kickoff and does not
-  // update in play. Kalshi's price does. Once a game starts, the gap between
-  // them is not mispricing - it is the live market marking a team down, and
-  // the bot is buying exactly the teams that are losing. Measured: every live
-  // trade that cleared the old filters had negative EV equal to the fee,
-  // because the live ask WAS the fair price.
+  // --- Gate 1: the quote must be FRESH ---
+  //
+  // This gate used to refuse in-play games outright, on the assumption that a
+  // sharp line stops updating at kickoff. That assumption was wrong: the odds
+  // feed serves live in-play prices, and a live game is a perfectly good thing
+  // to trade.
+  //
+  // What is NOT good to trade is a SUSPENDED quote. Books pull their markets
+  // during a possession, a review, a pitching change - and the last posted
+  // price stays on the wire looking exactly like a live one. Kalshi keeps
+  // moving. The gap between a suspended book and a moving exchange is not
+  // mispricing, and buying it means buying the team that just fell behind.
+  //
+  // Age is the only thing that separates the two, so age is what is checked.
+  // In play the tolerance is tight, because a live book that has not ticked in
+  // minutes is not quoting. Before kickoff it is loose, because a pre-game line
+  // legitimately sits still.
   if (isLiveGame && !allowLiveGames) {
-    return {
-      action: "skip",
-      reason: "game is already in progress - a pre-game sharp line cannot price a live market, and the apparent edge is the live market marking this team down",
-    };
+    return { action: "skip", reason: "live trading is switched off in config (allowLiveGames)" };
+  }
+
+  const maxAge = isLiveGame ? maxLineAgeSecondsLive : maxLineAgeSecondsPregame;
+  if (maxAge) {
+    if (lineAgeSeconds == null) {
+      // Unknown age. Before kickoff that is fine - the line is not moving
+      // anyway. In play it is not: a suspended market and a live one look
+      // identical without a timestamp, so this fails closed.
+      if (isLiveGame) {
+        return {
+          action: "skip",
+          reason: "game is in play and this feed carries no quote timestamp - a suspended book cannot be told from a live one, so it is not traded",
+        };
+      }
+    } else if (lineAgeSeconds > maxAge) {
+      return {
+        action: "skip",
+        reason: `sharp quote is ${Math.round(lineAgeSeconds)}s old, past the ${maxAge}s limit for ` +
+          `${isLiveGame ? "an in-play" : "a pre-game"} market - the book has likely suspended it while the exchange kept moving`,
+      };
+    }
   }
 
   // --- Gate 2: price band ---
