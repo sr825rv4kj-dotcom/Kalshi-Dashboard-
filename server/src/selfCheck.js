@@ -48,6 +48,12 @@ const FINGERPRINTS = [
     equals: "2026-09-19-dollars-book",
     missing: "scanner.js is stale - it cannot read Kalshi's yes_dollars/no_dollars order book, so every entry fails on 'no ask price'.",
   },
+  {
+    file: "./executor.js",
+    exportName: "EXECUTOR_VERSION",
+    equals: "2026-09-19-orders-v2",
+    missing: "executor.js is stale - it posts to Kalshi's retired v1 order endpoint, which returns HTTP 410 and trips the circuit breaker.",
+  },
 ];
 
 
