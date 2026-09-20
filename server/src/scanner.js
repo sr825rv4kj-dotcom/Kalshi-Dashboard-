@@ -2,7 +2,7 @@
  * scanner.js
  *
  * Scans one sport: pulls sharp lines, resolves each team to a live Kalshi
- * ticker, and enters positions that clear the edge check.
+ * ticker, prices it, and enters positions that clear the edge check.
  */
 
 import { kalshiGet } from "./kalshiClient.js";
@@ -14,14 +14,9 @@ import { resolveTicker } from "./tickerResolver.js";
 
 const V2 = "/trade-api/v2";
 
-// Kalshi reports a tradeable market as "active". This module checked for
-// "open" and silently dropped every live market it had just resolved.
+// Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
 
-/**
- * Entry timing gate. With entryWindowHours null/0 the gate is OFF entirely -
- * pre-game AND in-progress games are both tradeable.
- */
 export function withinEntryWindow(commenceTime, entryWindowHours) {
   if (!entryWindowHours) return { ok: true, live: true };
   if (!commenceTime) return { ok: true, live: false };
@@ -41,6 +36,38 @@ export function withinEntryWindow(commenceTime, entryWindowHours) {
 function eventKeyOf(ticker) {
   const parts = String(ticker).split("-");
   return parts.length > 1 ? `${parts[0]}-${parts[1]}` : String(ticker);
+}
+
+/** Highest-priced level in a book side. Kalshi's ordering is not guaranteed. */
+function bestLevel(levels) {
+  let best = null;
+  for (const lvl of levels ?? []) {
+    const price = Array.isArray(lvl) ? lvl[0] : lvl?.price;
+    const size = Array.isArray(lvl) ? lvl[1] : lvl?.size;
+    if (price == null) continue;
+    if (!best || price > best.price) best = { price: Number(price), size: Number(size ?? 0) };
+  }
+  return best;
+}
+
+/**
+ * The ask for YES. The market object's yes_ask comes back as 0 on this
+ * endpoint, which stopped every entry at the last step. The orderbook is
+ * authoritative: the best ask for YES is 100c minus the best bid for NO,
+ * because buying YES means selling NO to someone bidding for it.
+ */
+async function priceFor(ticker, market) {
+  const direct = market?.yes_ask ?? 0;
+  if (direct > 0 && direct < 100) {
+    return { askCents: direct, askSize: market.yes_ask_size ?? 0, source: "market" };
+  }
+
+  const book = await kalshiGet(`${V2}/markets/${ticker}/orderbook`);
+  const noSide = bestLevel(book.orderbook?.no);
+  if (!noSide || noSide.price <= 0 || noSide.price >= 100) {
+    return { askCents: 0, askSize: 0, source: "book-empty" };
+  }
+  return { askCents: 100 - noSide.price, askSize: noSide.size, source: "book" };
 }
 
 /**
@@ -64,9 +91,6 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
   let sampleReason = null;
   const openEvents = skipEvents instanceof Set ? skipEvents : new Set();
 
-  // Resolve tickers and pull prices in parallel. Sequentially this was one
-  // round-trip per team (24+ for MLB alone), which put entry latency into
-  // minutes rather than seconds.
   const prepared = await Promise.all(teamEntries.map(async ([teamName, info]) => {
     const { trueProbability, commenceTime } = info;
 
@@ -95,7 +119,9 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
         if (!sampleReason) sampleReason = `${teamName}: status "${status || "missing"}"`;
         return null;
       }
-      return { teamName, trueProbability, commenceTime, ticker, market, windowCheck };
+
+      const pricing = await priceFor(ticker, market);
+      return { teamName, trueProbability, commenceTime, ticker, market, windowCheck, pricing };
     } catch (err) {
       drops.error++;
       if (!sampleReason) sampleReason = `${teamName}: ${err.message}`;
@@ -118,13 +144,11 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       appendLog("Max concurrent positions reached - stopping scan this cycle.", "warn");
       return true;
     }
-    // Re-check inside the loop: an entry earlier in this same pass may have
-    // opened a position on the other side of this game.
     if (openEvents.has(eventKeyOf(c.ticker))) continue;
 
-    const askCents = c.market.yes_ask ?? 0;
+    const askCents = c.pricing.askCents;
     if (askCents <= 0 || askCents >= 100) {
-      rejected.push(`${c.ticker}: no ask price`);
+      rejected.push(`${c.ticker}: no ask in book (${c.pricing.source})`);
       continue;
     }
 
@@ -132,7 +156,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       bankroll,
       trueProbability: c.trueProbability,
       price: askCents / 100,
-      restingContracts: c.market.yes_ask_size ?? 0,
+      restingContracts: c.pricing.askSize,
       multiplier: config.feeMultiplier,
       kellyFraction: config.kellyFraction,
       minLiquidity: config.minLiquidity ?? 0,
@@ -141,13 +165,15 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
     });
 
     if (assessment.action === "skip") {
-      rejected.push(`${c.ticker} ${askCents}c: ${assessment.reason}`);
+      rejected.push(
+        `${c.ticker} ${askCents}c (sharp ${(c.trueProbability * 100).toFixed(1)}%): ${assessment.reason}`
+      );
       continue;
     }
 
     appendLog(
-      `Candidate ${c.ticker} (${c.teamName}): sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c, ` +
-      `edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}%, ` +
+      `Candidate ${c.ticker} (${c.teamName}): sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ` +
+      `[${c.pricing.source}], edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}%, ` +
       `${assessment.sizing.contracts} contracts ($${assessment.sizing.dollarsAtRisk.toFixed(2)})`
     );
 
