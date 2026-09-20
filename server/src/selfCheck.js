@@ -45,7 +45,7 @@ const FINGERPRINTS = [
   {
         file: "./scanner.js", exportName: "SCANNER_VERSION", equals: "2026-09-19-orderbook-fp",
 
-    missing: "scanner.js is stale - it cannot price from the order book, so every entry fails on 'no ask price'.",=
+    =
   },
 ];
 
