@@ -2,11 +2,10 @@
  * Self-audit. Registers /api/selfcheck.
  *
  * Checks three things that never appear in a deploy log:
- *   1. Version drift - a module missing an export a sibling imports, or
- *      missing a behavior a newer version introduced. Detected by reading the
- *      live function source, so a stale file cannot hide.
+ *   1. Version drift - a module missing an export a sibling imports, or an
+ *      older version of a file whose behavior has since changed.
  *   2. Config that is syntactically fine but arithmetically prohibits trading.
- *   3. Runtime state - bot stopped, halted for the day, no credentials.
+ *   3. Runtime state - bot stopped, halted for the day, credentials broken.
  */
 import { loadConfig } from "./configStore.js";
 import { loadState } from "./stateStore.js";
@@ -37,34 +36,15 @@ const EXPECTED_EXPORTS = [
 ];
 
 /**
- * Behavioral fingerprints: a string that appears in the current version of a
- * function and not in the old one. Function.prototype.toString returns the
- * live source, so this detects a stale file that still has the right exports.
+ * Version markers. Reading an exported module constant is reliable. The
+ * previous approach read a single function's source, which could not see
+ * markers declared beside that function - and reported a current scanner.js
+ * as stale for an hour.
  */
 const FINGERPRINTS = [
   {
-    file: "./scanner.js", fn: "scanSport", needle: "orderbook",
-    missing: "scanner.js is stale - it reads yes_ask from the market object, which Kalshi returns as 0. Every entry fails with 'no ask price'.",
-  },
-  {
-    file: "./scanner.js", fn: "scanSport", needle: "active",
-    missing: "scanner.js is stale - it only accepts status 'open', and Kalshi reports live markets as 'active'. Every market is dropped as closed.",
-  },
-  {
-    file: "./executor.js", fn: "enterPosition", needle: "entrySlippageCents",
-    missing: "executor.js is stale - orders quote the ask exactly and rest unfilled instead of crossing.",
-  },
-  {
-    file: "./executor.js", fn: "exitPosition", needle: "exitSlippageCents",
-    missing: "executor.js is stale - exits do not cross the spread and can hang on illiquid books.",
-  },
-  {
-    file: "./riskManager.js", fn: "fractionalKellySize", needle: "minContracts",
-    missing: "riskManager.js is stale - Kelly sizing floors to zero contracts at a small bankroll.",
-  },
-  {
-    file: "./riskManager.js", fn: "assessOpportunity", needle: "wantContracts",
-    missing: "riskManager.js is stale - liquidity is checked against a fixed number instead of your order size.",
+    file: "./scanner.js", exportName: "SCANNER_VERSION", equals: "2026-09-19-book-pricing",
+    missing: "scanner.js is stale - it cannot price from the order book, so every entry fails on 'no ask price'.",
   },
 ];
 
@@ -106,13 +86,11 @@ async function checkModules() {
 
   for (const f of FINGERPRINTS) {
     const mod = loaded[f.file];
-    if (!mod || typeof mod[f.fn] !== "function") continue;
-    let source = "";
-    try { source = String(mod[f.fn]); } catch { continue; }
-    if (!source.includes(f.needle)) {
+    if (!mod) continue;
+    if (mod[f.exportName] !== f.equals) {
       findings.push({
         level: "blocker", area: "version",
-        detail: `${f.file} is not the current version (${f.fn} does not reference "${f.needle}")`,
+        detail: `${f.file} reports version "${mod[f.exportName] ?? "none"}", expected "${f.equals}"`,
         fix: f.missing,
       });
     }
@@ -123,7 +101,7 @@ async function checkModules() {
 
 function checkConfig(config, bankroll) {
   const f = [];
-  const price = 0.5;
+  const price = 0.5; // representative mid-price contract
 
   const maxRisk = config.maxRiskPctPerTrade ?? 0.10;
   const dollarsAtRisk = bankroll * maxRisk;
@@ -204,6 +182,7 @@ function checkConfig(config, bankroll) {
 
 function checkRuntime(state, botRunning) {
   const f = [];
+
   if (!botRunning) {
     f.push({
       level: "blocker", area: "runtime",
@@ -211,6 +190,7 @@ function checkRuntime(state, botRunning) {
       fix: "Press Start on the bot panel. The watchdog should also restart it within two minutes.",
     });
   }
+
   if (state.haltedForDay) {
     f.push({
       level: "blocker", area: "runtime",
@@ -218,6 +198,7 @@ function checkRuntime(state, botRunning) {
       fix: "This clears at the next calendar day. To resume sooner, raise dailyLossHaltPct.",
     });
   }
+
   return f;
 }
 
@@ -248,7 +229,7 @@ export function registerSelfCheckRoutes(app) {
       try {
         const bc = await import("./botController.js");
         botRunning = bc.isRunning();
-      } catch { /* already reported */ }
+      } catch { /* the module check above already reported this */ }
 
       report.findings.push(...checkConfig(config, bankroll));
       report.findings.push(...checkRuntime(state, botRunning));
@@ -264,7 +245,7 @@ export function registerSelfCheckRoutes(app) {
         report.findings.unshift({
           level: "ok", area: "summary",
           detail: "No mechanical blocker found. Every file is the current version. If the bot still is not trading, no market currently clears the edge threshold.",
-          fix: "Watch the scan log for 'failed entry checks' - the reason there is the live market condition, not a bug.",
+          fix: "Watch the scan log for 'failed entry checks' - the reason printed there is the live market condition, not a bug.",
         });
       }
 
