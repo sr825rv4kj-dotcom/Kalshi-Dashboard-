@@ -1,14 +1,12 @@
 /**
  * Self-audit. Registers /api/selfcheck.
  *
- * Two classes of failure have cost this project the most time, and neither
- * shows up in a deploy log:
- *   1. Version drift - one module imports a symbol a stale sibling never
- *      exported. The server either won't boot or a route silently 500s.
- *   2. Config that is syntactically fine but arithmetically prohibits trading
- *      (a 1% risk cap on a $19.67 balance floors every order to zero).
- * This checks both, plus live runtime state, and reports each finding with the
- * exact fix rather than a pass/fail.
+ * Checks three things that never appear in a deploy log:
+ *   1. Version drift - a module missing an export a sibling imports, or
+ *      missing a behavior a newer version introduced. Detected by reading the
+ *      live function source, so a stale file cannot hide.
+ *   2. Config that is syntactically fine but arithmetically prohibits trading.
+ *   3. Runtime state - bot stopped, halted for the day, no credentials.
  */
 import { loadConfig } from "./configStore.js";
 import { loadState } from "./stateStore.js";
@@ -16,7 +14,7 @@ import { kalshiGet } from "./kalshiClient.js";
 
 const V2 = "/trade-api/v2";
 
-/** Modules and the named exports their siblings depend on. */
+/** Named exports each module's dependents require. */
 const CONTRACTS = [
   { file: "./kalshiClient.js", expects: ["kalshiGet", "kalshiPost", "kalshiDelete", "hasCredentialsConfigured", "resetCredentialsCache"] },
   { file: "./tickerResolver.js", expects: ["resolveTicker", "SPORT_SERIES_MAP", "getFetchReport"] },
@@ -30,20 +28,54 @@ const CONTRACTS = [
   { file: "./tradeLedgerStore.js", expects: ["recordTrade", "getTradeLifecycles", "getTradeStats"] },
 ];
 
-/** Optional exports - absence means a newer file was never committed. */
-const OPTIONAL = [
-  { file: "./botController.js", name: "tradableBankroll", meansMissing: "botController.js is the old version - milestone tiers and take-profit are not active" },
-  { file: "./botController.js", name: "resetCircuitBreaker", meansMissing: "botController.js is the old version - no circuit breaker" },
-  { file: "./kalshiClient.js", name: "describeCredentials", meansMissing: "kalshiClient.js is the old version - the env-var key still overrides the saved key" },
-  { file: "./riskManager.js", name: "passesLiquidityFilter", meansMissing: "riskManager.js may be the old version" },
+/** Exports that exist only in the current version of a file. */
+const EXPECTED_EXPORTS = [
+  { file: "./botController.js", name: "tradableBankroll", missing: "botController.js is stale - milestone tiers and take-profit are not active" },
+  { file: "./botController.js", name: "resetCircuitBreaker", missing: "botController.js is stale - no circuit breaker" },
+  { file: "./kalshiClient.js", name: "describeCredentials", missing: "kalshiClient.js is stale - the env-var key still overrides your saved key" },
+  { file: "./tickerResolver.js", name: "getFetchReport", missing: "tickerResolver.js is stale - no Kalshi query telemetry" },
+];
+
+/**
+ * Behavioral fingerprints: a string that appears in the current version of a
+ * function and not in the old one. Function.prototype.toString returns the
+ * live source, so this detects a stale file that still has the right exports.
+ */
+const FINGERPRINTS = [
+  {
+    file: "./scanner.js", fn: "scanSport", needle: "orderbook",
+    missing: "scanner.js is stale - it reads yes_ask from the market object, which Kalshi returns as 0. Every entry fails with 'no ask price'.",
+  },
+  {
+    file: "./scanner.js", fn: "scanSport", needle: "active",
+    missing: "scanner.js is stale - it only accepts status 'open', and Kalshi reports live markets as 'active'. Every market is dropped as closed.",
+  },
+  {
+    file: "./executor.js", fn: "enterPosition", needle: "entrySlippageCents",
+    missing: "executor.js is stale - orders quote the ask exactly and rest unfilled instead of crossing.",
+  },
+  {
+    file: "./executor.js", fn: "exitPosition", needle: "exitSlippageCents",
+    missing: "executor.js is stale - exits do not cross the spread and can hang on illiquid books.",
+  },
+  {
+    file: "./riskManager.js", fn: "fractionalKellySize", needle: "minContracts",
+    missing: "riskManager.js is stale - Kelly sizing floors to zero contracts at a small bankroll.",
+  },
+  {
+    file: "./riskManager.js", fn: "assessOpportunity", needle: "wantContracts",
+    missing: "riskManager.js is stale - liquidity is checked against a fixed number instead of your order size.",
+  },
 ];
 
 async function checkModules() {
   const findings = [];
+  const loaded = {};
 
   for (const c of CONTRACTS) {
     try {
       const mod = await import(c.file);
+      loaded[c.file] = mod;
       const missing = c.expects.filter((name) => typeof mod[name] === "undefined");
       if (missing.length) {
         findings.push({
@@ -56,36 +88,42 @@ async function checkModules() {
       findings.push({
         level: "blocker", area: "module",
         detail: `${c.file} failed to load: ${err.message}`,
-        fix: "Syntax error or a broken import inside that file. Check the deploy log for the line number.",
+        fix: "Syntax error or a broken import inside that file. The deploy log has the line number.",
       });
     }
   }
 
-  for (const o of OPTIONAL) {
-    try {
-      const mod = await import(o.file);
-      if (typeof mod[o.name] === "undefined") {
-        findings.push({
-          level: "warn", area: "version",
-          detail: `${o.file} does not export ${o.name}`,
-          fix: o.meansMissing,
-        });
-      }
-    } catch {
-      // The blocker above already covers an unloadable module.
+  for (const e of EXPECTED_EXPORTS) {
+    const mod = loaded[e.file];
+    if (mod && typeof mod[e.name] === "undefined") {
+      findings.push({
+        level: "warn", area: "version",
+        detail: `${e.file} does not export ${e.name}`,
+        fix: e.missing,
+      });
+    }
+  }
+
+  for (const f of FINGERPRINTS) {
+    const mod = loaded[f.file];
+    if (!mod || typeof mod[f.fn] !== "function") continue;
+    let source = "";
+    try { source = String(mod[f.fn]); } catch { continue; }
+    if (!source.includes(f.needle)) {
+      findings.push({
+        level: "blocker", area: "version",
+        detail: `${f.file} is not the current version (${f.fn} does not reference "${f.needle}")`,
+        fix: f.missing,
+      });
     }
   }
 
   return findings;
 }
 
-/**
- * Config rules. Each returns a finding or null. These encode the arithmetic
- * that has actually stopped trades, not style preferences.
- */
 function checkConfig(config, bankroll) {
   const f = [];
-  const price = 0.5; // representative mid-price contract
+  const price = 0.5;
 
   const maxRisk = config.maxRiskPctPerTrade ?? 0.10;
   const dollarsAtRisk = bankroll * maxRisk;
@@ -101,7 +139,7 @@ function checkConfig(config, bankroll) {
   if (minLiq >= 25) {
     f.push({
       level: "blocker", area: "liquidity",
-      detail: `minLiquidity is ${minLiq} resting contracts, but positions at this bankroll are 1-4 contracts. Most game markets never show ${minLiq}.`,
+      detail: `minLiquidity is ${minLiq} resting contracts, but positions at this bankroll are 1-4 contracts.`,
       fix: "Set minLiquidity to 0 and let the relative 2x-coverage check govern.",
     });
   }
@@ -110,7 +148,7 @@ function checkConfig(config, bankroll) {
     f.push({
       level: "warn", area: "timing",
       detail: `entryWindowHours is ${config.entryWindowHours} - games outside that window are skipped before any price check.`,
-      fix: "Set entryWindowHours to 0 or null to trade live games at any point.",
+      fix: "Set entryWindowHours to 0 to trade live games at any point.",
     });
   }
 
@@ -129,7 +167,7 @@ function checkConfig(config, bankroll) {
     f.push({
       level: "warn", area: "exits",
       detail: "exitBelowCost fires on any tick below entry, which is ordinary noise. Each exit pays the round-trip fee.",
-      fix: "Turn exitBelowCost off and let perPositionStopLossPct govern, unless you want the tightest possible stop.",
+      fix: "Turn exitBelowCost off and let perPositionStopLossPct govern.",
     });
   }
 
@@ -149,7 +187,7 @@ function checkConfig(config, bankroll) {
       detail: `Survival mode is active (balance $${bankroll.toFixed(2)} below $${config.survivalMode.balanceThreshold}) and requires ${mult}x the normal edge.`,
       fix: mult > 1.5
         ? `An edge multiplier of ${mult} is close to unreachable. Lower survivalMode.edgeMultiplier to 1.2 or less.`
-        : "This is intentional caution at a small balance - no action needed.",
+        : "Intentional caution at a small balance - no action needed.",
     });
   }
 
@@ -166,23 +204,20 @@ function checkConfig(config, bankroll) {
 
 function checkRuntime(state, botRunning) {
   const f = [];
-
   if (!botRunning) {
     f.push({
       level: "blocker", area: "runtime",
       detail: "The bot is not running - no scans are happening.",
-      fix: "Press Start on the bot panel, or enable the watchdog to keep it running automatically.",
+      fix: "Press Start on the bot panel. The watchdog should also restart it within two minutes.",
     });
   }
-
   if (state.haltedForDay) {
     f.push({
       level: "blocker", area: "runtime",
       detail: `Trading is halted for the day: ${state.haltReason}`,
-      fix: "This clears itself at the next calendar day. To resume sooner, raise dailyLossHaltPct.",
+      fix: "This clears at the next calendar day. To resume sooner, raise dailyLossHaltPct.",
     });
   }
-
   return f;
 }
 
@@ -213,7 +248,7 @@ export function registerSelfCheckRoutes(app) {
       try {
         const bc = await import("./botController.js");
         botRunning = bc.isRunning();
-      } catch { /* module check already reported this */ }
+      } catch { /* already reported */ }
 
       report.findings.push(...checkConfig(config, bankroll));
       report.findings.push(...checkRuntime(state, botRunning));
@@ -228,7 +263,7 @@ export function registerSelfCheckRoutes(app) {
       if (!report.summary.blockers) {
         report.findings.unshift({
           level: "ok", area: "summary",
-          detail: "No mechanical blocker found. If the bot still is not trading, no market currently clears the edge threshold.",
+          detail: "No mechanical blocker found. Every file is the current version. If the bot still is not trading, no market currently clears the edge threshold.",
           fix: "Watch the scan log for 'failed entry checks' - the reason there is the live market condition, not a bug.",
         });
       }
