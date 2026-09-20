@@ -17,11 +17,12 @@ const V2 = "/trade-api/v2";
 const CONTRACTS = [
   { file: "./kalshiClient.js", expects: ["kalshiGet", "kalshiPost", "kalshiDelete", "hasCredentialsConfigured", "resetCredentialsCache"] },
   { file: "./tickerResolver.js", expects: ["resolveTicker", "SPORT_SERIES_MAP", "getFetchReport"] },
-  { file: "./riskManager.js", expects: ["assessOpportunity", "perContractFee", "requiredEdgeThreshold", "fractionalKellySize"] },
+  { file: "./riskManager.js", expects: ["assessOpportunity", "perContractFee", "requiredEdgeThreshold", "fractionalKellySize", "feeCentsAt", "evPerContractCents"] },
   { file: "./botController.js", expects: ["startBot", "stopBot", "isRunning", "runCycle"] },
   { file: "./executor.js", expects: ["enterPosition", "exitPosition"] },
   { file: "./scanner.js", expects: ["scanSport"] },
-  { file: "./scraper.js", expects: ["getSharpProbabilities"] },
+  { file: "./scraper.js", expects: ["getSharpProbabilities", "devig"] },
+  { file: "./configStore.js", expects: ["loadConfig", "saveConfig", "DEFAULTS", "STRATEGY_VERSION", "describeStrategy"] },
   { file: "./sportsDiscovery.js", expects: ["discoverActiveSports"] },
   { file: "./cadence.js", expects: ["currentCadenceSeconds", "describeCadence"] },
   { file: "./tradeLedgerStore.js", expects: ["recordTrade", "getTradeLifecycles", "getTradeStats"] },
@@ -33,6 +34,10 @@ const EXPECTED_EXPORTS = [
   { file: "./botController.js", name: "resetCircuitBreaker", missing: "botController.js is stale - no circuit breaker" },
   { file: "./kalshiClient.js", name: "describeCredentials", missing: "kalshiClient.js is stale - the env-var key still overrides your saved key" },
   { file: "./tickerResolver.js", name: "getFetchReport", missing: "tickerResolver.js is stale - no Kalshi query telemetry" },
+  { file: "./scanner.js", name: "entryTiming", missing: "scanner.js is stale - it cannot tell a live game from a pre-game one, so it is still trading in-progress games against frozen pre-game lines" },
+  { file: "./scraper.js", name: "devig", missing: "scraper.js is stale - the bookmaker margin is not being removed, which reports 2-4% of edge that does not exist on every single market" },
+  { file: "./riskManager.js", name: "evPerContractCents", missing: "riskManager.js is stale - it still prices a round trip and demands roughly double the edge actually needed, rejecting most profitable entries" },
+  { file: "./configStore.js", name: "STRATEGY_VERSION", missing: "configStore.js is stale - strategy defaults still come only from the volume file, so a deploy that changes how the bot trades changes nothing" },
 ];
 
 /**
@@ -45,14 +50,20 @@ const FINGERPRINTS = [
   {
     file: "./scanner.js",
     exportName: "SCANNER_VERSION",
-    equals: "2026-09-19-shard-routing",
-    missing: "scanner.js is stale - it cannot read Kalshi's yes_dollars/no_dollars order book, or does not pass the market's exchange shard to the executor.",
+    equals: "2026-09-20-pregame-hold",
+    missing: "scanner.js is stale - it is still entering live games off pre-game sharp lines, which measured at -1.92c per contract of expected value.",
   },
   {
     file: "./executor.js",
     exportName: "EXECUTOR_VERSION",
     equals: "2026-09-19-shard-patient",
     missing: "executor.js is stale - a collateral-routing failure still throws, which trips the circuit breaker and stops the bot instead of skipping that one market.",
+  },
+  {
+    file: "./botController.js",
+    exportName: "CONTROLLER_VERSION",
+    equals: "2026-09-20-hold-to-settlement",
+    missing: "botController.js is stale - it does not reconcile settled positions, so held positions never clear from tracking and the concurrent-position cap silently fills with finished games until the bot stops trading altogether.",
   },
 ];
 
