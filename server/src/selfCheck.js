@@ -43,11 +43,13 @@ const EXPECTED_EXPORTS = [
  */
 const FINGERPRINTS = [
   {
-        file: "./scanner.js", exportName: "SCANNER_VERSION", equals: "2026-09-19-orderbook-fp",
-
-    =
+    file: "./scanner.js",
+    exportName: "SCANNER_VERSION",
+    equals: "2026-09-19-dollars-book",
+    missing: "scanner.js is stale - it cannot read Kalshi's yes_dollars/no_dollars order book, so every entry fails on 'no ask price'.",
   },
 ];
+
 
 async function checkModules() {
   const findings = [];
