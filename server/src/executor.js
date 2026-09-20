@@ -11,15 +11,15 @@ function newClientOrderId() {
   return `dash_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** Contract prices are 1-99c; anything outside that is rejected by Kalshi. */
+/** Contract prices are 1-99c; anything outside is rejected by Kalshi. */
 function clampPrice(cents) {
   return Math.max(1, Math.min(99, Math.round(cents)));
 }
 
 /**
- * Kalshi reports fills in a few different shapes depending on how the order
- * crossed. Taking the real average fill price matters: booking the limit price
- * as cost basis overstates what you paid and makes the below-cost exit fire on
+ * Kalshi reports fills in several shapes depending on how the order crossed.
+ * Taking the real average fill price matters: booking the limit price as cost
+ * basis overstates what you paid and makes the below-cost exit fire on
  * positions that are actually flat.
  */
 function readFill(order, fallbackCents) {
@@ -34,8 +34,10 @@ function readFill(order, fallbackCents) {
   return { filled, price };
 }
 
-
-export async function enterPosition({ ticker, side, priceCents, contracts, reason = null, edgePct = null, teamName = null, sportKey = null, commenceTime = null }) {
+export async function enterPosition({
+  ticker, side, priceCents, contracts,
+  reason = null, edgePct = null, teamName = null, sportKey = null, commenceTime = null,
+}) {
   if (contracts <= 0) return { filled: 0 };
 
   const config = loadConfig();
@@ -57,21 +59,20 @@ export async function enterPosition({ ticker, side, priceCents, contracts, reaso
     `Placing entry order: ${side.toUpperCase()} ${contracts}x ${ticker} @ ${limitCents}c ` +
     `(ask ${priceCents}c + ${slippage}c cross)`
   );
+
   const placeRes = await kalshiPost(`${V2}/portfolio/orders`, body);
   const orderId = placeRes.order?.order_id;
   if (!orderId) throw new Error(`Kalshi did not return an order_id: ${JSON.stringify(placeRes)}`);
 
   // Poll rather than sleeping once: a crossing order usually fills instantly,
   // and waiting the full window on every entry adds latency for no reason.
-  let order = null;
   let filled = 0;
   let fillPrice = limitCents;
   const deadline = Date.now() + waitMs;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 1000));
     const statusRes = await kalshiGet(`${V2}/portfolio/orders/${orderId}`);
-    order = statusRes.order;
-    const read = readFill(order, limitCents);
+    const read = readFill(statusRes.order, limitCents);
     filled = read.filled;
     fillPrice = read.price;
     if (filled >= contracts) break;
@@ -117,7 +118,6 @@ export async function exitPosition(position, reason) {
   // Same logic in reverse: sell UNDER the best bid so the order crosses.
   const slippage = config.exitSlippageCents ?? 1;
 
-  const sellSide = side;
   let remaining = contracts;
   let attempts = 0;
   let lastExitPriceCents = null;
@@ -125,7 +125,14 @@ export async function exitPosition(position, reason) {
   while (remaining > 0 && attempts < 3) {
     const book = await kalshiGet(`${V2}/markets/${ticker}/orderbook`);
     const levels = side === "yes" ? book.orderbook?.yes : book.orderbook?.no;
-    const bestBid = levels && levels.length ? levels[0][0] : null;
+
+    // Best bid is the highest resting price, and Kalshi's ordering is not
+    // guaranteed - taking levels[0] blindly can sell into the worst bid.
+    let bestBid = null;
+    for (const lvl of levels ?? []) {
+      const price = Array.isArray(lvl) ? lvl[0] : lvl?.price;
+      if (price != null && (bestBid == null || price > bestBid)) bestBid = Number(price);
+    }
 
     if (!bestBid) {
       appendLog(`No resting bids for ${ticker} on exit attempt ${attempts + 1}`, "warn");
@@ -136,18 +143,22 @@ export async function exitPosition(position, reason) {
 
     const limitCents = clampPrice(bestBid - slippage);
     const body = {
-      ticker, client_order_id: newClientOrderId(), side: sellSide, action: "sell", type: "limit", count: remaining,
+      ticker, client_order_id: newClientOrderId(), side, action: "sell", type: "limit", count: remaining,
       [side === "yes" ? "yes_price" : "no_price"]: limitCents,
     };
+
     const placeRes = await kalshiPost(`${V2}/portfolio/orders`, body);
     const orderId = placeRes.order?.order_id;
     await new Promise((r) => setTimeout(r, 2000));
+
     const statusRes = await kalshiGet(`${V2}/portfolio/orders/${orderId}`);
     const read = readFill(statusRes.order, limitCents);
     if (read.filled > 0) lastExitPriceCents = read.price;
     remaining -= read.filled;
     attempts++;
 
+    // Without this, three attempts can leave three live sell orders resting
+    // and oversell the position if the market comes back.
     if (remaining > 0 && orderId) {
       try { await kalshiDelete(`${V2}/portfolio/orders/${orderId}`); } catch { /* already gone */ }
     }
