@@ -15,12 +15,7 @@ import { resolveTicker } from "./tickerResolver.js";
 
 const V2 = "/trade-api/v2";
 
-/**
- * Version marker. The self-check reads this rather than grepping function
- * source - the previous approach only saw inside scanSport and reported a
- * current file as stale because the markers lived in sibling declarations.
- */
-export const SCANNER_VERSION = "2026-09-19-book-pricing";
+export const SCANNER_VERSION = "2026-09-19-orderbook-fp";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -45,28 +40,41 @@ function eventKeyOf(ticker) {
   return parts.length > 1 ? `${parts[0]}-${parts[1]}` : String(ticker);
 }
 
+/**
+ * Normalizes a price to cents. The "_fp" (fixed point) book may express price
+ * as a decimal probability (0.55) or as cents (55); anything at or below 1 is
+ * treated as a decimal.
+ */
+function toCents(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const cents = n <= 1 ? n * 100 : n;
+  return Math.round(cents);
+}
+
 /** Highest-priced level in a book side. Kalshi's ordering is not guaranteed. */
 function bestLevel(levels) {
   let best = null;
   for (const lvl of levels ?? []) {
-    const price = Array.isArray(lvl) ? lvl[0] : lvl?.price;
-    const size = Array.isArray(lvl) ? lvl[1] : lvl?.size;
+    const rawPrice = Array.isArray(lvl) ? lvl[0] : (lvl?.price ?? lvl?.yes_price ?? lvl?.no_price);
+    const rawSize = Array.isArray(lvl) ? lvl[1] : (lvl?.size ?? lvl?.count ?? lvl?.quantity);
+    const price = toCents(rawPrice);
     if (price == null) continue;
-    const p = Number(price);
-    if (!Number.isFinite(p)) continue;
-    if (!best || p > best.price) best = { price: p, size: Number(size ?? 0) };
+    const size = Number(rawSize ?? 0) || 0;
+    if (!best || price > best.price) best = { price, size };
   }
   return best;
 }
 
 /**
- * Price to buy YES, tried in order of reliability:
- *   1. market.yes_ask, when the endpoint populates it
+ * Price to buy YES, in order of reliability:
+ *   1. market.yes_ask when the endpoint populates it
  *   2. 100c minus the best NO bid - buying YES means selling NO to a bidder
- *   3. market.yes_bid + 1c as a marketable estimate when the book is thin
- * Kalshi's orderbook has appeared under both `orderbook.{yes,no}` and
- * `{yes,no}`, so both shapes are read. On failure this returns what it saw,
- * so the log says which case actually occurred instead of just "empty".
+ *   3. best YES bid + 1c when nobody is offering
+ *
+ * Kalshi returns the book under "orderbook_fp"; the older "orderbook" key is
+ * still read as a fallback. Reading only the old key made every book look
+ * empty, which is what stopped every entry.
  */
 async function priceFor(ticker, market) {
   const direct = market?.yes_ask ?? 0;
@@ -81,7 +89,7 @@ async function priceFor(ticker, market) {
     return { askCents: 0, askSize: 0, source: `book-error:${err.message.slice(0, 40)}` };
   }
 
-  const ob = book?.orderbook ?? book ?? {};
+  const ob = book?.orderbook_fp ?? book?.orderbook ?? book ?? {};
   const noLevels = ob.no ?? ob.no_levels ?? [];
   const yesLevels = ob.yes ?? ob.yes_levels ?? [];
 
@@ -90,9 +98,8 @@ async function priceFor(ticker, market) {
     return { askCents: 100 - bestNo.price, askSize: bestNo.size, source: "book-no-bid" };
   }
 
-  // No one is bidding NO, so nothing is offered on YES. A YES bid one cent
-  // above the best YES bid is the cheapest price that could realistically
-  // fill, and the executor's cross adds another cent on top.
+  // Nobody is bidding NO, so nothing is offered on YES. A bid one cent above
+  // the best YES bid is the cheapest price that could realistically fill.
   const bestYes = bestLevel(yesLevels);
   if (bestYes && bestYes.price > 0 && bestYes.price < 99) {
     return { askCents: bestYes.price + 1, askSize: bestYes.size, source: "book-yes-bid+1" };
