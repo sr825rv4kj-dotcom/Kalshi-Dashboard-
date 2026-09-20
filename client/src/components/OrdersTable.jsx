@@ -1,182 +1,195 @@
-import React from "react";
-import { sportEmoji } from "../teamIdentity.js";
+import React, { useEffect, useState } from "react";
+import { teamIdentity, sportEmoji, sportLabel } from "../teamIdentity.js";
 
 /**
- * Kalshi's raw order feed carries only tickers, so both sides of the game are
- * decoded from the ticker itself:
- *   KXNCAAFGAME-26SEP19MONTORST-MONT
- *   series ......^ date ^ matchup ^ side
- * The matchup segment is the two team codes concatenated; stripping the side
- * code leaves the opponent.
+ * A statement, not an order feed.
+ *
+ * Kalshi's order endpoint returns tickers with no team names and, since the v2
+ * migration, no usable quantity - which is why this panel showed "8c x null"
+ * and no dollars. The bot's own ledger records the actual fill price, the
+ * actual contract count, the reason, and the matching exit, so every figure
+ * here is real money rather than a reconstruction.
  */
-const SERIES_META = {
-  KXNFLGAME: { key: "americanfootball_nfl", label: "NFL" },
-  KXNCAAFGAME: { key: "americanfootball_ncaaf", label: "NCAA Football" },
-  KXNBAGAME: { key: "basketball_nba", label: "NBA" },
-  KXNCAABGAME: { key: "basketball_ncaab", label: "NCAA Basketball" },
-  KXWNBAGAME: { key: "basketball_wnba", label: "WNBA" },
-  KXMLBGAME: { key: "baseball_mlb", label: "MLB" },
-  KXNHLGAME: { key: "icehockey_nhl", label: "NHL" },
-  KXATPMATCH: { key: "tennis", label: "ATP Tennis" },
-  KXWTAMATCH: { key: "tennis", label: "WTA Tennis" },
-  KXITFMATCH: { key: "tennis", label: "ITF Tennis" },
-  KXITFWMATCH: { key: "tennis", label: "ITF Tennis" },
-  KXCS2GAME: { key: "esports", label: "Counter-Strike" },
-  KXLOLGAME: { key: "esports", label: "League of Legends" },
-  KXUFCFIGHT: { key: "mma_mixed_martial_arts", label: "UFC" },
-  KXNASCAR: { key: "motorsport_nascar", label: "NASCAR" },
-  KXPGA: { key: "golf", label: "PGA" },
-};
-
-function decode(ticker) {
-  const parts = String(ticker || "").split("-");
-  const series = parts[0] || "";
-  const middle = parts[1] || "";
-  const side = parts[2] || "";
-  const meta = SERIES_META[series] || { key: null, label: series.replace(/^KX/, "") || "Market" };
-
-  const m = middle.match(/^(\d{2}[A-Z]{3}\d{2})(.*)$/);
-  const matchup = m ? m[2] : middle;
-
-  let opponent = null;
-  if (side && matchup.startsWith(side)) opponent = matchup.slice(side.length) || null;
-  else if (side && matchup.endsWith(side)) opponent = matchup.slice(0, -side.length) || null;
-
-  return { meta, matchup, held: side || null, opponent };
+function money(n) {
+  if (n == null) return "—";
+  return `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
 }
 
 function when(iso) {
-  if (!iso) return "";
+  if (!iso) return "—";
   return new Date(iso).toLocaleString(undefined, {
     month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
   });
 }
 
-function colorFor(text) {
-  let h = 0;
-  for (let i = 0; i < String(text).length; i++) h = (h * 31 + String(text).charCodeAt(i)) % 360;
-  return [`hsl(${h} 60% 42%)`, `hsl(${(h + 45) % 360} 58% 62%)`];
+/** Opponent code from the ticker: KX...-26SEP19MONTORST-MONT -> ORST */
+function opponentFrom(ticker) {
+  const parts = String(ticker || "").split("-");
+  const side = parts[2] || "";
+  const middle = (parts[1] || "").replace(/^\d{2}[A-Z]{3}\d{2}/, "");
+  if (!side || !middle) return null;
+  if (middle.startsWith(side)) return middle.slice(side.length) || null;
+  if (middle.endsWith(side)) return middle.slice(0, -side.length) || null;
+  return null;
 }
 
-/**
- * Pairs sells against earlier buys on the same ticker, oldest first, so every
- * sell can report what it actually made. Kalshi's order feed has no P&L of its
- * own - each row is just a fill - so the realized result has to be reconstructed
- * here from the matching buys.
- */
-function annotateRealized(orders) {
-  const chronological = [...orders].sort(
-    (a, b) => new Date(a.createdTime || 0) - new Date(b.createdTime || 0)
+/** Cumulative P&L sparkline - green when the run is up, red when it is down. */
+function Sparkline({ values }) {
+  if (!values || values.length < 2) return null;
+
+  const w = 120;
+  const h = 34;
+  const min = Math.min(...values, 0);
+  const max = Math.max(...values, 0);
+  const span = max - min || 1;
+
+  const points = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * w;
+    const y = h - ((v - min) / span) * h;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+
+  const last = values[values.length - 1];
+  const up = last >= 0;
+  const stroke = up ? "#21c17a" : "#ff4d4f";
+  const zeroY = h - ((0 - min) / span) * h;
+
+  return (
+    <svg width={w} height={h} className="kx-spark" role="img" aria-label="Cumulative profit and loss">
+      <line x1="0" y1={zeroY} x2={w} y2={zeroY} stroke="currentColor" strokeOpacity="0.25" strokeDasharray="3 3" />
+      <polyline
+        points={points.join(" ")}
+        fill="none"
+        stroke={stroke}
+        strokeWidth="2"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+      <circle cx={w} cy={points[points.length - 1].split(",")[1]} r="3" fill={stroke} />
+    </svg>
   );
-
-  const lots = {}; // ticker -> [{ priceCents, count }]
-  const realized = {}; // orderId -> { net, roiPct, costBasis }
-
-  for (const o of chronological) {
-    const count = Number(o.count) || 0;
-    const price = Number(o.priceCents) || 0;
-    if (!count || !price) continue;
-
-    const isBuy = String(o.action || "").toLowerCase() === "buy";
-    lots[o.ticker] = lots[o.ticker] || [];
-
-    if (isBuy) {
-      lots[o.ticker].push({ priceCents: price, count });
-      continue;
-    }
-
-    // Sell: consume the oldest buys first.
-    let remaining = count;
-    let costCents = 0;
-    while (remaining > 0 && lots[o.ticker].length) {
-      const lot = lots[o.ticker][0];
-      const take = Math.min(remaining, lot.count);
-      costCents += take * lot.priceCents;
-      lot.count -= take;
-      remaining -= take;
-      if (lot.count <= 0) lots[o.ticker].shift();
-    }
-
-    const matched = count - remaining;
-    if (matched > 0) {
-      const proceedsCents = matched * price;
-      const net = (proceedsCents - costCents) / 100;
-      realized[o.orderId || `${o.ticker}-${o.createdTime}`] = {
-        net,
-        costBasis: costCents / 100,
-        roiPct: costCents > 0 ? (net / (costCents / 100)) * 100 : null,
-      };
-    }
-  }
-
-  return realized;
 }
 
-export default function OrdersTable({ orders }) {
-  if (!orders || orders.length === 0) {
-    return <div className="empty-state">No recent orders.</div>;
+function StatementRow({ t, runningBalance }) {
+  const id = teamIdentity(t.teamName, t.sportKey);
+  const opponent = opponentFrom(t.ticker);
+  const win = (t.netDollars ?? 0) > 0;
+
+  return (
+    <div className="kx-stmt-row">
+      <div className="kx-stmt-main">
+        <div className="kx-stmt-icon" style={{ background: id.primary, borderColor: id.secondary }}>
+          {sportEmoji(t.sportKey)}
+        </div>
+        <div className="kx-stmt-text">
+          <div className="kx-stmt-title">
+            {id.name}{opponent ? ` vs ${opponent}` : ""}
+          </div>
+          <div className="kx-stmt-sub">
+            {sportLabel(t.sportKey)} · {t.contracts} @ {t.entryPriceCents}¢ → {t.exitPriceCents}¢ · {t.exitReason}
+          </div>
+          <div className="kx-stmt-sub">{when(t.entryTimestamp)} → {when(t.exitTimestamp)}</div>
+        </div>
+      </div>
+
+      <div className="kx-stmt-figures">
+        <div><span>In</span><strong>{money(t.costDollars)}</strong></div>
+        <div><span>Out</span><strong>{money(t.proceedsDollars)}</strong></div>
+        <div>
+          <span>Net</span>
+          <strong className={win ? "kx-pos" : "kx-neg"}>{win ? "+" : ""}{money(t.netDollars)}</strong>
+        </div>
+        <div>
+          <span>ROI</span>
+          <strong className={win ? "kx-pos" : "kx-neg"}>
+            {t.roiPct == null ? "—" : `${t.roiPct > 0 ? "+" : ""}${t.roiPct.toFixed(1)}%`}
+          </strong>
+        </div>
+        <div>
+          <span>Balance</span>
+          <strong className={runningBalance >= 0 ? "kx-pos" : "kx-neg"}>
+            {runningBalance >= 0 ? "+" : ""}{money(runningBalance)}
+          </strong>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function OrdersTable() {
+  const [data, setData] = useState({ completed: [], open: [], stats: null });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  async function load() {
+    try {
+      setError(null);
+      const res = await fetch(`/api/trade-lifecycles`);
+      const text = await res.text();
+      let json;
+      try { json = JSON.parse(text); }
+      catch { throw new Error(`Server returned ${res.status}. Close the tab and reopen to clear a stale build.`); }
+      if (json.error) throw new Error(json.error);
+      setData({ completed: json.completed ?? [], open: json.open ?? [], stats: json.stats ?? null });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
   }
 
-  const realized = annotateRealized(orders);
+  useEffect(() => {
+    load();
+    const i = setInterval(load, 60000);
+    return () => clearInterval(i);
+  }, []);
+
+  // Oldest first for the running balance, then show newest at the top.
+  const chronological = [...data.completed].reverse();
+  let running = 0;
+  const withBalance = chronological.map((t) => {
+    running += t.netDollars ?? 0;
+    return { t, balance: running };
+  });
+  const curve = withBalance.map((r) => r.balance);
+  const newestFirst = [...withBalance].reverse();
+
+  const s = data.stats;
+
+  if (loading) return <p className="muted">Loading statement...</p>;
+  if (error) return <div className="error-banner">{error}</div>;
 
   return (
     <div>
-      {orders.map((o, i) => {
-        const { meta, matchup, held, opponent } = decode(o.ticker);
-        const [primary, secondary] = colorFor(held || matchup || o.ticker);
-        const isBuy = String(o.action || "").toLowerCase() === "buy";
-        const title = held && opponent ? `${held} vs ${opponent}` : (matchup || "—");
-
-        const dollars =
-          o.priceCents != null && o.count != null ? (o.priceCents * o.count) / 100 : null;
-
-        const r = realized[o.orderId || `${o.ticker}-${o.createdTime}`];
-        const won = r ? r.net > 0 : false;
-
-        return (
-          <div key={o.orderId || `${o.ticker}-${i}`} className="kx-order">
-            <div
-              className="kx-tile kx-tile-sm"
-              style={{ background: primary, border: `2px solid ${secondary}` }}
-            >
-              {meta.key === "esports" ? "🎮" : sportEmoji(meta.key)}
-            </div>
-
-            <div className="kx-order-body">
-              <div className="kx-order-title">{title}</div>
-              <div className="kx-status">
-                <span>{meta.label}</span>
-                {held && <><span className="kx-sep">·</span><span>on {held}</span></>}
-                {o.createdTime && <><span className="kx-sep">·</span><span>{when(o.createdTime)}</span></>}
-              </div>
-              <div className="kx-order-sub">
-                {isBuy ? "Entered" : "Exited"}{" "}
-                {dollars != null ? `$${dollars.toFixed(2)}` : "—"}
-                {o.priceCents != null ? ` · ${o.priceCents}¢ × ${o.count}` : ""}
-              </div>
-            </div>
-
-            <div className="kx-order-right">
-              <span className={`kx-pill ${isBuy ? "kx-pill-buy" : "kx-pill-sell"}`}>
-                {isBuy ? "Buy" : "Sell"}
-              </span>
-
-              {r ? (
-                <>
-                  <div className={`kx-order-pnl ${won ? "kx-pos" : "kx-neg"}`}>
-                    {won ? "+" : ""}${r.net.toFixed(2)}
-                  </div>
-                  <div className={`kx-order-sub ${won ? "kx-pos" : "kx-neg"}`}>
-                    {r.roiPct == null ? "" : `${r.roiPct > 0 ? "+" : ""}${r.roiPct.toFixed(1)}% ROI`}
-                  </div>
-                </>
-              ) : (
-                <div className="kx-order-sub">{isBuy ? "open" : o.status || ""}</div>
-              )}
-            </div>
+      <div className="kx-stmt-header">
+        <div>
+          <div className="kx-stmt-hlabel">Realized P&amp;L</div>
+          <div className={`kx-stmt-hvalue ${(s?.totalNetDollars ?? 0) >= 0 ? "kx-pos" : "kx-neg"}`}>
+            {(s?.totalNetDollars ?? 0) >= 0 ? "+" : ""}{money(s?.totalNetDollars ?? 0)}
           </div>
-        );
-      })}
+          <div className="kx-stmt-sub">
+            {s?.totalExits ?? 0} closed · {s?.wins ?? 0}W / {s?.losses ?? 0}L
+            {s?.winRatePct != null ? ` · ${s.winRatePct.toFixed(0)}% win rate` : ""}
+            {s?.overallRoiPct != null ? ` · ${s.overallRoiPct > 0 ? "+" : ""}${s.overallRoiPct.toFixed(1)}% ROI` : ""}
+          </div>
+        </div>
+        <Sparkline values={curve} />
+      </div>
+
+      {data.open.length > 0 && (
+        <div className="kx-stmt-open">
+          {data.open.length} position{data.open.length === 1 ? "" : "s"} still open ·{" "}
+          {money(data.open.reduce((sum, t) => sum + (t.costDollars ?? 0), 0))} at risk
+        </div>
+      )}
+
+      {newestFirst.length === 0 ? (
+        <div className="empty-state">No completed trades yet.</div>
+      ) : (
+        newestFirst.map(({ t, balance }, i) => (
+          <StatementRow key={`${t.ticker}-${t.entryTimestamp}-${i}`} t={t} runningBalance={balance} />
+        ))
+      )}
     </div>
   );
 }
