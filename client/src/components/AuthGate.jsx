@@ -1,7 +1,33 @@
 import React, { useEffect, useState } from "react";
-import { getTodaysTheme, applyTheme } from "../theme.js";
 
 const TOKEN_KEY = "kalshi_dashboard_token";
+
+/**
+ * The old palette system (theme.js) wrote its variables as INLINE styles on
+ * <html>, and an inline style beats a stylesheet rule. Its default palette was
+ * light - "--label: #1c1c1e" on a dark glass panel - so on any browser that had
+ * ever loaded the dashboard, button and input text rendered near-black on
+ * near-black and was effectively invisible. Rendering the built page is what
+ * caught it.
+ *
+ * theme.js and themes.js are gone; the palette now lives entirely in index.css
+ * with the accent driven by the wallpaper. This clears the stale inline
+ * variables a previous version left behind, which would otherwise keep
+ * overriding the stylesheet forever on an existing device.
+ */
+const LEGACY_THEME_VARS = [
+  "--field", "--card", "--label", "--label-secondary", "--label-tertiary",
+  "--separator", "--fill", "--blue", "--green", "--red", "--orange",
+];
+
+function clearLegacyTheme() {
+  try {
+    for (const prop of LEGACY_THEME_VARS) document.documentElement.style.removeProperty(prop);
+    localStorage.removeItem("kalshi_theme");
+  } catch {
+    // nothing to clean up, or storage is blocked - either way, carry on
+  }
+}
 
 export function getStoredToken() {
   try {
@@ -28,7 +54,7 @@ function clearToken() {
 }
 
 export default function AuthGate({ apiBase, children }) {
-  useEffect(() => { applyTheme(getTodaysTheme()); }, []);
+  useEffect(() => { clearLegacyTheme(); }, []);
 
   const [checking, setChecking] = useState(true);
   const [hasAccount, setHasAccount] = useState(null);
