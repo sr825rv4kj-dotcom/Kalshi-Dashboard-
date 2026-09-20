@@ -45,17 +45,16 @@ const FINGERPRINTS = [
   {
     file: "./scanner.js",
     exportName: "SCANNER_VERSION",
-    equals: "2026-09-19-dollars-book",
-    missing: "scanner.js is stale - it cannot read Kalshi's yes_dollars/no_dollars order book, so every entry fails on 'no ask price'.",
+    equals: "2026-09-19-shard-routing",
+    missing: "scanner.js is stale - it cannot read Kalshi's yes_dollars/no_dollars order book, or does not pass the market's exchange shard to the executor.",
   },
   {
     file: "./executor.js",
     exportName: "EXECUTOR_VERSION",
-    equals: "2026-09-19-orders-v2",
-    missing: "executor.js is stale - it posts to Kalshi's retired v1 order endpoint, which returns HTTP 410 and trips the circuit breaker.",
+    equals: "2026-09-19-shard-routing-2",
+    missing: "executor.js is stale - it posts to Kalshi's retired v1 order endpoint, or cannot move collateral to the shard a market trades on.",
   },
 ];
-
 
 async function checkModules() {
   const findings = [];
