@@ -1,11 +1,5 @@
 /**
  * Fee-aware edge threshold + position sizing.
- *
- * Two constants here were sized for a bankroll two orders of magnitude larger
- * than the live one and made trading arithmetically impossible: a 1% per-trade
- * risk cap (19c on a $19.67 account - less than one contract) and a 50-contract
- * liquidity floor on a strategy that buys 2-3. Both are now relative to what
- * the account is actually trying to do.
  */
 
 const DEFAULT_FEE_MULTIPLIER = 0.07;
@@ -95,7 +89,7 @@ export function fractionalKellySize({
 }
 
 /**
- * Liquidity is now measured against the order being placed, not an absolute
+ * Liquidity is measured against the order being placed, not an absolute
  * number. Requiring 50 resting contracts to buy 2 rejected most of the book.
  */
 export function passesLiquidityFilter({ restingContracts, wantContracts = 1, minContracts = 0, coverageMultiple = 2 }) {
@@ -114,9 +108,22 @@ export function assessOpportunity({
   maxRiskPctPerTrade = 0.10,
   maxStakeDollars = null,
   maxPlausibleEdge = 0.25,
+  minEntryPriceCents = 20,
   survivalMode = null,
 }) {
   const observedEdge = trueProbability - price;
+  const priceCents = Math.round(price * 100);
+
+  // Kalshi's fee rounds UP to a whole cent per contract each way, so on an 8c
+  // contract the round trip costs 2c - a quarter of the stake - before the
+  // market moves at all. Below this floor the fee structure, not the edge,
+  // decides the outcome.
+  if (minEntryPriceCents && priceCents < minEntryPriceCents) {
+    return {
+      action: "skip",
+      reason: `price ${priceCents}c is below the ${minEntryPriceCents}c floor - the 1c-per-contract fee would be ${(100 / priceCents).toFixed(0)}% of the stake each way`,
+    };
+  }
 
   // A sportsbook line is priced pre-game; Kalshi's price is live. When a game
   // turns, Kalshi moves and the book does not, and the gap reads as an enormous
@@ -146,8 +153,7 @@ export function assessOpportunity({
     };
   }
 
-  // Size first, then check liquidity against that size. The old order checked
-  // liquidity against a fixed 50 before knowing it only wanted 2.
+  // Size first, then check liquidity against that size.
   let sizing;
   if (inSurvivalMode) {
     const flatDollars = survivalMode.flatBetDollars || 1;
