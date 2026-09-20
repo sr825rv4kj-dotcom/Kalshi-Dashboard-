@@ -51,8 +51,8 @@ const FINGERPRINTS = [
   {
     file: "./executor.js",
     exportName: "EXECUTOR_VERSION",
-    equals: "2026-09-19-shard-wait",
-    missing: "executor.js is stale - it does not wait for collateral to land on a market's exchange shard before ordering, so entries fail with insufficient_balance.",
+    equals: "2026-09-19-shard-patient",
+    missing: "executor.js is stale - a collateral-routing failure still throws, which trips the circuit breaker and stops the bot instead of skipping that one market.",
   },
 ];
 
