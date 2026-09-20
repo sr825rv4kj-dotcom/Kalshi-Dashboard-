@@ -22,9 +22,6 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 
 // --- Crash resilience ---
-// A single bad tick in the bot loop (a malformed API response, a network blip)
-// should never take down the whole process. These are last-resort catches;
-// specific errors are still caught closer to their source.
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
 });
@@ -59,6 +56,24 @@ app.post("/api/auth/login", (req, res) => {
   }
 });
 
+/**
+ * Anything that looks like an API call but is not one gets a JSON 404 rather
+ * than the HTML page. A stale frontend bundle was requesting
+ * "/undefined/api/diagnose/v2"; because that path does not start with "/api/",
+ * it fell through to the SPA catch-all and came back as index.html with a 200,
+ * which the dashboard then reported as a mysterious parse error. This turns
+ * that class of mistake into a message that names itself.
+ */
+app.use((req, res, next) => {
+  if (req.path.includes("/api/") && !req.path.startsWith("/api/")) {
+    return res.status(404).json({
+      error: `Malformed API path "${req.path}". The browser is running a stale build - ` +
+             `close the tab and reopen the app.`,
+    });
+  }
+  next();
+});
+
 // Everything below requires a valid session token, except the routes defined
 // above and the static frontend, which must load before anyone is logged in.
 app.use("/api", (req, res, next) => {
@@ -85,8 +100,7 @@ registerSettingsRoutes(app);
 /**
  * Optional modules, loaded defensively. If diagnostics.js, selfCheck.js or
  * watchdog.js has not been committed yet, the server logs a line and keeps
- * running rather than refusing to boot on a missing import - which is exactly
- * the failure that has taken this app down repeatedly.
+ * running rather than refusing to boot on a missing import.
  */
 async function registerOptionalModules() {
   try {
@@ -107,18 +121,34 @@ async function registerOptionalModules() {
 }
 
 /**
- * Static frontend is registered AFTER the optional API routes, because its
- * catch-all "*" handler would otherwise swallow any route registered later.
+ * Static frontend, registered AFTER the API routes so its catch-all cannot
+ * swallow them.
+ *
+ * index.html is served with no-store. Hashed asset files can cache forever,
+ * but the HTML that names them must never be cached - otherwise a browser
+ * keeps loading yesterday's bundle after a deploy, which is exactly what made
+ * fixed bugs appear to persist for hours.
  */
 function registerFrontend() {
   const clientDistPath = path.join(__dirname, "..", "..", "client", "dist");
   if (!fs.existsSync(clientDistPath)) return;
 
-  app.use(express.static(clientDistPath));
+  app.use(express.static(clientDistPath, {
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith("index.html")) {
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      } else {
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      }
+    },
+  }));
+
   app.get("*", (req, res, next) => {
     if (req.path.startsWith("/api/")) return next();
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     res.sendFile(path.join(clientDistPath, "index.html"));
   });
+
   console.log("Serving built frontend from client/dist");
 }
 
@@ -137,7 +167,6 @@ async function boot() {
       console.log("autoStartOnBoot enabled but no credentials configured yet - waiting for setup.");
     }
 
-    // The watchdog restarts the bot if it ever stops. Also optional.
     try {
       const { startWatchdog } = await import("./watchdog.js");
       startWatchdog();
