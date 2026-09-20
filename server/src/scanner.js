@@ -15,7 +15,7 @@ import { resolveTicker } from "./tickerResolver.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-19-orderbook-fp";
+export const SCANNER_VERSION = "2026-09-19-dollars-book";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -41,9 +41,8 @@ function eventKeyOf(ticker) {
 }
 
 /**
- * Normalizes a price to cents. The "_fp" (fixed point) book may express price
- * as a decimal probability (0.55) or as cents (55); anything at or below 1 is
- * treated as a decimal.
+ * Normalizes a price to cents. The book quotes in dollars (0.43); anything at
+ * or below 1 is treated as a decimal, anything above as cents already.
  */
 function toCents(raw) {
   const n = Number(raw);
@@ -71,10 +70,6 @@ function bestLevel(levels) {
  *   1. market.yes_ask when the endpoint populates it
  *   2. 100c minus the best NO bid - buying YES means selling NO to a bidder
  *   3. best YES bid + 1c when nobody is offering
- *
- * Kalshi returns the book under "orderbook_fp"; the older "orderbook" key is
- * still read as a fallback. Reading only the old key made every book look
- * empty, which is what stopped every entry.
  */
 async function priceFor(ticker, market) {
   const direct = market?.yes_ask ?? 0;
@@ -90,16 +85,24 @@ async function priceFor(ticker, market) {
   }
 
   const ob = book?.orderbook_fp ?? book?.orderbook ?? book ?? {};
-  const noLevels = ob.no ?? ob.no_levels ?? [];
-  const yesLevels = ob.yes ?? ob.yes_levels ?? [];
+
+  // Kalshi names the sides "yes_dollars" / "no_dollars" on this endpoint and
+  // quotes them in dollars (0.43), not cents. Matching on a key prefix keeps
+  // this working if the suffix changes again.
+  const sideFor = (prefix) => {
+    for (const [k, v] of Object.entries(ob)) {
+      if (Array.isArray(v) && k.toLowerCase().startsWith(prefix)) return v;
+    }
+    return [];
+  };
+  const yesLevels = sideFor("yes");
+  const noLevels = sideFor("no");
 
   const bestNo = bestLevel(noLevels);
   if (bestNo && bestNo.price > 0 && bestNo.price < 100) {
     return { askCents: 100 - bestNo.price, askSize: bestNo.size, source: "book-no-bid" };
   }
 
-  // Nobody is bidding NO, so nothing is offered on YES. A bid one cent above
-  // the best YES bid is the cheapest price that could realistically fill.
   const bestYes = bestLevel(yesLevels);
   if (bestYes && bestYes.price > 0 && bestYes.price < 99) {
     return { askCents: bestYes.price + 1, askSize: bestYes.size, source: "book-yes-bid+1" };
