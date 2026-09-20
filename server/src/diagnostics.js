@@ -1,15 +1,15 @@
 /**
- * Deep diagnostic. Registers /api/diagnose/v2 - a separate path from the
- * original /api/diagnose so it can live alongside it without route conflicts.
+ * Deep diagnostic + manual trade test. Registers /api/diagnose/v2 and
+ * /api/test-trade.
  *
- * Every stage is individually guarded and the whole handler is wrapped. The
- * old endpoint threw on failure, which returned Express's HTML error page, and
- * the panel reported "the string did not match the expected pattern" - a JSON
- * parse failure that told you nothing about the actual fault.
+ * The test-trade route exists because every layer reported healthy while zero
+ * orders reached the exchange. It places one real contract with no edge check,
+ * no sizing logic and no position cap, and returns Kalshi's raw response - so
+ * the execution path is proven or disproven outright.
  */
 import fs from "fs";
 import crypto from "crypto";
-import { kalshiGet } from "./kalshiClient.js";
+import { kalshiGet, kalshiPost, kalshiDelete } from "./kalshiClient.js";
 import { tradableBankroll } from "./botController.js";
 import { loadConfig } from "./configStore.js";
 import { loadState } from "./stateStore.js";
@@ -20,52 +20,213 @@ import { assessOpportunity } from "./riskManager.js";
 
 const V2 = "/trade-api/v2";
 
+function toCents(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n <= 1 ? n * 100 : n);
+}
+
+function bestLevel(levels) {
+  let best = null;
+  for (const lvl of levels ?? []) {
+    const rawPrice = Array.isArray(lvl) ? lvl[0] : (lvl?.price ?? lvl?.yes_price ?? lvl?.no_price);
+    const rawSize = Array.isArray(lvl) ? lvl[1] : (lvl?.size ?? lvl?.count ?? lvl?.quantity);
+    const price = toCents(rawPrice);
+    if (price == null) continue;
+    if (!best || price > best.price) best = { price, size: Number(rawSize ?? 0) || 0 };
+  }
+  return best;
+}
+
+/** Reads the book and returns the ask plus the raw shape, for inspection. */
+async function bookPrice(ticker) {
+  const book = await kalshiGet(`${V2}/markets/${ticker}/orderbook`);
+  const ob = book?.orderbook_fp ?? book?.orderbook ?? book ?? {};
+  const noLevels = ob.no ?? ob.no_levels ?? [];
+  const yesLevels = ob.yes ?? ob.yes_levels ?? [];
+
+  const bestNo = bestLevel(noLevels);
+  const bestYes = bestLevel(yesLevels);
+
+  let askCents = 0;
+  let source = "none";
+  if (bestNo && bestNo.price > 0 && bestNo.price < 100) {
+    askCents = 100 - bestNo.price;
+    source = "book-no-bid";
+  } else if (bestYes && bestYes.price > 0 && bestYes.price < 99) {
+    askCents = bestYes.price + 1;
+    source = "book-yes-bid+1";
+  }
+
+  return {
+    askCents, source,
+    bestNoBid: bestNo, bestYesBid: bestYes,
+    topLevelKeys: Object.keys(book ?? {}),
+    bookKeys: Object.keys(ob),
+    yesCount: yesLevels.length,
+    noCount: noLevels.length,
+    rawSample: JSON.stringify(ob).slice(0, 400),
+  };
+}
+
+function credentialsStage() {
+  try {
+    const keyId = process.env.KALSHI_API_KEY_ID;
+    const keyPath = process.env.KALSHI_PRIVATE_KEY_PATH;
+    const keyPem = process.env.KALSHI_PRIVATE_KEY_PEM;
+    const fileExists = Boolean(keyPath && fs.existsSync(keyPath));
+
+    let fingerprint = null;
+    let keyError = null;
+    try {
+      const pem = fileExists ? fs.readFileSync(keyPath, "utf8") : (keyPem || "").replace(/\\n/g, "\n");
+      const pub = crypto.createPublicKey(pem);
+      fingerprint = crypto.createHash("sha256")
+        .update(pub.export({ type: "spki", format: "der" }))
+        .digest("hex").slice(0, 16);
+    } catch (err) {
+      keyError = err.message;
+    }
+
+    return {
+      keyId: keyId ? `${keyId.slice(0, 8)}...` : null,
+      source: fileExists ? "saved in app" : keyPem ? "KALSHI_PRIVATE_KEY_PEM env var" : "none",
+      envVarAlsoSet: Boolean(keyPem),
+      keyFileExists: fileExists,
+      fingerprint,
+      keyError,
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
 export function registerDiagnosticRoutes(app) {
+  /**
+   * Places ONE contract at the current ask, no edge check, no cap. Optional
+   * body: { ticker, contracts, maxPriceCents }. With no ticker it picks the
+   * first live market it can price from the active sports.
+   */
+  app.post("/api/test-trade", async (req, res) => {
+    const out = { steps: [] };
+    const step = (name, data) => out.steps.push({ name, ...data });
+
+    try {
+      const body = req.body || {};
+      const contracts = Math.max(1, Math.min(5, Number(body.contracts) || 1));
+      const maxPriceCents = Number(body.maxPriceCents) || 95;
+
+      // 1. Choose a market
+      let ticker = (body.ticker || "").trim();
+      if (!ticker) {
+        const config = loadConfig();
+        const sports = await discoverActiveSports();
+        step("discover", { sports });
+
+        outer:
+        for (const sportKey of sports) {
+          let probs;
+          try {
+            probs = await getSharpProbabilities(sportKey, {
+              oddsPapiTournamentId: (config.oddsPapiTournamentIds || {})[sportKey],
+              providerOrder: config.oddsProviderOrder,
+            });
+          } catch (err) {
+            step("odds", { sportKey, error: err.message });
+            continue;
+          }
+          for (const [teamName, info] of Object.entries(probs.probabilities)) {
+            const r = await resolveTicker({ sportKey, teamName, commenceTime: info.commenceTime });
+            if (!r.ticker) continue;
+            const priced = await bookPrice(r.ticker).catch(() => null);
+            if (priced && priced.askCents > 0 && priced.askCents <= maxPriceCents) {
+              ticker = r.ticker;
+              step("picked", { sportKey, teamName, ticker, priced });
+              break outer;
+            }
+          }
+        }
+      }
+
+      if (!ticker) {
+        step("picked", { error: "No market could be priced. Pass a ticker explicitly." });
+        return res.json({ ok: false, ...out });
+      }
+
+      // 2. Confirm the market is tradeable
+      const mRes = await kalshiGet(`${V2}/markets/${ticker}`);
+      const market = mRes.market || {};
+      step("market", {
+        ticker, status: market.status,
+        yes_ask: market.yes_ask, yes_bid: market.yes_bid,
+        title: market.title, subtitle: market.yes_sub_title,
+      });
+
+      // 3. Price it
+      const priced = await bookPrice(ticker);
+      step("price", priced);
+
+      const limitCents = Math.max(1, Math.min(99, (priced.askCents || market.yes_ask || 0) + 1));
+      if (limitCents <= 1) {
+        step("abort", { reason: "No usable price - nothing to buy." });
+        return res.json({ ok: false, ...out });
+      }
+      if (limitCents > maxPriceCents) {
+        step("abort", { reason: `Price ${limitCents}c exceeds maxPriceCents ${maxPriceCents}.` });
+        return res.json({ ok: false, ...out });
+      }
+
+      // 4. Place the order
+      const clientOrderId = `test_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const orderBody = {
+        ticker, client_order_id: clientOrderId, side: "yes", action: "buy",
+        type: "limit", count: contracts, yes_price: limitCents,
+      };
+      step("placing", { orderBody });
+
+      let placeRes;
+      try {
+        placeRes = await kalshiPost(`${V2}/portfolio/orders`, orderBody);
+      } catch (err) {
+        step("place-failed", { error: err.message });
+        return res.json({ ok: false, ...out });
+      }
+      const orderId = placeRes.order?.order_id;
+      step("placed", { orderId, raw: placeRes });
+
+      // 5. Check the fill
+      await new Promise((r) => setTimeout(r, 3000));
+      const statusRes = await kalshiGet(`${V2}/portfolio/orders/${orderId}`);
+      const order = statusRes.order || {};
+      const filled = order.taker_fill_count ?? order.filled_count ?? 0;
+      step("fill", {
+        filled, requested: contracts, status: order.status,
+        average_fill_price: order.average_fill_price, raw: order,
+      });
+
+      // 6. Cancel anything unfilled so a stray order is not left resting
+      if (filled < contracts && orderId) {
+        try {
+          await kalshiDelete(`${V2}/portfolio/orders/${orderId}`);
+          step("cancelled-remainder", { cancelled: contracts - filled });
+        } catch (err) {
+          step("cancel-failed", { error: err.message });
+        }
+      }
+
+      return res.json({ ok: filled > 0, ticker, filled, limitCents, ...out });
+    } catch (err) {
+      step("error", { error: err.message });
+      return res.status(500).json({ ok: false, error: err.message, ...out });
+    }
+  });
+
   app.get("/api/diagnose/v2", async (_req, res) => {
     const report = { ranAt: new Date().toISOString(), stages: {}, sports: [] };
 
     try {
-           // Stage 1: which key is actually signing requests. Computed here rather
-      // than imported so this endpoint works against the current kalshiClient.
-      try {
-        const keyId = process.env.KALSHI_API_KEY_ID;
-        const keyPath = process.env.KALSHI_PRIVATE_KEY_PATH;
-        const keyPem = process.env.KALSHI_PRIVATE_KEY_PEM;
-        const fileExists = Boolean(keyPath && fs.existsSync(keyPath));
+      report.stages.credentials = credentialsStage();
 
-        // The env var wins in the current client, so report it as the source
-        // whenever it is set - that is what is really signing.
-        const source = keyPem
-          ? "KALSHI_PRIVATE_KEY_PEM env var"
-          : fileExists ? "saved in app" : "none";
-
-        let fingerprint = null;
-        let keyError = null;
-        try {
-          const pem = keyPem ? keyPem.replace(/\\n/g, "\n") : fs.readFileSync(keyPath, "utf8");
-          const pub = crypto.createPublicKey(pem);
-          fingerprint = crypto
-            .createHash("sha256")
-            .update(pub.export({ type: "spki", format: "der" }))
-            .digest("hex")
-            .slice(0, 16);
-        } catch (err) {
-          keyError = err.message;
-        }
-
-        report.stages.credentials = {
-          keyId: keyId ? `${keyId.slice(0, 8)}...` : null,
-          source,
-          envVarAlsoSet: Boolean(keyPem),
-          keyFileExists: fileExists,
-          fingerprint,
-          keyError,
-        };
-      } catch (err) {
-        report.stages.credentials = { error: err.message };
-      }
-
-      // Stage 2: can we reach Kalshi at all
       try {
         const bal = await kalshiGet(`${V2}/portfolio/balance`);
         report.stages.kalshi = { ok: true, balanceDollars: (bal.balance ?? 0) / 100 };
@@ -73,7 +234,6 @@ export function registerDiagnosticRoutes(app) {
         report.stages.kalshi = { ok: false, error: err.message };
       }
 
-      // Stage 3: the config actually in force on the volume, not in the repo
       const config = loadConfig();
       const bankroll = report.stages.kalshi?.balanceDollars ?? 0;
       const tiering = tradableBankroll(bankroll, config);
@@ -92,18 +252,14 @@ export function registerDiagnosticRoutes(app) {
         openPositions: loadState().positions.length,
       };
 
-      // Stage 4: what is in season
       let activeSports = [];
       try {
         activeSports = await discoverActiveSports();
         report.stages.sports = { ok: true, activeSports, seriesMapped: Object.keys(SPORT_SERIES_MAP) };
       } catch (err) {
         report.stages.sports = { ok: false, error: err.message };
-        activeSports = [];
       }
 
-      // Stage 5: per sport - odds, resolution, live price, and the exact
-      // verdict the risk manager would hand back for a real entry.
       for (const sportKey of activeSports) {
         const entry = { sportKey, samples: [] };
 
@@ -114,8 +270,7 @@ export function registerDiagnosticRoutes(app) {
             providerOrder: config.oddsProviderOrder,
           });
           entry.odds = {
-            ok: true,
-            provider: probResult.provider,
+            ok: true, provider: probResult.provider,
             teamsFound: Object.keys(probResult.probabilities).length,
             quotaRemaining: probResult.quota?.remaining ?? null,
           };
@@ -125,8 +280,7 @@ export function registerDiagnosticRoutes(app) {
           continue;
         }
 
-        const teams = Object.entries(probResult.probabilities);
-        for (const [teamName, info] of teams.slice(0, 4)) {
+        for (const [teamName, info] of Object.entries(probResult.probabilities).slice(0, 4)) {
           const sample = { teamName, trueProbability: info.trueProbability, commenceTime: info.commenceTime };
           try {
             const resolved = await resolveTicker({ sportKey, teamName, commenceTime: info.commenceTime });
@@ -137,15 +291,20 @@ export function registerDiagnosticRoutes(app) {
               const m = await kalshiGet(`${V2}/markets/${resolved.ticker}`);
               const market = m.market || {};
               sample.marketStatus = market.status;
-              sample.yesAsk = market.yes_ask;
-              sample.yesAskSize = market.yes_ask_size;
 
-              if (market.yes_ask > 0) {
+              const priced = await bookPrice(resolved.ticker);
+              sample.yesAsk = priced.askCents;
+              sample.yesAskSize = priced.bestNoBid?.size ?? 0;
+              sample.priceSource = priced.source;
+              sample.bookKeys = priced.bookKeys.join(",");
+              sample.bookCounts = `yes=${priced.yesCount} no=${priced.noCount}`;
+
+              if (priced.askCents > 0) {
                 const verdict = assessOpportunity({
                   bankroll: tiering.tradable,
                   trueProbability: info.trueProbability,
-                  price: market.yes_ask / 100,
-                  restingContracts: market.yes_ask_size ?? 0,
+                  price: priced.askCents / 100,
+                  restingContracts: sample.yesAskSize,
                   multiplier: config.feeMultiplier,
                   kellyFraction: config.kellyFraction ?? tiering.tier.kellyFraction,
                   minLiquidity: config.minLiquidity ?? 0,
@@ -164,8 +323,6 @@ export function registerDiagnosticRoutes(app) {
           entry.samples.push(sample);
         }
 
-        // Raw Kalshi query telemetry: which query shape won, row counts,
-        // status histogram. This is the layer that keeps returning zero.
         entry.kalshiFetch = getFetchReport(SPORT_SERIES_MAP[sportKey]);
         report.sports.push(entry);
       }
