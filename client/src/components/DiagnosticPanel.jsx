@@ -1,5 +1,18 @@
 import React, { useState } from "react";
 
+/**
+ * Resolves the API base itself rather than trusting a prop. When this
+ * component was rendered without apiBase, every request went to
+ * "undefined/api/..." and returned the HTML page. The frontend is served by
+ * the same server, so an empty base (relative URLs) is always correct.
+ */
+function resolveBase(apiBase) {
+  if (typeof apiBase === "string" && apiBase && apiBase !== "undefined") return apiBase;
+  const env = import.meta.env.VITE_API_BASE;
+  if (typeof env === "string" && env && env !== "undefined") return env;
+  return "";
+}
+
 function Row({ label, value, tone }) {
   return (
     <div className="trade-row">
@@ -10,25 +23,46 @@ function Row({ label, value, tone }) {
 }
 
 export default function DiagnosticPanel({ apiBase }) {
+  const base = resolveBase(apiBase);
+
   const [report, setReport] = useState(null);
+  const [trade, setTrade] = useState(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState(null);
 
-  async function run() {
-    setRunning(true); setError(null); setReport(null);
+  /** Reads as text first so a crashed server shows its real error, not a parser message. */
+  async function readJson(res) {
+    const text = await res.text();
     try {
-      const res = await fetch(`${apiBase}/api/diagnose/v2`);
-      const text = await res.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        // A non-JSON body means the server crashed and returned an HTML error
-        // page. Show the first part of it rather than a parser message.
-        throw new Error(`Server returned ${res.status}: ${text.slice(0, 200)}`);
-      }
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`Server returned ${res.status}: ${text.slice(0, 300)}`);
+    }
+  }
+
+  async function runDiagnostic() {
+    setRunning(true); setError(null); setReport(null); setTrade(null);
+    try {
+      const res = await fetch(`${base}/api/diagnose/v2`);
+      const data = await readJson(res);
       if (data.error && !data.partial) throw new Error(data.error);
       setReport(data);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function runTestTrade() {
+    setRunning(true); setError(null); setReport(null); setTrade(null);
+    try {
+      const res = await fetch(`${base}/api/test-trade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contracts: 1, maxPriceCents: 95 }),
+      });
+      setTrade(await readJson(res));
     } catch (err) {
       setError(err.message);
     } finally {
@@ -46,12 +80,64 @@ export default function DiagnosticPanel({ apiBase }) {
         one - which key is signing, what Kalshi returns, whether tickers resolve,
         the live price, and why the risk manager would take or skip the trade.
       </p>
-      <button type="button" onClick={run} disabled={running}>
-        {running ? "Running..." : "Run diagnostic scan"}
+
+      <button type="button" onClick={runDiagnostic} disabled={running}>
+        {running ? "Working..." : "Run diagnostic scan"}
       </button>
+
+      <button
+        type="button"
+        className="ledger-toggle"
+        style={{ marginTop: 10 }}
+        onClick={runTestTrade}
+        disabled={running}
+      >
+        Place 1-contract test trade (real money)
+      </button>
+      <div className="ledger-reason" style={{ marginTop: 6 }}>
+        Buys one YES contract at the ask on the first live market it can price,
+        with no edge check. Up to about $0.95 plus fees. This proves whether
+        orders reach the exchange.
+      </div>
 
       {error && <div className="error-banner" style={{ marginTop: 16 }}>{error}</div>}
 
+      {/* ---- Test trade result ---- */}
+      {trade && (
+        <div className="bot-subsection">
+          <div className="ledger-card">
+            <div className="ledger-card-head">
+              <span>Test trade</span>
+              <span className={trade.ok ? "pos" : "neg"}>{trade.ok ? "FILLED" : "NOT FILLED"}</span>
+            </div>
+            <Row label="Ticker" value={trade.ticker} />
+            <Row label="Filled" value={trade.filled} tone={trade.filled ? "pos" : "neg"} />
+            <Row label="Limit price" value={trade.limitCents != null ? `${trade.limitCents}c` : "—"} />
+            {trade.error && <div className="trade-card-reason neg">{trade.error}</div>}
+          </div>
+
+          {(trade.steps ?? []).map((st, i) => (
+            <div key={i} className="ledger-card">
+              <div className="ledger-card-head">
+                <span>{st.name}</span>
+                <span className={st.error ? "neg" : ""}>{st.error ? "error" : "ok"}</span>
+              </div>
+              {st.error && <div className="trade-card-reason neg">{st.error}</div>}
+              <pre
+                style={{
+                  whiteSpace: "pre-wrap", wordBreak: "break-word",
+                  fontFamily: "ui-monospace, Menlo, monospace", fontSize: 11,
+                  margin: "8px 0 0", opacity: 0.85,
+                }}
+              >
+                {JSON.stringify(st, null, 1).slice(0, 1500)}
+              </pre>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ---- Diagnostic report ---- */}
       {report && (
         <div className="bot-subsection">
           <h3>Credentials</h3>
@@ -66,11 +152,7 @@ export default function DiagnosticPanel({ apiBase }) {
           {s.credentials?.keyError && <div className="trade-card-reason neg">{s.credentials.keyError}</div>}
 
           <h3 style={{ marginTop: 16 }}>Kalshi</h3>
-          <Row
-            label="Reachable"
-            value={s.kalshi?.ok ? "yes" : "no"}
-            tone={s.kalshi?.ok ? "pos" : "neg"}
-          />
+          <Row label="Reachable" value={s.kalshi?.ok ? "yes" : "no"} tone={s.kalshi?.ok ? "pos" : "neg"} />
           {s.kalshi?.ok
             ? <Row label="Balance" value={`$${(s.kalshi.balanceDollars ?? 0).toFixed(2)}`} />
             : <div className="trade-card-reason neg">{s.kalshi?.error}</div>}
@@ -86,7 +168,7 @@ export default function DiagnosticPanel({ apiBase }) {
           <Row label="Trailing stop" value={`${((s.config?.trailingStopPct ?? 0) * 100).toFixed(0)}%`} />
           <Row label="Entry cross" value={`${s.config?.entrySlippageCents}c`} />
 
-          {report.sports.map((sp) => (
+          {(report.sports ?? []).map((sp) => (
             <div key={sp.sportKey} className="trade-card" style={{ marginTop: 16 }}>
               <div className="trade-card-team">{sp.sportKey}</div>
 
@@ -105,22 +187,25 @@ export default function DiagnosticPanel({ apiBase }) {
                   <Row label="Winning query" value={sp.kalshiFetch.winner} tone={sp.kalshiFetch.total ? "pos" : "neg"} />
                   <Row label="Markets returned" value={sp.kalshiFetch.total} />
                   <Row label="Statuses" value={JSON.stringify(sp.kalshiFetch.statuses)} />
-                  <div className="trade-card-reason">
-                    Tried: {sp.kalshiFetch.tried.map((t) => `${t.label}=${t.returned ?? t.error}`).join(", ")}
-                  </div>
                 </div>
               )}
 
-              {sp.samples.map((sm, i) => (
-                <div key={i} style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--panel-border)" }}>
+              {(sp.samples ?? []).map((sm, i) => (
+                <div key={i} style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--separator)" }}>
                   <Row label="Team" value={sm.teamName} />
                   <Row label="Sharp prob" value={`${(sm.trueProbability * 100).toFixed(1)}%`} />
                   <Row label="Ticker" value={sm.ticker || "not resolved"} tone={sm.ticker ? "pos" : "neg"} />
                   {!sm.ticker && <div className="trade-card-reason">{sm.resolveReason}</div>}
+                  {sm.marketStatus && <Row label="Status" value={sm.marketStatus} />}
                   {sm.yesAsk != null && (
                     <>
-                      <Row label="Status" value={sm.marketStatus} />
-                      <Row label="Yes ask" value={`${sm.yesAsk}c (${sm.yesAskSize} resting)`} />
+                      <Row
+                        label="Ask"
+                        value={sm.yesAsk > 0 ? `${sm.yesAsk}c (${sm.yesAskSize} resting)` : "none"}
+                        tone={sm.yesAsk > 0 ? "pos" : "neg"}
+                      />
+                      <Row label="Price source" value={sm.priceSource} />
+                      <Row label="Book" value={`${sm.bookKeys} | ${sm.bookCounts}`} />
                     </>
                   )}
                   {sm.verdict && (
@@ -134,7 +219,9 @@ export default function DiagnosticPanel({ apiBase }) {
                       tone={sm.edge.qualifies ? "pos" : "neg"}
                     />
                   )}
-                  {sm.sizing && <Row label="Would buy" value={`${sm.sizing.contracts} contracts ($${(sm.sizing.dollarsAtRisk ?? 0).toFixed(2)})`} />}
+                  {sm.sizing && (
+                    <Row label="Would buy" value={`${sm.sizing.contracts} contracts ($${(sm.sizing.dollarsAtRisk ?? 0).toFixed(2)})`} />
+                  )}
                   {sm.error && <div className="trade-card-reason neg">{sm.error}</div>}
                 </div>
               ))}
