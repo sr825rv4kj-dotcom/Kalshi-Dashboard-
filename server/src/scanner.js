@@ -11,11 +11,16 @@
  * in-play events by commence_time. There is no waiting period: if a game is on
  * and the book is quoting it, the bot can trade it.
  *
- * What is refused is a STALE QUOTE. A book that has suspended its market leaves
- * its last price on the wire, where it is indistinguishable from a live one,
- * while the exchange keeps moving - and that gap reads as a huge edge on a team
- * that just fell behind. Every quote now carries its age, and the entry gate
- * refuses quotes that have gone quiet: tight in play, loose before kickoff.
+ * What is refused is a price the GAME STATE contradicts. Three live positions
+ * proved a quote-age check is not enough on its own: the feed's record refreshes
+ * while the h2h price stays at its pre-game number, so last_update looks healthy
+ * and the line is still stale. PHI was bought at 82c in a TIED game; HOU at 36c
+ * while DOWN 7 after halftime. Only the score can catch that.
+ *
+ * So for a market already in play, the sharp line must now be corroborated by an
+ * in-game model built from the live score (see liveModel.js), and the entry uses
+ * the MORE CONSERVATIVE of the two. Neither source has to be right; they have to
+ * agree. If the score cannot be read, the market is not traded.
  */
 
 import { kalshiGet } from "./kalshiClient.js";
@@ -24,10 +29,12 @@ import { assessOpportunity } from "./riskManager.js";
 import { enterPosition } from "./executor.js";
 import { appendLog } from "./stateStore.js";
 import { resolveTicker } from "./tickerResolver.js";
+import { getLiveScores, findLiveGameForTeam } from "./scoresFetcher.js";
+import { corroboratedProbability, fractionRemaining, paramsFor } from "./liveModel.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-20-live-fresh";
+export const SCANNER_VERSION = "2026-09-20-live-corroborated";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -236,7 +243,68 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
     }
   }));
 
-  const viable = prepared.filter(Boolean);
+  let viable = prepared.filter(Boolean);
+
+  // --- In-play corroboration -------------------------------------------
+  // One /scores call per sport per scan, and only when something in play
+  // actually needs it - that endpoint is billed separately from /odds.
+  const livePending = viable.filter((c) => c.timing.live);
+  if (livePending.length) {
+    if (!paramsFor(sportKey)) {
+      appendLog(
+        `${sportKey}: ${livePending.length} in-play market(s) skipped - no in-game model exists for this sport, ` +
+        `so a stale line could not be detected.`, "warn"
+      );
+      viable = viable.filter((c) => !c.timing.live);
+    } else {
+      const { events, error } = await getLiveScores(sportKey);
+      if (error && !events.length) {
+        appendLog(`${sportKey}: live scores unavailable (${error}) - in-play markets skipped this cycle.`, "warn");
+        viable = viable.filter((c) => !c.timing.live);
+      } else {
+        const vetoed = [];
+        viable = viable.filter((c) => {
+          if (!c.timing.live) return true;
+
+          const game = findLiveGameForTeam(events, c.teamName);
+          if (!game) {
+            vetoed.push(`${c.teamName}: in play but no live score found - cannot check the line against the game`);
+            return false;
+          }
+
+          const frac = fractionRemaining(sportKey, c.commenceTime);
+          const corr = corroboratedProbability({
+            sportKey, sharpProbability: c.trueProbability, lead: game.lead, fracRemaining: frac,
+          });
+          if (!corr.usable) {
+            vetoed.push(`${c.teamName}: in play, could not model the game state`);
+            return false;
+          }
+
+          const maxDisagree = config.maxModelDisagreementPoints ?? 12;
+          if (corr.disagreementPoints > maxDisagree) {
+            vetoed.push(
+              `${c.teamName}: sharp line ${(c.trueProbability * 100).toFixed(0)}% vs in-game model ` +
+              `${(corr.modelProbability * 100).toFixed(0)}% (${game.homeScore}-${game.awayScore}, ` +
+              `${(frac * 100).toFixed(0)}% left) - ${corr.disagreementPoints.toFixed(0)}pt gap exceeds ${maxDisagree}, line is stale`
+            );
+            return false;
+          }
+
+          // Trade on the more conservative of the two.
+          c.trueProbability = corr.probability;
+          c.liveContext =
+            `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ` +
+            `${(frac * 100).toFixed(0)}% left, model ${(corr.modelProbability * 100).toFixed(0)}%`;
+          return true;
+        });
+
+        if (vetoed.length) {
+          appendLog(`${sportKey}: ${vetoed.length} in-play market(s) vetoed by the game state. First: ${vetoed[0]}`, "warn");
+        }
+      }
+    }
+  }
   appendLog(
     `${sportKey}: ${teamEntries.length} lines -> ${viable.length} tradeable ` +
     `(dropped: ${drops.live} live-disabled, ${drops.unresolved} unresolved, ${drops.window} out-of-window, ` +
@@ -300,11 +368,12 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       ? `LIVE ${Math.abs(c.timing.minutesUntilStart ?? 0).toFixed(0)}m in` +
         (c.lineAgeSeconds != null ? `, quote ${Math.round(c.lineAgeSeconds)}s old` : "")
       : (c.timing.minutesUntilStart != null ? `${c.timing.minutesUntilStart.toFixed(0)}m to start` : "start time unknown");
+    const liveNote = c.liveContext ? ` | ${c.liveContext}` : "";
     appendLog(
       `Candidate ${c.ticker} (${c.teamName}): sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ` +
       `[${c.pricing.source}], edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}%, ` +
       `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract, ` +
-      `${assessment.sizing.contracts} contracts ($${assessment.sizing.dollarsAtRisk.toFixed(2)}), ${startsIn}`
+      `${assessment.sizing.contracts} contracts ($${assessment.sizing.dollarsAtRisk.toFixed(2)}), ${startsIn}${liveNote}`
     );
 
     const result = await enterPosition({
