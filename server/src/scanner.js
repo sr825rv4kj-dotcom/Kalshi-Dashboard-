@@ -15,7 +15,7 @@ import { resolveTicker } from "./tickerResolver.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-19-dollars-book";
+export const SCANNER_VERSION = "2026-09-19-shard-routing";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -216,11 +216,13 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       `${assessment.sizing.contracts} contracts ($${assessment.sizing.dollarsAtRisk.toFixed(2)})`
     );
 
-    const result = await enterPosition({
+        const result = await enterPosition({
       ticker: c.ticker,
       side: "yes",
       priceCents: askCents,
+      exchangeIndex: c.market?.exchange_index ?? null,
       contracts: assessment.sizing.contracts,
+
       reason:
         `Sharp-book edge via ${probResult.provider} on "${c.teamName}" ` +
         `(true ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c)` +
