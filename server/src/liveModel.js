@@ -87,8 +87,19 @@ export const SPORT_PARAMS = {
   soccer_usa_mls:         { sigma: 1.7,  wallClockMinutes: 115 },
 };
 
-export function paramsFor(sportKey) {
-  return SPORT_PARAMS[sportKey] || null;
+/**
+ * Fallback for a sport with no calibrated numbers.
+ *
+ * Returning null used to mean every in-play market in that sport was dropped
+ * in silence - tennis sat in the sports pool all day being refused with no
+ * trace. A wide sigma makes the model deliberately unconfident, so the
+ * corroboration gate leans on the sharp line rather than on numbers nobody
+ * calibrated, but the market at least gets considered.
+ */
+const GENERIC_PARAMS = { sigma: 12, wallClockMinutes: 150, generic: true };
+
+export function paramsFor(sportKey, { allowGeneric = true } = {}) {
+  return SPORT_PARAMS[sportKey] || (allowGeneric ? GENERIC_PARAMS : null);
 }
 
 /**
