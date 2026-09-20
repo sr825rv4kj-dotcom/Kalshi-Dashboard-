@@ -53,6 +53,21 @@ export default function BotControlPanel({ apiBase }) {
     } catch (err) { setError(err.message); } finally { setBusy(false); }
   }
 
+  /**
+   * Clears a day halt and re-bases the drawdown baseline to current equity.
+   * A halt used to be escapable only by waiting for the server's calendar day
+   * to turn over, which on a UTC host is mid-afternoon local time.
+   */
+  async function resumeTrading() {
+    setBusy(true); setError(null);
+    try {
+      const res = await fetch(`${apiBase}/api/bot/resume`, { method: "POST" });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      await refresh();
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+
   async function confirmStop() {
     setBusy(true); setError(null);
     try {
@@ -82,7 +97,21 @@ export default function BotControlPanel({ apiBase }) {
           </span>
         )}
       </div>
-      {status.haltedForDay && <div className="error-banner" style={{ marginTop: 16 }}>Trading halted for today: {status.haltReason}</div>}
+      {status.haltedForDay && (
+        <div className="error-banner" style={{ marginTop: 16 }}>
+          Trading halted for today: {status.haltReason}
+          <div className="error-action">
+            <button type="button" onClick={resumeTrading} disabled={busy}>
+              {busy ? "Working..." : "Resume trading now"}
+            </button>
+          </div>
+          <div style={{ marginTop: 8, fontSize: 13, opacity: 0.75, lineHeight: 1.45 }}>
+            Resuming clears the halt and re-bases the drawdown baseline to your
+            current equity, so today is measured from here rather than from a
+            loss taken under the old strategy.
+          </div>
+        </div>
+      )}
       {error && <div className="error-banner" style={{ marginTop: 16 }}>{error}</div>}
       {status.running ? (
         <button type="button" className="danger-button" onClick={() => setConfirmingStop(true)} disabled={busy} style={{ marginTop: 20 }}>Stop Bot</button>
