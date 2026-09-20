@@ -20,7 +20,7 @@ const V2 = "/trade-api/v2";
  */
 const ORDERS_PATH = `${V2}/portfolio/events/orders`;
 
-export const EXECUTOR_VERSION = "2026-09-19-shard-wait";
+export const EXECUTOR_VERSION = "2026-09-19-shard-patient";
 
 const ALLOCATION_PATH = `${V2}/portfolio/target_balance_allocation`;
 
@@ -48,9 +48,8 @@ async function shardBalanceDollars(exchangeIndex) {
 
 /**
  * Target allocation is asynchronous: Kalshi accepts the request and moves the
- * money afterwards. Firing the order two seconds later simply failed again with
- * insufficient_balance, so this waits for the shard to actually hold what the
- * order needs before returning.
+ * money afterwards. This waits for the shard to actually hold what the order
+ * needs before returning.
  */
 async function allocateAllTo(exchangeIndex, needDollars = 0) {
   await kalshiPost(ALLOCATION_PATH, {
@@ -59,17 +58,26 @@ async function allocateAllTo(exchangeIndex, needDollars = 0) {
   });
   allocatedShard = exchangeIndex;
 
-  for (let i = 0; i < 10; i++) {
-    await new Promise((r) => setTimeout(r, 1500));
+  // Kalshi settles the transfer on its own schedule - 15 seconds was not
+  // enough. Poll for up to a minute, reporting progress so the log shows
+  // whether money is moving at all.
+  let last = null;
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
     const have = await shardBalanceDollars(exchangeIndex);
     if (have == null) break;                       // cannot read - proceed and let the order decide
+    last = have;
     if (have >= needDollars) {
       appendLog(`Collateral on shard ${exchangeIndex}: $${have.toFixed(2)} (needed $${needDollars.toFixed(2)}).`);
       return true;
     }
   }
 
-  appendLog(`Shard ${exchangeIndex} still short of $${needDollars.toFixed(2)} after waiting.`, "warn");
+  appendLog(
+    `Shard ${exchangeIndex} holds $${last == null ? "?" : last.toFixed(2)} of the $${needDollars.toFixed(2)} needed ` +
+    `after 60s. Kalshi moves collateral on its own schedule - it should settle before the next scan.`,
+    "warn"
+  );
   return false;
 }
 
@@ -177,6 +185,16 @@ export async function enterPosition({
     }
     result = await placeIOC({ ticker, side: "bid", limitCents, contracts, exchangeIndex });
   } catch (err) {
+    // A collateral-routing failure is not a system fault. Throwing here tripped
+    // the circuit breaker after three markets on an unfunded shard and stopped
+    // the bot outright, so it is reported and skipped instead.
+    if (/insufficient_(shard_)?balance/.test(String(err.message))) {
+      appendLog(
+        `Skipping ${ticker}: collateral has not reached shard ${exchangeIndex} yet. ` +
+        `Trading continues on funded shards.`, "warn"
+      );
+      return { filled: 0, skipped: "shard-unfunded" };
+    }
     appendLog(`Entry order rejected for ${ticker}: ${err.message}`, "error");
     throw err;
   }
