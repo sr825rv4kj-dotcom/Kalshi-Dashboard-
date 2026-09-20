@@ -6,11 +6,69 @@ import { assessOpportunity } from "../riskManager.js";
 
 const V2 = "/trade-api/v2";
 
+/**
+ * Kalshi has been migrating to fixed-point dollar strings ("0.43") alongside
+ * the older integer-cent fields, and the order objects no longer carry
+ * yes_price / remaining_count - which is why the dashboard showed "Entered -"
+ * with no amount. Rather than bet on one spelling, take the first field that
+ * actually has a value and normalize: anything at or below 1 is dollars,
+ * anything above is already cents.
+ */
+function firstNumber(obj, keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v == null || v === "") continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function toCents(raw) {
+  if (raw == null) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n <= 1 ? n * 100 : n);
+}
+
+function normalizeOrder(o) {
+  const priceRaw = firstNumber(o, [
+    "yes_price", "no_price", "price",
+    "yes_price_dollars", "no_price_dollars", "price_dollars",
+    "average_fill_price", "avg_price",
+  ]);
+
+  const count = firstNumber(o, [
+    "count", "initial_count", "original_count",
+    "fill_count", "taker_fill_count", "filled_count",
+    "remaining_count",
+  ]);
+
+  const filled = firstNumber(o, ["fill_count", "taker_fill_count", "filled_count"]);
+
+  return {
+    orderId: o.order_id ?? o.id ?? null,
+    ticker: o.ticker ?? null,
+    side: o.side ?? null,                       // "yes"/"no" or "bid"/"ask"
+    action: o.action ?? (o.side === "bid" ? "buy" : o.side === "ask" ? "sell" : null),
+    status: o.status ?? null,
+    priceCents: toCents(priceRaw),
+    count: count != null ? Math.round(count) : null,
+    filled: filled != null ? Math.round(filled) : null,
+    createdTime: o.created_time ?? o.created_ts ?? o.ts_ms ?? null,
+  };
+}
+
 export function registerPortfolioRoutes(app) {
   app.get("/api/balance", async (_req, res) => {
     try {
       const data = await kalshiGet(`${V2}/portfolio/balance`);
-      res.json({ balanceDollars: (data.balance ?? 0) / 100 });
+      res.json({
+        balanceDollars: (data.balance ?? 0) / 100,
+        positionsValueDollars: (data.portfolio_value ?? 0) / 100,
+        equityDollars: ((data.balance ?? 0) + (data.portfolio_value ?? 0)) / 100,
+        shards: data.balance_breakdown ?? null,
+      });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -40,20 +98,30 @@ export function registerPortfolioRoutes(app) {
     }
   });
 
+  /**
+   * Recent orders. Add ?debug=1 to see the raw field names Kalshi returns for
+   * the first order - the fastest way to settle a mapping question without
+   * another round of guessing.
+   */
   app.get("/api/orders", async (req, res) => {
     try {
       const limit = req.query.limit || "50";
       const data = await kalshiGet(`${V2}/portfolio/orders`, `?limit=${limit}`);
-      const orders = (data.orders ?? []).map((o) => ({
-        orderId: o.order_id,
-        ticker: o.ticker,
-        side: o.side,
-        action: o.action,
-        status: o.status,
-        priceCents: o.yes_price ?? o.no_price,
-        count: o.remaining_count ?? o.original_count ?? o.count,
-        createdTime: o.created_time,
-      }));
+      const raw = data.orders ?? [];
+      const orders = raw.map(normalizeOrder);
+
+      if (req.query.debug === "1") {
+        return res.json({
+          orders,
+          debug: {
+            count: raw.length,
+            firstOrderKeys: raw.length ? Object.keys(raw[0]) : [],
+            firstOrderRaw: raw.length ? raw[0] : null,
+            topLevelKeys: Object.keys(data ?? {}),
+          },
+        });
+      }
+
       res.json({ orders });
     } catch (err) {
       res.status(500).json({ error: err.message });
