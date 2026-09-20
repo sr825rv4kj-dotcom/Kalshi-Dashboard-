@@ -117,6 +117,31 @@ function openEventKeys() {
 }
 
 /**
+ * Marks a game as just-exited. Without this the bot bought, hit take-profit
+ * seconds later, sold, and the very next scan saw the same edge and bought
+ * again - a buy/sell loop on one game paying the round-trip fee every lap.
+ */
+function recordExit(ticker) {
+  const state = loadState();
+  state.recentExits = state.recentExits || {};
+  state.recentExits[eventKeyOf(ticker)] = new Date().toISOString();
+  saveState(state);
+}
+
+/** Games exited within the cooldown, which this cycle must leave alone. */
+function cooledDownEventKeys(config) {
+  const minutes = config.reentryCooldownMinutes ?? 30;
+  if (!minutes) return new Set();
+  const cutoff = Date.now() - minutes * 60 * 1000;
+  const recent = loadState().recentExits || {};
+  const keys = new Set();
+  for (const [key, iso] of Object.entries(recent)) {
+    if (new Date(iso).getTime() >= cutoff) keys.add(key);
+  }
+  return keys;
+}
+
+/**
  * Total account equity: cash plus the market value of open positions. The
  * drawdown check used cash alone, which meant buying contracts - converting
  * cash into positions - registered as a loss. Three small entries moved cash
@@ -235,6 +260,7 @@ async function checkOpenPositions(config) {
           `${position.ticker} at ${bestBid}c vs ${entry}c entry (+${(gainPct * 100).toFixed(1)}%) - taking profit.`
         );
         await exitPosition(position, "take-profit");
+        recordExit(position.ticker);
         continue;
       }
 
@@ -245,6 +271,7 @@ async function checkOpenPositions(config) {
           "warn"
         );
         await exitPosition(position, "trailing-stop");
+        recordExit(position.ticker);
         continue;
       }
 
@@ -253,12 +280,14 @@ async function checkOpenPositions(config) {
           `${position.ticker} worth ${bestBid}c vs ${entry}c paid - exiting below cost.`, "warn"
         );
         await exitPosition(position, "below-cost");
+        recordExit(position.ticker);
         continue;
       }
 
       if (adverseMovePct >= config.perPositionStopLossPct) {
         appendLog(`${position.ticker} down ${(adverseMovePct * 100).toFixed(1)}% from entry - cutting loss.`, "warn");
         await exitPosition(position, "stop-loss");
+        recordExit(position.ticker);
       }
     } catch (err) {
       appendLog(`Error checking ${position.ticker}: ${err.message}`, "error");
@@ -313,6 +342,11 @@ export async function runCycle() {
     }
 
     const skipEvents = openEventKeys();
+    const cooling = cooledDownEventKeys(config);
+    for (const k of cooling) skipEvents.add(k);
+    if (cooling.size) {
+      appendLog(`${cooling.size} game(s) in re-entry cooldown - not re-trading them this cycle.`);
+    }
 
     for (const sportKey of activeSports) {
       const stop = await scanSport({
