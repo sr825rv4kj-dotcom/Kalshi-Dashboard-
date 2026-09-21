@@ -210,7 +210,29 @@ const REASON_LABELS = {
   "unmodellable": "could not model the game state",
   "no-fill": "order placed but nothing filled",
   "skip-other": "other",
+
+  // --- Not gates. These describe the board, not a threshold you set. --------
+  "no-lines-from-provider": "no games on the board (nothing to price)",
+  "odds-fetch-failed": "odds feed error",
+  "scanner-error": "scan crashed and was contained",
+  "order-error": "exchange rejected the order",
 };
+
+/**
+ * Codes that are NOT a threshold you can loosen.
+ *
+ * "no games on the board" used to sit at the top of the blocker list as the
+ * apparent reason nothing traded, which sent the tuning in exactly the wrong
+ * direction: there is no setting that creates a fixture. These are still shown
+ * - a large count is worth knowing - but they sort below the real gates so the
+ * top row is always something you can actually act on.
+ */
+const NOT_A_GATE = new Set([
+  "no-lines-from-provider",
+  "odds-fetch-failed",
+  "scanner-error",
+  "order-error",
+]);
 
 function lastScanSummary() {
   let scans = {};
@@ -230,8 +252,14 @@ function lastScanSummary() {
   }
 
   const blockers = Object.entries(totals)
-    .map(([code, count]) => ({ code, count, label: REASON_LABELS[code] || code }))
-    .sort((a, b) => b.count - a.count);
+    .map(([code, count]) => ({
+      code, count,
+      label: REASON_LABELS[code] || code,
+      actionable: !NOT_A_GATE.has(code),
+    }))
+    // Real gates first, biggest first. Board conditions last, whatever their
+    // count, because no threshold change affects them.
+    .sort((a, b) => (Number(b.actionable) - Number(a.actionable)) || (b.count - a.count));
 
   return { at: newest, sports: sports.length, seen, entered, blockers };
 }
