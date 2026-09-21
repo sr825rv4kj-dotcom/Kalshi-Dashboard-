@@ -29,7 +29,7 @@ import { CONFIG_DIR } from "./paths.js";
 const CONFIG_PATH = path.join(CONFIG_DIR, "bot-config.json");
 
 /** Bump this whenever a STRATEGY_KEYS default below changes meaningfully. */
-export const STRATEGY_VERSION = 9;
+export const STRATEGY_VERSION = 10;
 
 /**
  * Keys the migration is allowed to reset. Anything not listed here is the
@@ -101,7 +101,10 @@ export const DEFAULTS = {
   maxEntryPriceCents: 88,
 
   maxPlausibleEdge: 0.18,       // a wider gap than this is a stale feed, not an edge
-  minEvCentsPerContract: 2,     // absolute floor - thin percentage edges are not worth capital
+  // Absolute EV floor per contract. Dropped from 2c to 1c: at $2 flat bets a
+  // 1c edge on 5 contracts is 5c of expected value, which is small but real,
+  // and the 2c floor was throwing away everything between break-even and there.
+  minEvCentsPerContract: 1,
   maxSpreadCents: 6,            // a wide book means the quote is not a real price
   minLiquidity: 0,              // coverage is checked against order size, not an absolute
 
@@ -172,7 +175,11 @@ export const DEFAULTS = {
     balanceThreshold: 40,
     flatBetDollars: 2,
     maxConcurrentPositions: 6,
-    edgeMultiplier: 1.25,
+    // Was 1.25. The strategy has produced +37.6% ROI over 18 completed trades,
+    // so taxing every survival-mode entry by a further 25% of required edge was
+    // no longer buying safety - it was the difference between a 2.5% bar and a
+    // 3.1% one on trades that already clear break-even.
+    edgeMultiplier: 1.0,
   },
 
   milestoneTiers: [
