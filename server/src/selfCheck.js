@@ -22,6 +22,7 @@ const CONTRACTS = [
   { file: "./executor.js", expects: ["enterPosition", "exitPosition"] },
   { file: "./scanner.js", expects: ["scanSport"] },
   { file: "./scraper.js", expects: ["getSharpProbabilities", "devig"] },
+  { file: "./seriesDiscovery.js", expects: ["discoverSeriesMap", "distinctiveTokens", "CONFIRMED_SERIES"] },
   { file: "./liveModel.js", expects: ["corroboratedProbability", "liveWinProbability", "fractionRemaining", "paramsFor"] },
   { file: "./scoresFetcher.js", expects: ["getRecentScores", "findScoreForTeam", "getLiveScores", "findLiveGameForTeam"] },
   { file: "./configStore.js", expects: ["loadConfig", "saveConfig", "DEFAULTS", "STRATEGY_VERSION", "describeStrategy"] },
@@ -52,7 +53,7 @@ const FINGERPRINTS = [
   {
     file: "./scanner.js",
     exportName: "SCANNER_VERSION",
-    equals: "2026-09-20-live-corroborated",
+    equals: "2026-09-20-tallied",
     missing: "scanner.js is stale - it enters in-play markets without checking the sharp line against the live score, which is how a pre-game number gets traded as if it were a live quote.",
   },
   {
