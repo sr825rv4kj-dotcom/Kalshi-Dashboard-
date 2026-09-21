@@ -5,7 +5,9 @@ import { kalshiGet } from "./kalshiClient.js";
 import { exitPosition } from "./executor.js";
 import { loadState, saveState, appendLog } from "./stateStore.js";
 import { loadConfig } from "./configStore.js";
-import { discoverActiveSports } from "./sportsDiscovery.js";
+import { discoverActiveSports, allActiveSportKeys } from "./sportsDiscovery.js";
+import { discoverSeriesMap } from "./seriesDiscovery.js";
+import { setSeriesMap } from "./tickerResolver.js";
 import { currentCadenceSeconds, describeCadence } from "./cadence.js";
 import { scanSport } from "./scanner.js";
 import { notifyMilestone, notifyDailyHalt, notifyDailySummary } from "./notifier.js";
@@ -60,6 +62,12 @@ function loadTickerMap() {
 /**
  * Milestone tiers. Crossing a milestone governs how the bot trades: more size,
  * more concurrency, and a reserve that sizing is not allowed to touch.
+ */
+/**
+ * Sizing tiers. Once the balance clears survival mode the bot is no longer
+ * protecting a fragile bankroll, so the caps step up rather than staying at
+ * survival-era numbers - that was leaving most of the balance idle at exactly
+ * the point the strategy had proven itself.
  */
 export function tierFor(bankroll, config) {
   const tiers = config.milestoneTiers || [
@@ -624,6 +632,19 @@ export async function runCycle() {
         appendLog(`At the concurrent position cap with ${loadState().positions.length} open - waiting for games to settle.`);
       }
       return;
+    }
+
+    // Refresh which Kalshi series exist BEFORE deciding what is scannable.
+    // Six hardcoded sports were the real reason the bot sat idle on a board of
+    // 86 live markets; this asks Kalshi what it actually lists. Cached 6h, so
+    // this is one extra call a few times a day.
+    try {
+      const candidates = await allActiveSportKeys();
+      if (candidates.length) {
+        setSeriesMap(await discoverSeriesMap(kalshiGet, candidates));
+      }
+    } catch (err) {
+      appendLog(`Series discovery skipped this cycle (${err.message}).`, "warn");
     }
 
     const activeSports = await discoverActiveSports();
