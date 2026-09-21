@@ -39,33 +39,43 @@ const EXPECTED_EXPORTS = [
   { file: "./tickerResolver.js", name: "getFetchReport", missing: "tickerResolver.js is stale - no Kalshi query telemetry" },
   { file: "./scanner.js", name: "entryTiming", missing: "scanner.js is stale - it cannot tell a live game from a pre-game one, so it cannot apply the right quote-freshness limit to either" },
   { file: "./scraper.js", name: "devig", missing: "scraper.js is stale - the bookmaker margin is not being removed, which reports 2-4% of edge that does not exist on every single market" },
+  { file: "./scraper.js", name: "oddsProviderHealth", missing: "scraper.js is stale - it still throws when a sport simply has no games today, so an out-of-season competition is reported as a failure AND re-fetched at 2 credits a call every single scan" },
+  { file: "./coverageCheck.js", name: "runCoverageCheck", missing: "coverageCheck.js is missing - there is no way to prove a sport can trade other than waiting to see whether it does" },
   { file: "./riskManager.js", name: "evPerContractCents", missing: "riskManager.js is stale - it still prices a round trip and demands roughly double the edge actually needed, rejecting most profitable entries" },
   { file: "./configStore.js", name: "STRATEGY_VERSION", missing: "configStore.js is stale - strategy defaults still come only from the volume file, so a deploy that changes how the bot trades changes nothing" },
 ];
 
 /**
- * Version markers. Reading an exported module constant is reliable. The
- * previous approach read a single function's source, which could not see
- * markers declared beside that function - and reported a current scanner.js
- * as stale for an hour.
+ * Version markers.
+ *
+ * These used to be EXACT-MATCH strings. That made the self-check a liability:
+ * every time a module was legitimately improved, this file reported the NEW
+ * code as a blocker until someone remembered to hand-edit a string here too.
+ * A "blocker" that fires on correct code trains you to ignore blockers, which
+ * is worse than having no check at all.
+ *
+ * Version strings are `YYYY-MM-DD-slug`. The check is now a FLOOR on the date
+ * part: anything at or after minDate passes, anything before it is genuinely
+ * stale. Shipping a newer module can never produce a false blocker again;
+ * deploying an older one still gets caught.
  */
 const FINGERPRINTS = [
   {
     file: "./scanner.js",
     exportName: "SCANNER_VERSION",
-    equals: "2026-09-20-tallied",
+    minDate: "2026-09-21",
     missing: "scanner.js is stale - it enters in-play markets without checking the sharp line against the live score, which is how a pre-game number gets traded as if it were a live quote.",
   },
   {
     file: "./executor.js",
     exportName: "EXECUTOR_VERSION",
-    equals: "2026-09-19-shard-patient",
+    minDate: "2026-09-19",
     missing: "executor.js is stale - a collateral-routing failure still throws, which trips the circuit breaker and stops the bot instead of skipping that one market.",
   },
   {
     file: "./botController.js",
     exportName: "CONTROLLER_VERSION",
-    equals: "2026-09-20-hold-to-settlement",
+    minDate: "2026-09-20",
     missing: "botController.js is stale - it does not reconcile settled positions, so held positions never clear from tracking and the concurrent-position cap silently fills with finished games until the bot stops trading altogether.",
   },
 ];
@@ -109,10 +119,26 @@ async function checkModules() {
   for (const f of FINGERPRINTS) {
     const mod = loaded[f.file];
     if (!mod) continue;
-    if (mod[f.exportName] !== f.equals) {
+
+    const reported = mod[f.exportName];
+    const datePart = typeof reported === "string" ? reported.slice(0, 10) : null;
+
+    // No marker at all, or one that is not a date, means the module predates
+    // fingerprinting entirely. That is stale.
+    if (!datePart || !/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
       findings.push({
         level: "blocker", area: "version",
-        detail: `${f.file} reports version "${mod[f.exportName] ?? "none"}", expected "${f.equals}"`,
+        detail: `${f.file} reports no usable version marker (${f.exportName} = ${JSON.stringify(reported ?? null)})`,
+        fix: f.missing,
+      });
+      continue;
+    }
+
+    // String comparison is correct for zero-padded ISO dates.
+    if (datePart < f.minDate) {
+      findings.push({
+        level: "blocker", area: "version",
+        detail: `${f.file} reports version "${reported}", which predates the required ${f.minDate} build`,
         fix: f.missing,
       });
     }
