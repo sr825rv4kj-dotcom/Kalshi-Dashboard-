@@ -57,12 +57,29 @@ export function evPerContractCents({ trueProbability, priceCents, multiplier = D
  * `expectRoundTrip` exists for callers that genuinely intend to sell back;
  * the bot does not, so it defaults to false.
  */
+/**
+ * The edge a price must show before it is worth taking.
+ *
+ * Break-even is exactly the fee, expressed in percentage points: EV is
+ * p*100 - price - fee, so it crosses zero when the edge equals the fee. With a
+ * 2c fee that is 2.0 points, at EVERY price in the band - not a larger number
+ * at cheap prices, which is what the fee-as-share-of-stake figure looks like
+ * and is a different quantity entirely.
+ *
+ * Everything above break-even is buffer against devigging error in the sharp
+ * line. It was set at fee + max(1.5%, fee/2), then multiplied by 1.25 in
+ * survival mode - about 4.4%, more than double break-even, and in production it
+ * became the single largest blocker: 25 of 49 lines in one scan.
+ *
+ * It is now fee + max(0.5%, fee/4), which lands at 2.5% against a 2.0% floor.
+ * That half point is the entire margin for error, so it does not go lower.
+ */
 export function requiredEdgeThreshold({
   price,
   multiplier = DEFAULT_FEE_MULTIPLIER,
   expectRoundTrip = false,
-  minTickBuffer = 0.015,
-  feeSafetyMultiplier = 0.5,
+  minTickBuffer = 0.005,
+  feeSafetyMultiplier = 0.25,
 }) {
   const priceCents = Math.round(price * 100);
   const entryFee = feeCentsAt(priceCents, multiplier) / 100;
@@ -164,7 +181,11 @@ export function assessOpportunity({
   maxPlausibleEdge = 0.18,
   minEntryPriceCents = 25,
   maxEntryPriceCents = 88,
-  minEvCentsPerContract = 2,
+  // Kept in step with configStore's DEFAULTS. These drifted apart once - config
+  // said 1c while this still said 2c, so lowering the edge bar changed almost
+  // nothing: the EV floor was the gate actually doing the blocking, and a sweep
+  // showed only 3% more setups qualifying instead of the expected jump.
+  minEvCentsPerContract = 1,
   isLiveGame = false,
   allowLiveGames = true,
   lineAgeSeconds = null,
