@@ -29,7 +29,7 @@ import { CONFIG_DIR } from "./paths.js";
 const CONFIG_PATH = path.join(CONFIG_DIR, "bot-config.json");
 
 /** Bump this whenever a STRATEGY_KEYS default below changes meaningfully. */
-export const STRATEGY_VERSION = 7;
+export const STRATEGY_VERSION = 8;
 
 /**
  * Keys the migration is allowed to reset. Anything not listed here is the
@@ -146,8 +146,12 @@ export const DEFAULTS = {
   // at $2 is deliberately preferred over three at $4: identical exposure, but
   // the outcome is spread across six independent games instead of three. With
   // a small edge, diversification beats concentration every time.
+  // Survival mode ends at $40 rather than $60. The strategy has now produced
+  // +37.6% ROI over 18 completed trades, so holding it at flat $2 bets and a
+  // 1.25x edge penalty well past the point it proved itself was costing
+  // opportunity, not buying safety.
   survivalMode: {
-    balanceThreshold: 60,
+    balanceThreshold: 40,
     flatBetDollars: 2,
     maxConcurrentPositions: 6,
     edgeMultiplier: 1.25,
@@ -157,6 +161,9 @@ export const DEFAULTS = {
     // Raised across the board for the same reason as survival mode: a held
     // position ties up its slot for the length of a game, not for minutes.
     { at: 0,     kellyFraction: 0.25, maxConcurrentPositions: 6,  maxStakeDollars: 4,   reservePct: 0.00 },
+    // First tier clear of survival mode: real Kelly sizing and twice the
+    // concurrency, because the constraint above $40 is opportunity, not ruin.
+    { at: 40,    kellyFraction: 0.25, maxConcurrentPositions: 8,  maxStakeDollars: 8,   reservePct: 0.00 },
     { at: 100,   kellyFraction: 0.25, maxConcurrentPositions: 10, maxStakeDollars: 15,  reservePct: 0.10 },
     { at: 500,   kellyFraction: 0.25, maxConcurrentPositions: 14, maxStakeDollars: 50,  reservePct: 0.20 },
     { at: 2500,  kellyFraction: 0.30, maxConcurrentPositions: 12, maxStakeDollars: 200, reservePct: 0.30 },
