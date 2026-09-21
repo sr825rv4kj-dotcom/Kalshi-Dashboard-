@@ -29,7 +29,7 @@ import { CONFIG_DIR } from "./paths.js";
 const CONFIG_PATH = path.join(CONFIG_DIR, "bot-config.json");
 
 /** Bump this whenever a STRATEGY_KEYS default below changes meaningfully. */
-export const STRATEGY_VERSION = 8;
+export const STRATEGY_VERSION = 9;
 
 /**
  * Keys the migration is allowed to reset. Anything not listed here is the
@@ -65,15 +65,33 @@ export const DEFAULTS = {
   // a huge edge on a team that just fell behind. In play a quote older than
   // this is treated as suspended. Before kickoff a line legitimately sits
   // still, so the tolerance is wide.
-  maxLineAgeSecondsLive: 180,        // 3 minutes
-  maxLineAgeSecondsPregame: 1800,    // 30 minutes
+  // Quote-age limits, deliberately loose now.
+  //
+  // 180s was the single biggest blocker in production: real quotes from this
+  // feed arrive 383s old, because the odds API refreshes on its own cadence
+  // rather than per tick. The gate was measuring the FEED's publishing rhythm
+  // and calling it a suspended market.
+  //
+  // It is also the weaker of two overlapping guards. A timestamp cannot tell
+  // you a line is wrong - it only tells you when it was written. The in-game
+  // model compares the line against the LIVE SCORE, which is what actually
+  // caught HOU (sharp 40% vs model 16%) and PHI (86% vs 71%). That check does
+  // the real work; this one now only rejects quotes so old they are obviously
+  // abandoned.
+  maxLineAgeSecondsLive: 900,        // 15 minutes
+  maxLineAgeSecondsPregame: 7200,    // 2 hours
 
   // Hold to settlement. Kalshi charges a fee on every trade and nothing at
   // settlement, so a flip costs two fees and a hold costs one. Worth +4 to
   // +7c per contract at the prices traded here.
   holdToSettlement: true,
 
-  entryWindowHours: 8,          // how far AHEAD of kickoff to look; does not limit live games
+  // NO ENTRY WINDOW. Zero disables the look-ahead limit entirely: a line 12
+  // hours before kickoff is still a real line, and the price band, edge bar and
+  // EV floor already decide whether it is worth taking. The window was refusing
+  // markets before any of those ever got to run - your logs showed tennis
+  // dropping 2 of 10 lines on this alone.
+  entryWindowHours: 0,
   minMinutesBeforeStart: 0,     // raise this to stop entering right on the whistle
 
   // --- Price band --------------------------------------------------------
