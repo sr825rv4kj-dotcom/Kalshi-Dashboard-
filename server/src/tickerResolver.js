@@ -14,6 +14,13 @@ const WINDOW_BEFORE_H = 3;
 const WINDOW_AFTER_H = 30;
 const CACHE_TTL_MS = 3 * 60 * 1000;
 
+/**
+ * The six confirmed, in-production mappings. Everything beyond this is
+ * DISCOVERED at runtime from Kalshi's own /series endpoint - see
+ * seriesDiscovery.js for why hardcoding the list was the thing keeping the bot
+ * idle. This object is still exported because the self-check and the fallback
+ * path both read it.
+ */
 export const SPORT_SERIES_MAP = {
   americanfootball_nfl: "KXNFLGAME",
   americanfootball_ncaaf: "KXNCAAFGAME",
@@ -33,6 +40,18 @@ const WEAK = new Set([
 
 const cache = new Map();
 export const lastFetchReport = new Map();
+
+/**
+ * Filled in by the bot each cycle from Kalshi's live series list. Empty until
+ * the first discovery runs, at which point the confirmed six above still apply.
+ */
+let runtimeSeriesMap = {};
+export function setSeriesMap(map) {
+  runtimeSeriesMap = map && typeof map === "object" ? map : {};
+}
+export function getSeriesMap() {
+  return { ...SPORT_SERIES_MAP, ...runtimeSeriesMap };
+}
 
 function normalize(t) {
   return (t || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
@@ -118,7 +137,7 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
     return { ticker: null, reason: "draw/tie is not a two-sided market" };
   }
 
-  const series = SPORT_SERIES_MAP[sportKey];
+  const series = runtimeSeriesMap[sportKey] || SPORT_SERIES_MAP[sportKey];
   if (!series) return { ticker: null, reason: `no Kalshi series for "${sportKey}"` };
 
   let all;
