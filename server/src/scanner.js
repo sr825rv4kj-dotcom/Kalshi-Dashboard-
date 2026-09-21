@@ -34,7 +34,7 @@ import { corroboratedProbability, fractionRemaining, paramsFor } from "./liveMod
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-20-tallied";
+export const SCANNER_VERSION = "2026-09-20-nowindow";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -218,6 +218,9 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
 
   const teamEntries = Object.entries(probResult.probabilities);
   const drops = { live: 0, window: 0, unresolved: 0, closed: 0, error: 0, duplicate: 0 };
+  // "8 not-tradeable" told us nothing actionable. Counting the actual status
+  // strings turns it into "status=finalized x8", which is a fixable fact.
+  const statusCounts = {};
   let sampleReason = null;
   const openEvents = skipEvents instanceof Set ? skipEvents : new Set();
   const allowLive = config.allowLiveGames !== false;   // live trading is ON unless switched off
@@ -255,6 +258,8 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
       const market = res.market;
       const status = String(market?.status || "").toLowerCase();
       if (!market || !TRADEABLE.has(status)) {
+        const label = status || "missing";
+        statusCounts[label] = (statusCounts[label] || 0) + 1;
         drops.closed++;
         if (!sampleReason) sampleReason = `${teamName}: status "${status || "missing"}"`;
         return null;
@@ -350,6 +355,7 @@ export async function scanSport({ sportKey, config, bankroll, tickerMap, atCap, 
   const tally = {};
   const bump = (code) => { tally[code] = (tally[code] || 0) + 1; };
   for (const [k, n] of Object.entries(drops)) if (n) bump(`dropped:${k}`);
+  for (const [st, n] of Object.entries(statusCounts)) tally[`status:${st}`] = n;
   const maxSpread = config.maxSpreadCents ?? 6;
   let entered = 0;
 
