@@ -11,6 +11,7 @@ import { getRecentScores, findScoreForTeam } from "../scoresFetcher.js";
 import { getSharpProbabilities } from "../scraper.js";
 import { resolveTicker } from "../tickerResolver.js";
 import { discoverActiveSports } from "../sportsDiscovery.js";
+import { runCoverageCheck, REQUIRED_SPORTS, COVERAGE_VERSION } from "../coverageCheck.js";
 
 const V2 = "/trade-api/v2";
 
@@ -226,6 +227,46 @@ export function registerBotRoutes(app) {
       res.json(report);
     } catch (err) {
       res.status(500).json({ error: err.message, partial: report });
+    }
+  });
+
+  /**
+   * Per-sport coverage walk.
+   *
+   * Answers "would this sport trade if an edge existed", stage by stage, using
+   * the same functions the scanner uses. On demand only: it spends one odds
+   * credit per sport, so nothing here runs on a timer.
+   *
+   *   GET /api/coverage                      -> the 12 required sports
+   *   GET /api/coverage?sports=a,b           -> just those
+   *   GET /api/coverage?discovered=true      -> whatever the feed says is live
+   *   GET /api/coverage?sample=3             -> markets sampled per sport (1-12)
+   */
+  app.get("/api/coverage", async (req, res) => {
+    try {
+      let sports = null;
+
+      if (typeof req.query.sports === "string" && req.query.sports.trim()) {
+        sports = req.query.sports.split(",").map((s) => s.trim()).filter(Boolean);
+      } else if (req.query.discovered === "true") {
+        try {
+          const active = await discoverActiveSports();
+          // Union with the required list so a required sport going missing from
+          // discovery is visible as a row rather than silently absent.
+          sports = [...new Set([...REQUIRED_SPORTS, ...active])];
+        } catch (err) {
+          sports = REQUIRED_SPORTS;
+          res.set("X-Coverage-Note", `discovery failed: ${err.message}`);
+        }
+      }
+
+      const sampleSize = Math.min(12, Math.max(1, Number(req.query.sample) || 6));
+      const report = await runCoverageCheck({ sports, sampleSize });
+      report.requiredSports = REQUIRED_SPORTS;
+      report.coverageVersion = COVERAGE_VERSION;
+      res.json(report);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
   });
 }
