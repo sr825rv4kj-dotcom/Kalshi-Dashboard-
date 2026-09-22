@@ -209,8 +209,13 @@ const REASON_LABELS = {
   "no-model-for-sport": "no in-game model for that sport",
   "unmodellable": "could not model the game state",
   "no-fill": "order placed but nothing filled",
-  "skipped:shard-unfunded": "collateral was on the wrong Kalshi shard - order never placed",
   "skip-other": "other",
+
+  // A funding-routing miss, NOT an illiquid book. The edge was real and the
+  // size was there; Kalshi refused the order because the account's collateral
+  // was sitting on a different exchange shard. Counting it as "nothing filled"
+  // pointed the tuning at liquidity settings that had nothing to do with it.
+  "skipped:shard-unfunded": "collateral was on another shard - move requested, retried next scan",
 
   // --- Resolver refusals, itemised by cause --------------------------------
   // These replaced a single "no matching Kalshi market" row. Splitting them up
@@ -254,6 +259,9 @@ const NOT_A_GATE = new Set([
   "unresolved:no-series",
   "unresolved:draw-or-tie",
   "unresolved:fetch-failed",
+  // Self-clearing. The collateral move is already in flight; no threshold on
+  // this dashboard makes it arrive faster.
+  "skipped:shard-unfunded",
 ]);
 
 /**
