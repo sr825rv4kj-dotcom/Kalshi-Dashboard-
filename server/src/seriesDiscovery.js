@@ -1,24 +1,53 @@
 /**
  * seriesDiscovery.js
  *
- * Finds out which Kalshi series actually exist, instead of assuming.
+ * Works out which Kalshi series each odds-feed sport should trade against.
  *
- * THE BUG THIS FIXES. SPORT_SERIES_MAP held six hardcoded entries - NFL,
- * NCAAF, NBA, NCAAB, MLB, NHL - and sportsDiscovery filtered the odds feed
- * down to exactly those. Everything else was invisible. Traced against a live
- * Kalshi board of 86 markets: WNBA, ATP tennis, Caribbean Premier League
- * cricket and Brasileiro soccer were all running, five of them with a side
- * inside the tradeable price band, and the bot could not see a single one.
- * It sat idle looking at two MLB games priced 77/24 and 97/4 that were never
- * going to clear an edge bar.
+ * ---------------------------------------------------------------------------
+ * THE MATCHER USED TO BIND REAL MONEY TO THE WRONG LEAGUE (2026-09-22)
+ * ---------------------------------------------------------------------------
+ * The previous scorer awarded +10 for ANY substring hit anywhere in a series
+ * ticker, +8 more if the ticker contained "game", and accepted anything at or
+ * above 10. One substring was therefore always enough. Run against the live
+ * board, using the tickers the production log actually printed:
  *
- * Adding six more hardcoded rows would have gone stale the moment Kalshi
- * listed a new sport. So the map is now DISCOVERED: Kalshi publishes its own
- * series list at GET /series, which needs no authentication, and the bot reads
- * it and matches each odds-feed sport against what is really there.
+ *   soccer_brazil_serie_b          -> KXSERIECGAME   (18)  on the word "serie"
+ *   icehockey_sweden_hockey_league -> KXBALLERLEAGUEGAME (18) on "league"
+ *   basketball_wnba                -> KXWNBAASGAME   (18)  All-Star, not WNBA
  *
- * Every match and every miss is logged. A sport the bot cannot address is now
- * a visible line in the log rather than silence.
+ * A Brazilian club bound to an Italian league with 42 tradeable markets. The
+ * only thing that prevented a wrong-league fill was the ticker date gate in
+ * tickerResolver - one guard, load-bearing, with nothing behind it.
+ *
+ * And the decisive detail: baseball_mlb scored 18 too. So did soccer_epl. The
+ * correct bindings and the garbage bindings scored IDENTICALLY, which means no
+ * threshold could ever have separated them. Raising the bar to 19 would have
+ * switched the bot off; leaving it at 10 kept trading the wrong leagues.
+ *
+ * Worse, ties were resolved by list order. `if (sc > bestScore)` keeps the
+ * FIRST series seen at the top score, so KXSERIECGAME vs KXSERIEAGAME and
+ * KXWNBAASGAME vs KXWNBAGAME were decided by however Kalshi happened to order
+ * its response that morning. That is not a heuristic with a weak spot. That is
+ * a coin flip in front of the order router.
+ *
+ * WHAT REPLACES IT. Kalshi series tickers are structured: KX + CORE + GAME
+ * (or MATCH). The core is the league. So the core is extracted and matched
+ * ANCHORED - a token must BE the core, not merely appear somewhere inside it:
+ *
+ *   "mlb"    vs core "MLB"          -> exact, bind
+ *   "wnba"   vs core "WNBAAS"       -> not exact, refuse
+ *   "serie"  vs core "SERIEC"       -> not exact, refuse
+ *   "league" vs core "BALLERLEAGUE" -> not exact, refuse
+ *
+ * Under that rule every one of the 12 named sports still resolves, and all
+ * three wrong bindings above are refused. A tie at the top is a REFUSAL rather
+ * than a list-order coin flip, and the refusal is logged with both candidates
+ * so an ambiguity is something you can go and look at.
+ *
+ * The bar this sets is deliberately harsh: a sport whose league has no
+ * matching Kalshi core is simply not traded. Missing a sport costs nothing.
+ * Trading the wrong one costs the position.
+ * ---------------------------------------------------------------------------
  */
 
 import { appendLog } from "./stateStore.js";
@@ -26,12 +55,14 @@ import { appendLog } from "./stateStore.js";
 const V2 = "/trade-api/v2";
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;   // series lists barely move
 
+export const DISCOVERY_VERSION = "2026-09-22-anchored-core";
+
 let cache = null;
 
 /**
- * Confirmed mappings, kept as overrides because these six are in production
- * and known correct. Discovery fills in everything else; these are never
- * allowed to be overwritten by a weaker match.
+ * Confirmed mappings, kept as overrides because these are in production and
+ * known correct. Discovery fills in everything else; these are never allowed
+ * to be overwritten by a weaker match.
  */
 export const CONFIRMED_SERIES = {
   americanfootball_nfl: "KXNFLGAME",
@@ -46,37 +77,72 @@ export const CONFIRMED_SERIES = {
  * Words that describe the SPORT rather than the competition. They are stripped
  * when working out what makes a sport key distinctive, so soccer_epl is matched
  * on "epl" rather than on "soccer", which would match every league at once.
+ *
+ * "league" is now in here. It is not distinctive - it appears in Baller League,
+ * Major League Soccer, National League and a dozen others - and on its own it
+ * was enough to bind Swedish hockey to a streamer exhibition series.
  */
 const GENERIC_TOKENS = new Set([
   "americanfootball", "basketball", "baseball", "icehockey", "soccer", "tennis",
   "cricket", "golf", "mma", "boxing", "rugbyleague", "rugbyunion", "aussierules",
-  "football", "hockey", "sport", "sports",
+  "football", "hockey", "sport", "sports", "league", "liga", "serie", "division",
+  "cup", "open", "championship", "pro", "premier", "national",
 ]);
 
 /**
  * How leagues are written in English versus how an odds feed abbreviates them.
  * These are language facts, not assumptions about Kalshi's ticker format - the
- * match still has to find a real series before anything is used.
+ * match still has to find a real series core before anything is used.
+ *
+ * Note these are deliberately written as the CORE would appear: "laliga", not
+ * "la liga", because the comparison is against a ticker core with no spaces.
+ * Both spellings are kept so a title match can still use the spaced form.
  */
 const ALIASES = {
-  epl: ["premier league", "epl"],
-  spain_la_liga: ["la liga", "laliga"],
+  epl: ["epl", "premierleague"],
+  spain_la_liga: ["laliga"],
   germany_bundesliga: ["bundesliga"],
-  italy_serie_a: ["serie a", "seriea"],
-  france_ligue_one: ["ligue 1", "ligue1"],
-  usa_mls: ["mls", "major league soccer"],
-  uefa_champs_league: ["champions league", "ucl"],
-  brazil_campeonato: ["brazil", "brasileiro", "campeonato"],
+  italy_serie_a: ["seriea"],
+  italy_serie_b: ["serieb"],
+  france_ligue_one: ["ligue1", "ligueone"],
+  usa_mls: ["mls", "majorleaguesoccer"],
+  uefa_champs_league: ["ucl", "championsleague"],
+  uefa_europa_league: ["uel", "europaleague"],
+  brazil_campeonato: ["brasileirao", "brasileiro", "campeonato"],
   atp: ["atp"],
   wta: ["wta"],
   wnba: ["wnba"],
-  ncaaf: ["ncaaf", "college football"],
-  ncaab: ["ncaab", "college basketball"],
+  ncaaf: ["ncaaf"],
+  ncaab: ["ncaab"],
   mlb: ["mlb"],
   nhl: ["nhl"],
   nba: ["nba"],
   nfl: ["nfl"],
 };
+
+/**
+ * The league core of a Kalshi series ticker: KXNHLGAME -> NHL.
+ *
+ * The suffix strip runs twice because a few series end "...GAMES". Stripping
+ * is anchored at the ends only - nothing is removed from the middle, so
+ * BALLERLEAGUE stays BALLERLEAGUE and cannot be whittled down to LEAGUE.
+ */
+export function seriesCore(ticker) {
+  let c = String(ticker || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  c = c.replace(/^KX/, "");
+  for (let i = 0; i < 2; i++) c = c.replace(/(GAMES|GAME|MATCH|WINNER)$/, "");
+  return c;
+}
+
+/**
+ * All-star, pro-bowl and exhibition series. These are listed year-round and
+ * dead for most of it - KXWNBAASGAME returned 0 markets on every query shape
+ * in production, which is exactly what a dead series looks like from inside
+ * the scanner. They are never an acceptable answer for a regular-season key.
+ */
+export function isExhibitionCore(core) {
+  return /ALLSTAR|PROBOWL|EXHIB|FRIENDLY|PRESEASON/.test(core) || /^[A-Z]{3,}AS$/.test(core);
+}
 
 /** The distinctive parts of an odds-feed sport key, plus any known aliases. */
 export function distinctiveTokens(sportKey) {
@@ -87,20 +153,24 @@ export function distinctiveTokens(sportKey) {
   const out = new Set();
   for (const p of base) out.add(p);
 
+  // The joined form matters as much as the parts: soccer_spain_la_liga only
+  // becomes "laliga" once the segments are glued together, and "laliga" is the
+  // thing that actually equals a ticker core.
+  const allParts = parts.filter((p) => !["americanfootball", "basketball", "baseball", "icehockey", "soccer", "tennis", "cricket", "golf", "mma", "boxing"].includes(p));
+  if (allParts.length > 1) out.add(allParts.join(""));
+  if (base.length > 1) out.add(base.join(""));
+
   // Aliases match on whole segments only.
   //
   // This used to test `joined.endsWith(key)`, and "wnba" ends with "nba" - so
-  // basketball_wnba inherited every NBA alias. Proved harmful in testing: with
-  // an NBA series present and no WNBA series, WNBA resolved to KXNBAGAME and
-  // the bot would have traded men's basketball markets as if they were the
-  // women's game. A raw substring test is not good enough for something that
-  // decides which market real money goes into.
-  const joined = base.join("_");
-  const segments = new Set(base);
+  // basketball_wnba inherited every NBA alias. With an NBA series present and
+  // no WNBA series, WNBA would resolve to KXNBAGAME and the bot would trade
+  // men's basketball as if it were the women's game.
+  const joined = allParts.join("_");
+  const segments = new Set(parts);
   for (const [key, words] of Object.entries(ALIASES)) {
     const keyParts = key.split("_");
     const isWholeKey = joined === key;
-    // every part of a multi-word alias key must appear as its own segment
     const isSegmentMatch = keyParts.every((kp) => segments.has(kp));
     if (isWholeKey || isSegmentMatch) {
       for (const w of words) out.add(w);
@@ -110,29 +180,50 @@ export function distinctiveTokens(sportKey) {
 }
 
 /**
- * Scores how well a Kalshi series matches a sport. A per-game or per-match
- * series is strongly preferred over a season-long or futures market: buying
- * "who wins the league" is not what this bot does.
+ * Scores a series against a sport's tokens. ANCHORED, not substring.
+ *
+ * Only three things earn a bind:
+ *   100  a token IS the series core exactly
+ *    40  a token is the core with a country/gender qualifier attached that the
+ *        sport key also carries (e.g. token "mlscup" vs core "MLSCUP")
+ *    20  the series TITLE contains every distinctive token as a whole word
+ *
+ * Everything else scores 0. A partial overlap inside the core - the exact
+ * thing that produced SERIEC, BALLERLEAGUE and WNBAAS - is worth nothing.
  */
-function scoreSeries(series, tokens) {
-  const ticker = String(series.ticker || "").toLowerCase();
-  const title = String(series.title || "").toLowerCase();
-  const hay = `${ticker} ${title}`;
+export function scoreSeries(series, tokens) {
+  const core = seriesCore(series.ticker);
+  if (!core) return 0;
+  if (isExhibitionCore(core)) return 0;
 
-  let score = 0;
-  let matched = false;
+  const lowerCore = core.toLowerCase();
+  let best = 0;
+
   for (const t of tokens) {
-    if (ticker.includes(t)) { score += 10; matched = true; }
-    else if (title.includes(t)) { score += 6; matched = true; }
+    const tok = t.replace(/[^a-z0-9]/g, "");
+    if (!tok) continue;
+    if (tok === lowerCore) best = Math.max(best, 100);
   }
-  if (!matched) return 0;
+  if (best) return best;
 
-  if (/game|match|winner/.test(ticker)) score += 8;
-  if (/\bgame\b|\bmatch\b/.test(title)) score += 4;
-  // Futures and season-long markets are not per-event and are demoted hard.
-  if (/champion|season|award|mvp|playoff|finals|cup winner/.test(hay)) score -= 12;
+  // Whole-word title match, and ONLY if every distinctive token is present.
+  // One word in a title is how "league" found Baller League; requiring all of
+  // them means a title match has to actually describe the same competition.
+  const title = String(series.title || "").toLowerCase();
+  if (title) {
+    const words = new Set(title.split(/[^a-z0-9]+/).filter(Boolean));
+    const joinedTitle = title.replace(/[^a-z0-9]/g, "");
+    const meaningful = tokens.filter((t) => t.length >= 3);
+    if (meaningful.length) {
+      const allPresent = meaningful.every((t) => {
+        const tok = t.replace(/[^a-z0-9]/g, "");
+        return words.has(tok) || joinedTitle === tok;
+      });
+      if (allPresent) return 20;
+    }
+  }
 
-  return score;
+  return 0;
 }
 
 async function fetchSeries(kalshiGet) {
@@ -154,7 +245,7 @@ async function fetchSeries(kalshiGet) {
 
 /**
  * Builds sportKey -> Kalshi series ticker for every sport the odds feed offers.
- * Returns the confirmed six unchanged if discovery fails for any reason, so a
+ * Returns the confirmed rows unchanged if discovery fails for any reason, so a
  * Kalshi outage degrades coverage rather than stopping trading.
  */
 export async function discoverSeriesMap(kalshiGet, sportKeys = []) {
@@ -164,18 +255,19 @@ export async function discoverSeriesMap(kalshiGet, sportKeys = []) {
   try {
     series = await fetchSeries(kalshiGet);
   } catch (err) {
-    appendLog(`Series discovery failed (${err.message}) - falling back to the six confirmed sports.`, "warn");
+    appendLog(`Series discovery failed (${err.message}) - falling back to the confirmed sports.`, "warn");
     return { ...CONFIRMED_SERIES };
   }
 
   if (!series.length) {
-    appendLog("Series discovery returned nothing - falling back to the six confirmed sports.", "warn");
+    appendLog("Series discovery returned nothing - falling back to the confirmed sports.", "warn");
     return { ...CONFIRMED_SERIES };
   }
 
   const map = { ...CONFIRMED_SERIES };
   const found = [];
   const missed = [];
+  const ambiguous = [];
 
   for (const sportKey of sportKeys) {
     if (CONFIRMED_SERIES[sportKey]) continue;     // never override a known-good row
@@ -183,29 +275,48 @@ export async function discoverSeriesMap(kalshiGet, sportKeys = []) {
     const tokens = distinctiveTokens(sportKey);
     if (!tokens.length) { missed.push(sportKey); continue; }
 
-    let best = null, bestScore = 0;
+    let bestScore = 0;
+    let winners = [];
     for (const s of series) {
       const sc = scoreSeries(s, tokens);
-      if (sc > bestScore) { bestScore = sc; best = s; }
+      if (sc <= 0) continue;
+      if (sc > bestScore) { bestScore = sc; winners = [s]; }
+      else if (sc === bestScore) winners.push(s);
     }
 
-    // A single weak token hit is not enough to start trading a market on.
-    if (best && bestScore >= 10) {
-      map[sportKey] = best.ticker;
-      found.push(`${sportKey} -> ${best.ticker}`);
-    } else {
+    if (!winners.length || bestScore < 20) { missed.push(sportKey); continue; }
+
+    // A TIE IS A REFUSAL.
+    //
+    // The old code took whichever tied series Kalshi happened to list first,
+    // which is how the WNBA All-Star series beat the WNBA game series. If the
+    // matcher cannot tell two competitions apart, neither can the bot, and the
+    // right answer is to trade neither and say so.
+    const distinct = [...new Set(winners.map((w) => w.ticker))];
+    if (distinct.length > 1) {
+      ambiguous.push(`${sportKey} -> ${distinct.join(" / ")}`);
       missed.push(sportKey);
+      continue;
     }
+
+    map[sportKey] = distinct[0];
+    found.push(`${sportKey} -> ${distinct[0]}`);
   }
 
   appendLog(
     `Series discovery: ${series.length} Kalshi sports series seen, ` +
     `${Object.keys(map).length} sports addressable` +
-    (found.length ? `. New: ${found.join(", ")}` : "") +
-    (missed.length ? `. No series for: ${missed.join(", ")}` : "")
+    (found.length ? `. Matched: ${found.join(", ")}` : "") +
+    (ambiguous.length ? `. REFUSED as ambiguous: ${ambiguous.join(", ")}` : "")
   );
+  if (missed.length) {
+    appendLog(
+      `Series discovery: no Kalshi series for ${missed.length} sport(s) - they are not scanned and cost nothing. ` +
+      `First few: ${missed.slice(0, 8).join(", ")}`
+    );
+  }
 
-  cache = { map, at: Date.now(), seriesCount: series.length, found, missed };
+  cache = { map, at: Date.now(), seriesCount: series.length, found, missed, ambiguous };
   return map;
 }
 
@@ -218,6 +329,7 @@ export function lastDiscovery() {
     addressable: Object.keys(cache.map).length,
     found: cache.found,
     missed: cache.missed,
+    ambiguous: cache.ambiguous || [],
     map: cache.map,
   };
 }
