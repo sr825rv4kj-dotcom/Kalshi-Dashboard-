@@ -1,5 +1,14 @@
 import React, { useEffect, useState } from "react";
 
+/** Plain-language age, so "is it running" is answerable at a glance. */
+function formatAge(seconds) {
+  if (seconds == null) return "never";
+  if (seconds < 90) return `${Math.max(0, Math.round(seconds))}s`;
+  const m = Math.round(seconds / 60);
+  if (m < 90) return `${m} min`;
+  return `${(m / 60).toFixed(1)}h`;
+}
+
 /**
  * Strategy Review.
  *
@@ -95,26 +104,64 @@ export default function StrategyReviewPanel({ apiBase }) {
       {data?.lastScan && (
         <div className="bot-subsection">
           <div className="field-label">Why it is not trading right now</div>
+
+          {/*
+            THE HEADLINE USED TO SAY "LAST SCAN", AND THAT WAS NOT TRUE.
+            The server keeps one entry per sport for an hour and sums them all,
+            so a sport scanned once went on contributing its counts to every
+            refresh for the next hour. That is why the same three rows - 5
+            no-fills, 4 name misses, 11 feed errors - appeared unchanged at
+            8:19pm, 9:58pm and 5:39am the next morning. It now says what window
+            it is really covering, and how old the freshest scan in it is.
+          */}
+          {data.lastScan.stale && (
+            <div className="error-banner" style={{ marginTop: 8 }}>
+              <strong>The bot is not scanning.</strong> The most recent scan was{" "}
+              {formatAge(data.lastScan.ageSeconds)} ago; it should run every 20s to 5 min
+              depending on the hour. Check that the bot is started, and look for a
+              circuit breaker or a day halt in the log.
+            </div>
+          )}
+
           <div className="sr-scan-head">
-            Last scan saw <strong>{data.lastScan.seen}</strong> line(s) across{" "}
-            <strong>{data.lastScan.sports}</strong> sport(s) and entered{" "}
+            <strong>{data.lastScan.seen}</strong> line(s) across{" "}
+            <strong>{data.lastScan.sports}</strong> sport(s) in the last{" "}
+            <strong>{data.lastScan.windowMinutes}</strong> min, entered{" "}
             <strong className={data.lastScan.entered ? "pos" : "neg"}>{data.lastScan.entered}</strong>.
           </div>
+          <div className="sr-hint" style={{ marginTop: 4 }}>
+            Freshest scan {formatAge(data.lastScan.ageSeconds)} ago
+            {data.lastScan.staleSports > 0 && (
+              <> · {data.lastScan.staleSports} of {data.lastScan.sports} sport(s) not
+              re-scanned in over 10 min, so their counts below are carried over</>
+            )}
+          </div>
+
           {data.lastScan.blockers.length === 0 ? (
             <div className="empty-state">Nothing was refused - the bot is taking everything that qualifies.</div>
           ) : (
             <div className="sr-table">
               {data.lastScan.blockers.map((b) => (
-                <div key={b.code} className="sr-blocker">
-                  <span className="sr-blocker-n">{b.count}</span>
-                  <span className="sr-blocker-label">{b.label}</span>
+                <div key={b.code}>
+                  <div className="sr-blocker">
+                    <span className="sr-blocker-n">{b.count}</span>
+                    <span className="sr-blocker-label">{b.label}</span>
+                  </div>
+                  {/* One worked example per code. A count is a number; an
+                      example is something you can actually go and fix. */}
+                  {b.example && (
+                    <div className="ledger-reason" style={{ margin: "2px 0 10px 52px", fontSize: 13, opacity: 0.75 }}>
+                      e.g. {b.example}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
           )}
           <div className="sr-hint">
             The top row is the gate doing the most blocking. If it is a threshold
-            you set, that is the one to loosen.
+            you set, that is the one to loosen. Rows marked as board conditions
+            are not thresholds - no setting creates a market that is not there.
           </div>
         </div>
       )}
