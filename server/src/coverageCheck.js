@@ -35,7 +35,7 @@
 
 import { kalshiGet } from "./kalshiClient.js";
 import { getSharpProbabilities } from "./scraper.js";
-import { resolveTicker, getSeriesMap } from "./tickerResolver.js";
+import { resolveTicker, getSeriesMap, getFetchReport } from "./tickerResolver.js";
 import { assessOpportunity } from "./riskManager.js";
 import { priceFor, entryTiming, SCANNER_VERSION } from "./scanner.js";
 import { paramsFor, SPORT_PARAMS } from "./liveModel.js";
@@ -45,7 +45,7 @@ import { loadConfig } from "./configStore.js";
 const V2 = "/trade-api/v2";
 const TRADEABLE = new Set(["open", "active"]);
 
-export const COVERAGE_VERSION = "2026-09-21-stagewalk";
+export const COVERAGE_VERSION = "2026-09-22-raw-board";
 
 /**
  * The sports that must work. Runtime discovery can and does add more; these
@@ -308,6 +308,39 @@ export async function checkSport(sportKey, { config, sampleSize = 6 } = {}) {
   result.counts.priced = priced;
   result.counts.wouldEnter = wouldEnter;
   result.gateCodes = gateCodes;
+
+  // ---- THE RAW KALSHI BOARD, PRINTED VERBATIM --------------------------
+  //
+  // This panel has always shown which ticker a team RESOLVED to, and never
+  // what Kalshi actually publishes. That gap is why the resolver was rewritten
+  // twice against an imagined market shape. Both rewrites assumed
+  // yes_sub_title carried the full team name. For MLB it carries the city
+  // alone - "Detroit", not "Detroit Tigers" - so the second attempt demanded a
+  // mascot that does not exist in the data and refused all 16 lines, and the
+  // bot traded nothing for a day.
+  //
+  // The report is already in memory: tickerResolver records it on every fetch.
+  // It was simply never surfaced. Patching it onto the series stage HERE
+  // rather than where that stage is created is deliberate - the fetch happens
+  // during resolution, so at creation time there is nothing to report yet.
+  //
+  // With the real ticker and the real yes_sub_title on screen, any future
+  // change to name or code matching can be checked against what Kalshi sends
+  // instead of against an assumption about it.
+  try {
+    const rep = seriesTicker ? getFetchReport(seriesTicker) : null;
+    const seriesStage = stages.find((s) => s.stage === "series");
+    if (rep && seriesStage) {
+      seriesStage.fetchReport = rep;
+      if (rep.sample && rep.sample.length) {
+        seriesStage.detail += ` | RAW BOARD (${rep.total} markets via ${rep.winner}): ` + rep.sample
+          .map((m) => `${m.ticker} YES="${m.yes_sub_title ?? "(none)"}" title="${String(m.title ?? "").slice(0, 44)}" ${m.status}`)
+          .join("  ::  ");
+      } else {
+        seriesStage.detail += ` | RAW BOARD: 0 markets (${JSON.stringify(rep.tried ?? [])})`;
+      }
+    }
+  } catch { /* a diagnostic must never break the walk it is diagnosing */ }
 
   stages.push(stage("resolve", resolved > 0,
     `${resolved}/${sample.length} team name(s) resolved to a Kalshi ticker` +
