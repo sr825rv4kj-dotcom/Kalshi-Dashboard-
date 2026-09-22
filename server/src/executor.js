@@ -20,7 +20,7 @@ const V2 = "/trade-api/v2";
  */
 const ORDERS_PATH = `${V2}/portfolio/events/orders`;
 
-export const EXECUTOR_VERSION = "2026-09-22-nonblocking-collateral";
+export const EXECUTOR_VERSION = "2026-09-22-auto-routed";
 
 const ALLOCATION_PATH = `${V2}/portfolio/target_balance_allocation`;
 
@@ -108,7 +108,12 @@ export async function readShardBalances() {
 /**
  * ASKS KALSHI TO MOVE COLLATERAL, AND DOES NOT STAND THERE WATCHING.
  *
- * This used to poll for a full SIXTY SECONDS, inside the scan loop, before
+ * This is now a LAST RESORT and should essentially never run. Orders no longer
+ * pin themselves to a shard (see placeIOC), so Kalshi routes them itself and
+ * there is nothing to move. It is kept only for the case where Kalshi rejects
+ * an auto-routed order for balance anyway.
+ *
+ * It used to poll for a full SIXTY SECONDS, inside the scan loop, before
  * giving up on one market. From the live log:
  *
  *     6:19:18  Shard 3 has no collateral for ...NYMTEX-NYM - reallocating.
@@ -116,28 +121,20 @@ export async function readShardBalances() {
  *     6:20:19  Skipping ...NYMTEX-NYM: collateral has not reached shard 3 yet.
  *
  * Sixty-one seconds, one market, no trade - and at a 20s cadence that is three
- * entire scan cycles skipped, every time, for every candidate that happens to
- * sit on an unfunded shard. That alone is why a bot with ten slots was holding
- * one position.
- *
- * Worse, the wait could not succeed. It posts percent:100 to a single shard,
- * but collateral backing an OPEN POSITION on another shard is not free to
- * move, so "put everything here" is a request Kalshi cannot honour while
- * anything is open. The bot waited a minute for something that was never going
- * to arrive, then repeated it on the next scan.
- *
- * The transfer is asynchronous on Kalshi's side regardless, so waiting on it
- * synchronously was never buying anything. The request is fired, the market is
- * skipped, and the NEXT scan - seconds later - finds the shard funded and
- * takes the trade. A short confirmation probe is kept only so the log can say
- * whether money actually started moving.
+ * entire scan cycles skipped, every time. The request is now fired, the market
+ * is skipped, and the next scan takes it. A short probe is kept only so the
+ * log can say whether money actually started moving.
  */
 async function requestCollateralMove(exchangeIndex, needDollars = 0, { probeMs = 9000 } = {}) {
   try {
-    await kalshiPost(ALLOCATION_PATH, {
+    // The response was previously discarded, which left the one call that
+    // mattered completely unobservable: it returned 2xx while moving nothing,
+    // and nothing in the log could show that. It is logged now.
+    const res = await kalshiPost(ALLOCATION_PATH, {
       allocations: [{ exchange_index: exchangeIndex, percent: 100 }],
       resting_margin_reservation: "max",
     });
+    appendLog(`Allocation request for shard ${exchangeIndex} accepted by Kalshi: ${JSON.stringify(res).slice(0, 300)}`);
   } catch (err) {
     appendLog(`Could not request collateral for shard ${exchangeIndex}: ${err.message}`, "warn");
     return false;
@@ -216,7 +213,31 @@ async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = fals
     post_only: false,
   };
   if (reduceOnly) body.reduce_only = true;
-  if (exchangeIndex != null) body.exchange_index = exchangeIndex;
+
+  // EXCHANGE_INDEX IS DELIBERATELY NOT SENT.
+  //
+  // This one field is why the bot held zero positions with a funded account.
+  // Kalshi's API changelog:
+  //
+  //   "Exchange auto-routing enabled by default when providing market_ticker
+  //    and excluding exchange_index parameter."
+  //
+  // So sending the market's own shard index DISABLES auto-routing and pins the
+  // order to that shard. On 2026-09-22 every viable MLB market sat on shard 3,
+  // shard 3 held $0.00, and all six positive-EV candidates were rejected -
+  // while the account's whole balance sat idle on another shard with NO open
+  // positions holding it there.
+  //
+  // The reallocation dance built around that rejection could never have fixed
+  // it. The POST returned 2xx every time - there is no "Could not request
+  // collateral" line anywhere in the production log - so Kalshi was accepting
+  // the request and treating it as a no-op, and the bot waited on money that
+  // was never in transit. Omitting the field hands routing back to Kalshi,
+  // which is what it does by default and what it does correctly.
+  //
+  // The caller still passes exchangeIndex; it is recorded on the position and
+  // used by the balance-error fallback below, but it never goes on the order.
+  void exchangeIndex;
 
   let res;
   try {
@@ -224,11 +245,12 @@ async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = fals
   } catch (err) {
     // Kalshi reports a shard with no collateral as either
     // insufficient_shard_balance (404) or the generic insufficient_balance
-    // (400). Both mean the same thing when the account plainly has cash:
-    // the money is sitting on a different shard than this market trades on.
+    // (400). Reaching here now means auto-routing itself could not find the
+    // money, which is a genuinely different situation from the one this used
+    // to fire on constantly.
     const isBalanceIssue = /insufficient_(shard_)?balance/.test(String(err.message));
     if (isBalanceIssue && exchangeIndex != null) {
-      appendLog(`Shard ${exchangeIndex} has no collateral for ${ticker} - reallocating.`, "warn");
+      appendLog(`Auto-routed order for ${ticker} still refused for balance - requesting collateral on shard ${exchangeIndex}.`, "warn");
       const needDollars = (clampPrice(limitCents) / 100) * Number(contracts) * 1.15; // + fee headroom
       const funded = await requestCollateralMove(exchangeIndex, needDollars);
       if (!funded) {
@@ -293,11 +315,6 @@ export async function enterPosition({
 
   let result;
   try {
-    // No pre-emptive reallocation. The old code moved collateral whenever the
-    // target shard differed from the last one used, which on a multi-shard
-    // board meant a transfer - and a wait - before most orders. The order is
-    // simply attempted; if Kalshi rejects it for collateral, the handler below
-    // requests the move and leaves the market for the next scan.
     result = await placeIOC({ ticker, side: "bid", limitCents, contracts, exchangeIndex });
   } catch (err) {
     // A collateral-routing failure is not a system fault. Throwing here tripped
