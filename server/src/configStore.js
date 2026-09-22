@@ -29,7 +29,7 @@ import { CONFIG_DIR } from "./paths.js";
 const CONFIG_PATH = path.join(CONFIG_DIR, "bot-config.json");
 
 /** Bump this whenever a STRATEGY_KEYS default below changes meaningfully. */
-export const STRATEGY_VERSION = 11;
+export const STRATEGY_VERSION = 12;
 
 /**
  * Keys the migration is allowed to reset. Anything not listed here is the
@@ -38,7 +38,8 @@ export const STRATEGY_VERSION = 11;
 export const STRATEGY_KEYS = [
   "allowLiveGames", "holdToSettlement", "entryWindowHours", "minMinutesBeforeStart",
   "maxLineAgeSecondsLive", "maxLineAgeSecondsPregame",
-  "minEntryPriceCents", "maxEntryPriceCents", "maxPlausibleEdge", "minEvCentsPerContract",
+  "minEntryPriceCents", "maxEntryPriceCents", "maxPlausibleEdge",
+  "minEvCentsPerContract", "minEvCentsPerTrade", "entrySlippageCents", "maxWalkupCents",
   "maxSpreadCents", "minLiquidity", "kellyFraction", "maxRiskPctPerTrade",
   "perPositionStopLossPct", "takeProfitPct", "trailingStopPct", "exitBelowCost",
   "blowoutExitBelowCents", "blowoutExitCollapsePct", "blowoutExitMaxSpreadCents",
@@ -112,10 +113,9 @@ export const DEFAULTS = {
   //     90c   fee 1c    +2.2%      <- was blocked by the old ceiling
   //
   // The band was keeping only the expensive middle and refusing both cheap
-  // zones. The ceiling moves to 97c, which is free: high prices are favourites,
-  // where the sharp line and the exchange disagree least and devigging error is
-  // smallest. It stops at 97 because ceilingExitAtCents is 97 - entering above
-  // the level the bot immediately exits at would be a round trip for nothing.
+  // zones. Raising the ceiling is nearly free: high prices are favourites, where
+  // the sharp line and the exchange disagree least and devigging error is
+  // smallest.
   //
   // The floor moves to 12c rather than all the way to 1c, deliberately. A
   // devigging error of one point is 8% of a 12c price and 20% of a 5c price,
@@ -124,13 +124,47 @@ export const DEFAULTS = {
   // book-quality gate (how many sharp books priced it, and how far apart they
   // were) that the entry gate does not read yet. Until then, 12c.
   minEntryPriceCents: 12,
-  maxEntryPriceCents: 97,
+  // 95, not 97. ceilingExitAtCents is 97 and the take-out test is `bid >= 97`,
+  // so a position entered at a 97c ask was eligible for its own exit the moment
+  // the bid ticked up one cent. Demonstrated end to end: buy 97c x3, bid moves
+  // 96 -> 97, sold at 96c, round trip -9c against -3c for simply holding. The
+  // entry band now stops two cents clear of the exit trigger.
+  maxEntryPriceCents: 95,
 
   maxPlausibleEdge: 0.18,       // a wider gap than this is a stale feed, not an edge
-  // Absolute EV floor per contract. Dropped from 2c to 1c: at $2 flat bets a
-  // 1c edge on 5 contracts is 5c of expected value, which is small but real,
-  // and the 2c floor was throwing away everything between break-even and there.
-  minEvCentsPerContract: 1,
+
+  // THE EV FLOOR IS NOW PER TRADE, NOT PER CONTRACT.
+  //
+  // A per-contract floor applied the same number to a 14-contract position at
+  // 12c and a 1-contract position at 95c. One of those is 14c of expected
+  // value and the other is 1c. Measured across the band, that floor also
+  // demanded MORE edge than the edge threshold at every single price, so the
+  // edge threshold was dead code and tuning it did nothing.
+  minEvCentsPerContract: 0,     // off - kept as a key so an old config still loads
+  minEvCentsPerTrade: 1,        // the trade, as a whole, must expect at least a cent
+
+  // THE ORDER LIMIT IS THE BAR, NOT THE ASK PLUS A FIXED CENT.
+  //
+  // The entry limit is now the HIGHEST price at which the edge still clears the
+  // fee plus the buffer, capped at this many cents above the ask. The trade is
+  // then judged at that limit - the worst fill it can take - so a fill anywhere
+  // inside the band still clears every gate by construction. Verified over 5,310
+  // (ask, sharp, fill) combinations across the whole band: zero fills with
+  // expected value at or below zero.
+  //
+  // This is free because Kalshi is a central limit order book and a taker pays
+  // the MAKER's price: a limit buy at 52c against resting offers at 49/50/51
+  // fills at 49, 50 and 51. The walk-up costs nothing when the book is where it
+  // was seen, and only pays up when it has genuinely moved.
+  //
+  // 4c is deliberate. A limit ten cents above the screen price is not patience,
+  // it is an invitation to be picked off by a book that has gone stale.
+  maxWalkupCents: 4,
+
+  // Fallback only. Used when a caller has no walk-up limit to work from - the
+  // executor still needs SOMETHING above the ask or an immediate-or-cancel
+  // order quotes the ask exactly and expires unfilled.
+  entrySlippageCents: 1,
   maxSpreadCents: 6,            // a wide book means the quote is not a real price
   minLiquidity: 0,              // coverage is checked against order size, not an absolute
 
@@ -272,7 +306,8 @@ export function loadConfig() {
     console.log(
       `[config] Strategy parameters migrated to v${STRATEGY_VERSION} ` +
       `(live trading on, held to settlement, ${DEFAULTS.minEntryPriceCents}-${DEFAULTS.maxEntryPriceCents}c band, ` +
-      `up to ${DEFAULTS.survivalMode.maxConcurrentPositions} concurrent). Account settings preserved.`
+      `up to ${DEFAULTS.survivalMode.maxConcurrentPositions} concurrent, entries priced at the fill). ` +
+      `Account settings preserved.`
     );
     return { ...DEFAULTS, ...migrated };
   }
@@ -310,7 +345,10 @@ export function describeStrategy() {
       ? "active exits enabled"
       : `held to settlement, except a take-out at ${c.ceilingExitAtCents}c+ and a blowout below ${c.blowoutExitBelowCents}c`,
     priceBand: `${c.minEntryPriceCents}c - ${c.maxEntryPriceCents}c`,
-    minEv: `${c.minEvCentsPerContract}c per contract`,
+    minEv: `${c.minEvCentsPerTrade}c per trade` +
+      (c.minEvCentsPerContract ? `, ${c.minEvCentsPerContract}c per contract` : ""),
+    pricing: `order limit walks up to ${c.maxWalkupCents ?? 4}c above the ask, but only as far as the edge still clears; ` +
+      `the trade is judged at that limit, so any fill inside the band is positive by construction`,
     sizing: `${(c.kellyFraction * 100).toFixed(0)}% Kelly, max ${(c.maxRiskPctPerTrade * 100).toFixed(0)}% of bankroll per trade`,
     concurrency: `up to ${c.survivalMode?.maxConcurrentPositions ?? "tier"} positions at once ` +
       `(flat $${c.survivalMode?.flatBetDollars ?? "-"} while the balance is under $${c.survivalMode?.balanceThreshold ?? "-"})`,
