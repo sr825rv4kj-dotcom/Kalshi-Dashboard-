@@ -66,7 +66,7 @@
 import { kalshiGet } from "./kalshiClient.js";
 import { getSharpProbabilities } from "./scraper.js";
 import { assessOpportunity } from "./riskManager.js";
-import { enterPosition } from "./executor.js";
+import { enterPosition, readShardBalances } from "./executor.js";
 import { appendLog, loadState, saveState } from "./stateStore.js";
 import { resolveTicker } from "./tickerResolver.js";
 import { getLiveScores, findLiveGameForTeam } from "./scoresFetcher.js";
@@ -74,10 +74,30 @@ import { corroboratedProbability, fractionRemaining, paramsFor } from "./liveMod
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-21-walkup";
+export const SCANNER_VERSION = "2026-09-22-shard-aware";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
+
+/**
+ * Where the collateral actually is, cached briefly.
+ *
+ * Kalshi splits an account's cash across exchange shards, and an order against
+ * a shard holding nothing is rejected however good the trade is. The scanner
+ * used to discover that one market at a time, at the cost of a blocking
+ * collateral move per miss. Knowing up front which shards are funded means the
+ * funded ones get traded FIRST, while a move is requested in the background
+ * for the rest.
+ *
+ * One call every 30s across every sport, not one per market.
+ */
+let shardCache = { at: 0, balances: null };
+async function fundedShards() {
+  if (Date.now() - shardCache.at < 30_000) return shardCache.balances;
+  const balances = await readShardBalances();
+  shardCache = { at: Date.now(), balances };
+  return balances;
+}
 
 /**
  * Where a game sits relative to its start time.
@@ -231,7 +251,7 @@ export async function priceFor(ticker, market) {
  * markets seen, 14 outside the price band, 6 edge too small, 3 stale line. The
  * gate to loosen stops being a matter of opinion.
  */
-export function recordScanTally(sportKey, tally, seen, entered) {
+export function recordScanTally(sportKey, tally, seen, entered, samples = {}) {
   try {
     const state = loadState();
     state.lastScan = state.lastScan || {};
@@ -239,6 +259,7 @@ export function recordScanTally(sportKey, tally, seen, entered) {
       at: new Date().toISOString(),
       seen, entered,
       reasons: tally,
+      samples,
     };
     // Keep only sports seen in the last hour so this cannot grow unbounded.
     const cutoff = Date.now() - 60 * 60 * 1000;
@@ -285,7 +306,14 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   // can now reach bump() without hitting the temporal dead zone.
   // ---------------------------------------------------------------------
   const tally = {};
-  const bump = (code) => { tally[code] = (tally[code] || 0) + 1; };
+  // ONE WORKED EXAMPLE PER CODE. "no-name-match x4" is a number; it is not a
+  // thing anyone can fix. "no-name-match x4 - e.g. Sporting KC: no KXMLSGAME
+  // market has it on its YES side among 8 same-date markets" is a bug report.
+  const samples = {};
+  const bump = (code, example = null) => {
+    tally[code] = (tally[code] || 0) + 1;
+    if (example && !samples[code]) samples[code] = String(example).slice(0, 220);
+  };
   const rejected = [];
 
   let probResult;
@@ -338,7 +366,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         // was one dead end; "18 wrong-date, 11 opponent-side-only, 4
         // none-tradeable" is three fixable things.
         drops.unresolved++;
-        bump(`unresolved:${resolved.code || "unknown"}`);
+        bump(`unresolved:${resolved.code || "unknown"}`, `${teamName}: ${resolved.reason}`);
         if (!sampleReason) sampleReason = `${teamName}: ${resolved.reason}`;
         return null;
       }
@@ -408,7 +436,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           const game = findLiveGameForTeam(events, c.teamName);
           if (!game) {
             vetoed.push(`${c.teamName}: in play but no live score found - cannot check the line against the game`);
-            bump("no-live-score-match");
+            bump("no-live-score-match", `${c.teamName}: in play, no live score row matched this team`);
             return false;
           }
 
@@ -418,7 +446,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           });
           if (!corr.usable) {
             vetoed.push(`${c.teamName}: in play, could not model the game state`);
-            bump("unmodellable");
+            bump("unmodellable", `${c.teamName}: in play, the game state could not be modelled`);
             return false;
           }
 
@@ -429,7 +457,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
               `${(corr.modelProbability * 100).toFixed(0)}% (${game.homeScore}-${game.awayScore}, ` +
               `${(frac * 100).toFixed(0)}% left) - ${corr.disagreementPoints.toFixed(0)}pt gap exceeds ${maxDisagree}, line is stale`
             );
-            bump("model-disagrees");
+            bump("model-disagrees", vetoed[vetoed.length - 1]);
             return false;
           }
 
@@ -464,9 +492,38 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   }
   for (const [st, n] of Object.entries(statusCounts)) tally[`status:${st}`] = n;
 
-  const maxSpread = config.maxSpreadCents ?? 6;
+  const maxSpread = config.maxSpreadCents ?? 25;
   let entered = 0;
   let stopScanning = false;
+
+  // FUNDED SHARDS FIRST.
+  //
+  // A candidate on a shard with no collateral cannot fill until Kalshi moves
+  // money, which takes seconds it does not control. A candidate on a funded
+  // shard can fill right now. Trying them in book order meant a single
+  // unfunded market at the front of the list stalled everything behind it -
+  // which is exactly what the live log showed at 6:19am, 61 seconds spent on
+  // one MLB market while the rest of the board went untouched.
+  //
+  // Sorting costs nothing and changes the outcome: the fundable trades happen
+  // this scan, and the others are requested and picked up on the next one.
+  let balances = null;
+  try { balances = await fundedShards(); } catch { /* unknown - keep book order */ }
+  if (balances) {
+    const fundedFor = (c) => {
+      const idx = c.market?.exchange_index;
+      if (idx == null) return 1;                       // unknown shard - do not penalise
+      return (balances[Number(idx)] ?? 0) > 0 ? 1 : 0;
+    };
+    viable.sort((a, b) => fundedFor(b) - fundedFor(a));
+    const unfunded = viable.filter((c) => fundedFor(c) === 0).length;
+    if (unfunded) {
+      appendLog(
+        `${sportKey}: ${unfunded} of ${viable.length} candidate(s) sit on a shard with no collateral - ` +
+        `funded shards are traded first.`
+      );
+    }
+  }
 
   for (const c of viable) {
     if (atCap()) {
@@ -478,7 +535,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
 
     const askCents = c.pricing.askCents;
     if (askCents <= 0 || askCents >= 100) {
-      bump("no-price");
+      bump("no-price", `${c.ticker}: ${c.pricing.source}`);
       rejected.push(`${c.ticker}: ${c.pricing.source}`);
       continue;
     }
@@ -486,8 +543,9 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // A wide book means the quoted ask is not a price anyone is trading at,
     // and any edge measured against it is measurement error.
     if (maxSpread && c.pricing.spreadCents != null && c.pricing.spreadCents > maxSpread) {
-      bump("spread-too-wide");
-      rejected.push(`${c.ticker}: ${c.pricing.spreadCents}c spread exceeds the ${maxSpread}c limit - the quote is not a real price`);
+      const wide = `${c.ticker}: ${c.pricing.spreadCents}c spread exceeds the ${maxSpread}c limit`;
+      bump("spread-too-wide", wide);
+      rejected.push(wide);
       continue;
     }
 
@@ -516,10 +574,9 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     });
 
     if (assessment.action === "skip") {
-      bump(assessment.code || "skip-other");
-      rejected.push(
-        `${c.ticker} ${askCents}c [${c.pricing.source}] (sharp ${(c.trueProbability * 100).toFixed(1)}%): ${assessment.reason}`
-      );
+      const line = `${c.ticker} ${askCents}c [${c.pricing.source}] (sharp ${(c.trueProbability * 100).toFixed(1)}%): ${assessment.reason}`;
+      bump(assessment.code || "skip-other", line);
+      rejected.push(line);
       continue;
     }
 
@@ -563,8 +620,22 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       continue;
     }
 
-    if (result && result.filled > 0) { openEvents.add(eventKeyOf(c.ticker)); entered += 1; }
-    else bump("no-fill");
+    if (result && result.filled > 0) {
+      openEvents.add(eventKeyOf(c.ticker));
+      entered += 1;
+    } else if (result && result.skipped) {
+      // NOT the same thing as an order that expired. The executor reports
+      // `skipped: "shard-unfunded"` when Kalshi rejected the order because the
+      // account's collateral is sitting on a different exchange shard than the
+      // market trades on - the edge was real, the size was there, and the
+      // trade was lost to plumbing. Counting that as "order placed but nothing
+      // filled" made a funding problem look like an illiquid book, which is
+      // the opposite of what it is and points at the wrong fix.
+      bump(`skipped:${result.skipped}`, `${c.ticker}: ${result.skipped}`);
+      rejected.push(`${c.ticker}: order not placed - ${result.skipped}`);
+    } else {
+      bump("no-fill", `${c.ticker}: limit ${assessment.limitCents}c, nothing crossed before the order expired`);
+    }
   }
 
   const tallyLine = Object.entries(tally)
@@ -577,6 +648,6 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   if (rejected.length) {
     appendLog(`${sportKey}: e.g. ${rejected[0]}`);
   }
-  recordScanTally(sportKey, tally, teamEntries.length, entered);
+  recordScanTally(sportKey, tally, teamEntries.length, entered, samples);
   return stopScanning;
 }
