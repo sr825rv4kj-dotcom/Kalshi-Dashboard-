@@ -29,7 +29,7 @@ import { CONFIG_DIR } from "./paths.js";
 const CONFIG_PATH = path.join(CONFIG_DIR, "bot-config.json");
 
 /** Bump this whenever a STRATEGY_KEYS default below changes meaningfully. */
-export const STRATEGY_VERSION = 12;
+export const STRATEGY_VERSION = 13;
 
 /**
  * Keys the migration is allowed to reset. Anything not listed here is the
@@ -165,7 +165,31 @@ export const DEFAULTS = {
   // executor still needs SOMETHING above the ask or an immediate-or-cancel
   // order quotes the ask exactly and expires unfilled.
   entrySlippageCents: 1,
-  maxSpreadCents: 6,            // a wide book means the quote is not a real price
+
+  // THE SPREAD GATE WAS A LEFTOVER FROM WHEN THIS BOT FLIPPED POSITIONS.
+  //
+  // At 6c it refused 18 of 92 lines in a single scan - a fifth of the board -
+  // for a risk that does not apply to a position held to settlement.
+  //
+  // The bot buys YES by selling NO to a resting bidder, so an "ask" of 49c
+  // derived from a 51c NO bid is a REAL, fillable order, not an estimate. And
+  // the value of holding it does not depend on the book at all:
+  //
+  //     EV = p*100 - price - fee
+  //
+  // The spread does not appear in that expression, because settlement is FREE
+  // and pays 100 or 0 whatever the book looks like at the time. Measured at a
+  // 56% sharp line against a 49c fill, EV held is +5.0c per contract at a 2c
+  // spread and +5.0c at a 29c spread - identical. It is only selling back that
+  // a wide book punishes, and the two exits that sell already carry their own
+  // spread guards (3c on the ceiling exit, 2c on the blowout).
+  //
+  // Liquidity is still checked, separately and properly: passesLiquidityFilter
+  // requires 1.5x the order size resting at the price. That is the real guard.
+  //
+  // 25c rather than off entirely - a spread wider than that suggests the sharp
+  // line and this Kalshi market may not be pricing the same thing.
+  maxSpreadCents: 25,
   minLiquidity: 0,              // coverage is checked against order size, not an absolute
 
   // --- Sizing ------------------------------------------------------------
