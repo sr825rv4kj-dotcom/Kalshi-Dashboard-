@@ -18,7 +18,7 @@ const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-09-20-hold-to-settlement";
+export const CONTROLLER_VERSION = "2026-09-21-self-healing";
 
 let intervalHandle = null;
 let positionMonitorHandle = null;
@@ -60,11 +60,9 @@ function loadTickerMap() {
 }
 
 /**
- * Milestone tiers. Crossing a milestone governs how the bot trades: more size,
+ * Sizing tiers. Crossing a milestone governs how the bot trades: more size,
  * more concurrency, and a reserve that sizing is not allowed to touch.
- */
-/**
- * Sizing tiers. Once the balance clears survival mode the bot is no longer
+ * Once the balance clears survival mode the bot is no longer
  * protecting a fragile bankroll, so the caps step up rather than staying at
  * survival-era numbers - that was leaving most of the balance idle at exactly
  * the point the strategy had proven itself.
@@ -210,51 +208,76 @@ async function reconcileSettledPositions() {
   for (const position of state.positions) {
     if (heldNow.has(position.ticker)) { stillOpen.push(position); continue; }
 
-    // Gone from the exchange: it settled. Read the real outcome so the ledger
-    // records what actually happened rather than an assumption.
-    let settlementCents = null;
+    // EVERY POSITION IS RECONCILED INDEPENDENTLY.
+    //
+    // recordTrade() below parses trade-ledger.json, and that parse was not
+    // guarded - only the market lookup was. A truncated ledger therefore threw
+    // out of this loop, so NO position was ever cleared, the cap filled with
+    // games that had already settled, and three cycles of it tripped the
+    // circuit breaker. Because the corruption is permanent, every half-open
+    // probe re-tripped it with the cooldown doubling toward an hour. That is
+    // exactly the silent stop this function exists to prevent.
     try {
-      const res = await kalshiGet(`${V2}/markets/${position.ticker}`);
-      const result = String(res.market?.result || "").toLowerCase();
-      if (result === "yes") settlementCents = 100;
-      else if (result === "no") settlementCents = 0;
-    } catch {
-      // leave null - recorded as unknown rather than guessed
+      // Gone from the exchange: it settled. Read the real outcome so the ledger
+      // records what actually happened rather than an assumption.
+      let settlementCents = null;
+      try {
+        const res = await kalshiGet(`${V2}/markets/${position.ticker}`);
+        const result = String(res.market?.result || "").toLowerCase();
+        if (result === "yes") settlementCents = 100;
+        else if (result === "no") settlementCents = 0;
+      } catch {
+        // leave null - recorded as unknown rather than guessed
+      }
+
+      const outcome =
+        settlementCents === 100 ? "settled-win" :
+        settlementCents === 0 ? "settled-loss" : "settled-unknown";
+
+      recordTrade({
+        action: "exit",
+        ticker: position.ticker,
+        side: "yes",
+        contracts: position.contracts,
+        priceCents: position.entryPriceCents,
+        exitPriceCents: settlementCents,
+        filled: position.contracts,
+        reason: outcome,
+        edgePct: null,
+        environment: loadConfig().environment,
+        teamName: position.teamName ?? null,
+        sportKey: position.sportKey ?? null,
+        commenceTime: position.commenceTime ?? null,
+      });
+
+      const net = settlementCents == null
+        ? "outcome unavailable"
+        : `$${(((settlementCents - position.entryPriceCents) * position.contracts) / 100).toFixed(2)}`;
+      appendLog(
+        `${position.ticker} settled ${settlementCents == null ? "(result unreadable)" : settlementCents === 100 ? "YES - won" : "NO - lost"}: ` +
+        `${position.contracts} contracts @ ${position.entryPriceCents}c entry, net ${net}. No exit fee - settlement is free.`
+      );
+      settledCount++;
+    } catch (err) {
+      // This position could not be booked. Keep it tracked so it is retried
+      // next cycle, log loudly, and carry on with the rest - one unreadable
+      // settlement must never cost the others their reconciliation.
+      appendLog(
+        `Could not book the settlement of ${position.ticker} (${err && err.message}) - ` +
+        `keeping it tracked and retrying next cycle.`, "error"
+      );
+      stillOpen.push(position);
     }
-
-    const outcome =
-      settlementCents === 100 ? "settled-win" :
-      settlementCents === 0 ? "settled-loss" : "settled-unknown";
-
-    recordTrade({
-      action: "exit",
-      ticker: position.ticker,
-      side: "yes",
-      contracts: position.contracts,
-      priceCents: position.entryPriceCents,
-      exitPriceCents: settlementCents,
-      filled: position.contracts,
-      reason: outcome,
-      edgePct: null,
-      environment: loadConfig().environment,
-      teamName: position.teamName ?? null,
-      sportKey: position.sportKey ?? null,
-      commenceTime: position.commenceTime ?? null,
-    });
-
-    const net = settlementCents == null
-      ? "outcome unavailable"
-      : `$${(((settlementCents - position.entryPriceCents) * position.contracts) / 100).toFixed(2)}`;
-    appendLog(
-      `${position.ticker} settled ${settlementCents == null ? "(result unreadable)" : settlementCents === 100 ? "YES - won" : "NO - lost"}: ` +
-      `${position.contracts} contracts @ ${position.entryPriceCents}c entry, net ${net}. No exit fee - settlement is free.`
-    );
-    settledCount++;
   }
 
   if (settledCount) {
     const fresh = loadState();
-    const settledKeys = new Set(state.positions.filter((p) => !heldNow.has(p.ticker)).map((p) => `${p.ticker}|${p.openedAt}`));
+    const cleared = new Set(stillOpen.map((p) => `${p.ticker}|${p.openedAt}`));
+    const settledKeys = new Set(
+      state.positions
+        .filter((p) => !heldNow.has(p.ticker) && !cleared.has(`${p.ticker}|${p.openedAt}`))
+        .map((p) => `${p.ticker}|${p.openedAt}`)
+    );
     fresh.positions = fresh.positions.filter((p) => !settledKeys.has(`${p.ticker}|${p.openedAt}`));
     saveState(fresh);
   }
@@ -315,26 +338,59 @@ async function checkDailyHalt(config) {
   // every cycle. Hysteresis at 90% of the limit stops it flapping on and off
   // around the boundary: it halts at the limit and only resumes once the
   // drawdown has genuinely pulled back from it.
+  // THE HALT LIMIT IS VALIDATED BEFORE IT IS COMPARED AGAINST.
+  //
+  // loadConfig is {...DEFAULTS, ...stored} and POST /api/bot/config writes
+  // arbitrary JSON, so any stored value beats the default. Both plausible
+  // wrong values failed silently and in opposite directions:
+  //
+  //   dailyLossHaltPct: 15   (a percent in a field that holds a fraction)
+  //     -> a 60% drawdown compares as 0.60 >= 15 = false. The guard is OFF and
+  //        the whole bankroll is unprotected. Reproduced: equity $10 against a
+  //        $25 baseline, haltedForDay stayed false.
+  //
+  //   dailyLossHaltPct: null
+  //     -> `0 >= null` is TRUE in JavaScript, so it halts at 0.0% drawdown on
+  //        the first cycle, and the resume test `drawdown < null*0.9` is never
+  //        true, so the halt is PERMANENT - logged only at info level.
+  //
+  // Anything outside a sane fractional range falls back to the default.
+  const rawHaltPct = Number(config.dailyLossHaltPct);
+  const haltPct = Number.isFinite(rawHaltPct) && rawHaltPct > 0 && rawHaltPct <= 1
+    ? rawHaltPct
+    : 0.15;
+  if (haltPct !== config.dailyLossHaltPct) {
+    appendLog(
+      `dailyLossHaltPct is ${JSON.stringify(config.dailyLossHaltPct)}, which is not a fraction between 0 and 1 - ` +
+      `using ${haltPct} instead. Set it from the dashboard as a decimal (0.15 = 15%).`, "warn"
+    );
+  }
+
   if (state.haltedForDay) {
-    const resumeBelow = config.dailyLossHaltPct * 0.9;
+    const resumeBelow = haltPct * 0.9;
     if (drawdown < resumeBelow) {
       appendLog(
         `Resuming: drawdown is ${(drawdown * 100).toFixed(1)}%, back under the ` +
-        `${(config.dailyLossHaltPct * 100).toFixed(0)}% limit (resume threshold ${(resumeBelow * 100).toFixed(1)}%). ` +
+        `${(haltPct * 100).toFixed(0)}% limit (resume threshold ${(resumeBelow * 100).toFixed(1)}%). ` +
         `Previous halt: ${state.haltReason}`
       );
       state.haltedForDay = false;
       state.haltReason = null;
+      state.haltDate = null;
       saveState(state);
     } else {
       return { halted: true, reason: state.haltReason };
     }
   }
 
-  if (drawdown >= config.dailyLossHaltPct) {
+  if (drawdown >= haltPct) {
     state.haltedForDay = true;
+    // Stamp the DAY the halt belongs to. Without this the watchdog cannot tell
+    // a halt taken an hour ago from one taken last Tuesday, and a stopped bot
+    // that was halted could never restart itself.
+    state.haltDate = today;
     state.haltReason =
-      `Daily drawdown ${(drawdown * 100).toFixed(1)}% hit the ${(config.dailyLossHaltPct * 100).toFixed(0)}% halt limit ` +
+      `Daily drawdown ${(drawdown * 100).toFixed(1)}% hit the ${(haltPct * 100).toFixed(0)}% halt limit ` +
       `(equity $${equity.toFixed(2)} vs $${baseline.toFixed(2)} at open)`;
     saveState(state);
     appendLog(state.haltReason, "error");
@@ -749,11 +805,41 @@ export function resetCircuitBreaker() {
   return { reset: true };
 }
 
+/**
+ * THE SCAN TIMER MUST NEVER DIE.
+ *
+ * This used to be `await runCycle(); if (intervalHandle) scheduleNextCycle();`
+ * with nothing catching a rejection. runCycle has its own try/catch, but
+ * appendLog runs inside that catch and appendLog reads state.json - so a
+ * truncated state file (a SIGKILL or a full disk mid-write) made the error
+ * handler itself throw, the rejection escaped, and the chain simply stopped.
+ *
+ * Worse, `intervalHandle` still pointed at the already-fired Timeout, so
+ * isRunning() kept returning true. The watchdog looked, saw "healthy", and did
+ * nothing. Reproduced end to end: one failure, then zero cycles for the next
+ * 45 seconds even after the state file was repaired, with the watchdog logging
+ * "healthy - bot running" throughout. The only recovery was a human pressing
+ * Stop then Start.
+ *
+ * Now the re-arm is in a finally block, so nothing that happens inside a cycle
+ * can stop the next one being scheduled.
+ */
 function scheduleNextCycle() {
   if (intervalHandle) clearTimeout(intervalHandle);
   intervalHandle = setTimeout(async () => {
-    await runCycle();
-    if (intervalHandle) scheduleNextCycle();
+    try {
+      await runCycle();
+    } catch (err) {
+      // runCycle is supposed to swallow its own errors. If one still reaches
+      // here, its error handler broke - so this must not depend on appendLog.
+      try {
+        appendLog(`Cycle threw past its own handler: ${err && err.message}. Scanning continues.`, "error");
+      } catch {
+        console.error("[bot] cycle threw and logging failed:", err && err.message);
+      }
+    } finally {
+      if (intervalHandle) scheduleNextCycle();
+    }
   }, currentCadenceSeconds() * 1000);
 }
 
@@ -765,7 +851,10 @@ export function startBot() {
   breakerOpenedAt = null;
   breakerTrips = 0;
   const { seconds, phase } = describeCadence();
-  appendLog(`Bot started (${config.environment}). Scanning every ${seconds}s (${phase}). Pre-game entries, held to settlement.`);
+  appendLog(
+    `Bot started (${config.environment}). Scanning every ${seconds}s (${phase}). ` +
+    `Live and pre-game entries, ${config.minEntryPriceCents}-${config.maxEntryPriceCents}c band, held to settlement.`
+  );
 
   const state = loadState();
   state.running = true;
