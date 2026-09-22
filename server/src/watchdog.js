@@ -8,7 +8,7 @@
  * trades would cost money faster than no guard at all.
  */
 import { loadConfig } from "./configStore.js";
-import { loadState, appendLog } from "./stateStore.js";
+import { saveState, loadState, appendLog } from "./stateStore.js";
 
 const CHECK_INTERVAL_MS = 2 * 60 * 1000;
 const BREAKER_COOLDOWN_MS = 15 * 60 * 1000;
@@ -31,8 +31,41 @@ async function tick() {
 
   // 1. Bot stopped while it should be running - restart it.
   if (!bc.isRunning()) {
+    // A HALT FROM A PREVIOUS DAY IS NOT A REASON TO STAY DOWN.
+    //
+    // This used to refuse to restart whenever haltedForDay was set. But the
+    // only code that CLEARS that flag lives inside runCycle - which only runs
+    // while the bot is running - so a bot that stopped while halted could never
+    // come back on its own. The flag is persisted, so it survived restarts too.
+    // Reproduced: yesterday's halt, new day, 0% drawdown, bot stopped ->
+    // "leaving it alone", forever, every tick.
+    //
+    // A halt is a limit for ONE DAY. If the day has turned over, clear it and
+    // let the bot start; checkDailyHalt will re-halt within one cycle if the
+    // drawdown is genuinely still there.
+    const today = new Date().toDateString();
+    if (state.haltedForDay && state.haltDate && state.haltDate !== today) {
+      appendLog(
+        `Watchdog: clearing a halt from ${state.haltDate} - it is now ${today}. ` +
+        `The bot will re-halt on its own if the drawdown is still live.`, "warn"
+      );
+      try {
+        const fresh = loadState();
+        fresh.haltedForDay = false;
+        fresh.haltReason = null;
+        fresh.haltDate = null;
+        saveState(fresh);
+        state.haltedForDay = false;
+      } catch (err) {
+        appendLog(`Watchdog could not clear the stale halt: ${err.message}`, "error");
+      }
+    }
+
     if (state.haltedForDay) {
-      appendLog("Watchdog: bot stopped and halted for the day - leaving it alone.", "warn");
+      appendLog(
+        "Watchdog: bot stopped and halted for TODAY - leaving it alone. " +
+        "Press Resume on the dashboard to override.", "warn"
+      );
       return;
     }
     // Don't restart-loop faster than once a minute if something is badly wrong.
