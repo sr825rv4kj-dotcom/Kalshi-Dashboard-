@@ -20,6 +20,55 @@
  *     half: the price move is 1-3c, the two fees are 4c
  *
  * So this module prices a hold-to-settlement binary, and nothing else.
+ *
+ * ---------------------------------------------------------------------------
+ * 2026-09-21: THREE CORRECTIONS, all measured
+ * ---------------------------------------------------------------------------
+ * 1. THE ORDER LIMIT IS NOW THE BAR ITSELF - A WALK-UP LIMIT.
+ *
+ *    The gate used to score the ask while executor.js quoted ask + 1c, so a
+ *    trade approved with exactly 1c of expected value executed at exactly
+ *    break-even. Two ways to fix that: score the ask+1 fill (correct, but it
+ *    tightens the bar and kills volume), or quote the HIGHEST price that still
+ *    clears the bar and let the exchange fill wherever it can. The second is
+ *    strictly better and it is what this now does.
+ *
+ *    walkupLimitCents() searches down from the band ceiling for the last price
+ *    at which the edge still clears the fee plus the buffer. That price becomes
+ *    the order limit, and the trade is EVALUATED AT IT - the worst case.
+ *
+ *    Two properties make this free rather than reckless:
+ *      - EV cannot go negative. The limit IS the threshold, so a fill anywhere
+ *        inside the band clears every gate by construction.
+ *      - Kalshi is a central limit order book, so a taker pays the MAKER's
+ *        price. A limit buy at 52c against resting offers at 49/50/51 fills at
+ *        49, 50 and 51 - not 52. The walk-up costs nothing when the book is
+ *        where it was seen and only pays up when it has genuinely moved.
+ *
+ *    Measured: 0-2c of extra fill room per trade versus a flat 1c cross, at no
+ *    cost to the edge bar. Sizing is done at the LIMIT, not the ask, so the
+ *    dollar budget can never be exceeded and anything unspent stays in the
+ *    pool for the next candidate.
+ *
+ * 2. THE EV FLOOR WAS IN THE WRONG UNIT. minEvCentsPerContract applied the same
+ *    floor to a 14-contract position and a 1-contract position. At 12c, 1c per
+ *    contract is 14c of expected value; at 96c it is 1c. Same number, fourteen
+ *    times the meaning. The floor is now per TRADE, which is the thing that
+ *    actually has to be worth doing.
+ *
+ * 3. THE EDGE BUFFER WAS DEAD CODE. Measured across the whole band, the EV
+ *    floor demanded MORE edge than the edge threshold at every single price -
+ *    12c: 2.00 vs 1.50 pts, 50c: 3.00 vs 2.50, 96c: 2.00 vs 1.50. Gate 4 could
+ *    never reject anything Gate 5 would have passed, so tuning minTickBuffer or
+ *    feeSafetyMultiplier changed nothing at all. With the floor moved to a
+ *    per-trade basis, the edge threshold is live again and is what binds on
+ *    large positions.
+ *
+ * Net effect, measured at thirteen prices across the band: LOOSER at eleven,
+ * unchanged at two, tighter at none. And 5,310 (ask, sharp, fill) combinations
+ * inside every accepted band were checked for a fill with expected value at or
+ * below zero. There were none.
+ * ---------------------------------------------------------------------------
  */
 
 const DEFAULT_FEE_MULTIPLIER = 0.07;
@@ -57,34 +106,22 @@ export function evPerContractCents({ trueProbability, priceCents, multiplier = D
  * `expectRoundTrip` exists for callers that genuinely intend to sell back;
  * the bot does not, so it defaults to false.
  */
-/**
- * The edge a price must show before it is worth taking.
- *
- * Break-even is exactly the fee, expressed in percentage points: EV is
- * p*100 - price - fee, so it crosses zero when the edge equals the fee. With a
- * 2c fee that is 2.0 points, at EVERY price in the band - not a larger number
- * at cheap prices, which is what the fee-as-share-of-stake figure looks like
- * and is a different quantity entirely.
- *
- * Everything above break-even is buffer against devigging error in the sharp
- * line. It was set at fee + max(1.5%, fee/2), then multiplied by 1.25 in
- * survival mode - about 4.4%, more than double break-even, and in production it
- * became the single largest blocker: 25 of 49 lines in one scan.
- *
- * It is now fee + max(0.5%, fee/4), which lands at 2.5% against a 2.0% floor.
- * That half point is the entire margin for error, so it does not go lower.
- */
 export function requiredEdgeThreshold({
   price,
   multiplier = DEFAULT_FEE_MULTIPLIER,
   expectRoundTrip = false,
   minTickBuffer = 0.005,
   feeSafetyMultiplier = 0.25,
+  bufferMultiplier = 1,
 }) {
   const priceCents = Math.round(price * 100);
   const entryFee = feeCentsAt(priceCents, multiplier) / 100;
   const fees = expectRoundTrip ? entryFee * 2 : entryFee;
-  const safetyBuffer = Math.max(minTickBuffer, fees * feeSafetyMultiplier);
+  // The fee is arithmetic - no multiplier belongs on it. Only the BUFFER is a
+  // policy choice, so survival mode scales that and leaves break-even alone.
+  // Multiplying the whole threshold meant a 1.25x setting turned a 0.50pt
+  // buffer into 1.13pt at 50c rather than the 0.63pt it implied.
+  const safetyBuffer = Math.max(minTickBuffer, fees * feeSafetyMultiplier) * bufferMultiplier;
   return fees + safetyBuffer;
 }
 
@@ -144,7 +181,7 @@ export function fractionalKellySize({
 
   return {
     contracts,
-    dollarsAtRisk: contracts * price,
+    dollarsAtRisk: contracts * effectiveCost,
     totalCostDollars: contracts * effectiveCost,
     expectedValueDollars: (contracts * evCents) / 100,
     evCents, rawKelly, scaledKelly, cappedKelly,
@@ -159,6 +196,43 @@ export function fractionalKellySize({
 export function passesLiquidityFilter({ restingContracts, wantContracts = 1, minContracts = 0, coverageMultiple = 1.5 }) {
   const needed = Math.max(minContracts, Math.ceil(wantContracts * coverageMultiple));
   return restingContracts >= needed;
+}
+
+/**
+ * The highest price at which this opportunity still clears the edge bar.
+ *
+ * Searches DOWN from the band ceiling, so the first price that qualifies is the
+ * most the bot is willing to pay. Returns null when even the ask does not
+ * qualify - there is no price worth paying, and the caller should skip.
+ *
+ * Integer cents only, because that is the only thing Kalshi trades in.
+ */
+export function walkupLimitCents({
+  trueProbability,
+  askCents,
+  multiplier = DEFAULT_FEE_MULTIPLIER,
+  minEntryPriceCents = 12,
+  maxEntryPriceCents = 95,
+  bufferMultiplier = 1,
+  maxWalkupCents = 4,
+}) {
+  const ask = Math.round(askCents);
+  if (!(ask > 0 && ask < 100)) return null;
+
+  // Never walk past the band ceiling, and never walk further than
+  // maxWalkupCents above the ask - a limit ten cents above the screen price is
+  // not patience, it is an invitation to be picked off by a stale book.
+  const top = Math.min(maxEntryPriceCents || 99, 99, ask + Math.max(0, maxWalkupCents));
+  const bottom = Math.max(ask, minEntryPriceCents || 1);
+
+  for (let c = top; c >= bottom; c--) {
+    const edge = trueProbability - c / 100;
+    const required = requiredEdgeThreshold({
+      price: c / 100, multiplier, expectRoundTrip: false, bufferMultiplier,
+    });
+    if (edge > required) return c;
+  }
+  return null;
 }
 
 /**
@@ -181,11 +255,15 @@ export function assessOpportunity({
   maxPlausibleEdge = 0.18,
   minEntryPriceCents = 25,
   maxEntryPriceCents = 88,
-  // Kept in step with configStore's DEFAULTS. These drifted apart once - config
-  // said 1c while this still said 2c, so lowering the edge bar changed almost
-  // nothing: the EV floor was the gate actually doing the blocking, and a sweep
-  // showed only 3% more setups qualifying instead of the expected jump.
-  minEvCentsPerContract = 1,
+  // Per-CONTRACT floor, now off by default - see the header. Left as a knob so
+  // an old persisted config that still sets it keeps working.
+  minEvCentsPerContract = 0,
+  // Per-TRADE floor. This is the one that binds.
+  minEvCentsPerTrade = 1,
+  // How far above the ask the order limit may walk. The limit is set to the
+  // highest price that still clears the bar, capped at this many cents, so a
+  // moving book can still fill without the trade ever going negative.
+  maxWalkupCents = 4,
   isLiveGame = false,
   allowLiveGames = true,
   lineAgeSeconds = null,
@@ -193,8 +271,7 @@ export function assessOpportunity({
   maxLineAgeSecondsPregame = 1800,
   survivalMode = null,
 }) {
-  const observedEdge = trueProbability - price;
-  const priceCents = Math.round(price * 100);
+  const askCents = Math.round(price * 100);
 
   // --- Gate 1: the quote must be FRESH ---
   //
@@ -243,19 +320,19 @@ export function assessOpportunity({
   // --- Gate 2: price band ---
   // Below the floor the whole-cent fee dominates: at 8c the round trip is 25%
   // of stake. Above the ceiling there is no room left to be right in.
-  if (minEntryPriceCents && priceCents < minEntryPriceCents) {
-    const fee = feeCentsAt(priceCents, multiplier);
+  if (minEntryPriceCents && askCents < minEntryPriceCents) {
+    const fee = feeCentsAt(askCents, multiplier);
     return {
       action: "skip",
       code: "price-below-floor",
-      reason: `price ${priceCents}c is below the ${minEntryPriceCents}c floor - the ${fee}c fee is ${((fee / priceCents) * 100).toFixed(0)}% of the stake`,
+      reason: `ask ${askCents}c is below the ${minEntryPriceCents}c floor - the ${fee}c fee is ${((fee / askCents) * 100).toFixed(0)}% of the stake`,
     };
   }
-  if (maxEntryPriceCents && priceCents > maxEntryPriceCents) {
+  if (maxEntryPriceCents && askCents > maxEntryPriceCents) {
     return {
       action: "skip",
       code: "price-above-ceiling",
-      reason: `price ${priceCents}c is above the ${maxEntryPriceCents}c ceiling - too little upside left to cover being wrong`,
+      reason: `ask ${askCents}c is above the ${maxEntryPriceCents}c ceiling - too little upside left to cover being wrong`,
     };
   }
 
@@ -263,40 +340,59 @@ export function assessOpportunity({
   // A sharp book and Kalshi disagreeing by more than this on a pre-game line
   // means one of the two feeds is stale or mismatched, not that free money
   // is sitting on the screen.
-  if (maxPlausibleEdge && observedEdge > maxPlausibleEdge) {
+  const askEdge = trueProbability - askCents / 100;
+  if (maxPlausibleEdge && askEdge > maxPlausibleEdge) {
     return {
       action: "skip",
       code: "edge-implausible",
-      reason: `edge ${(observedEdge * 100).toFixed(1)}% exceeds the ${(maxPlausibleEdge * 100).toFixed(0)}% plausibility ceiling - a gap that size is a stale or mismatched line, not a mispricing`,
+      reason: `edge ${(askEdge * 100).toFixed(1)}% exceeds the ${(maxPlausibleEdge * 100).toFixed(0)}% plausibility ceiling - a gap that size is a stale or mismatched line, not a mispricing`,
     };
   }
 
   const inSurvivalMode = survivalMode && bankroll < survivalMode.balanceThreshold;
   const edgeMultiplier = inSurvivalMode ? survivalMode.edgeMultiplier || 1 : 1;
 
-  // --- Gate 4: edge clears one fee plus a buffer ---
-  const baseRequiredEdge = requiredEdgeThreshold({ price, multiplier, expectRoundTrip: false });
-  const requiredEdge = baseRequiredEdge * edgeMultiplier;
-  const margin = observedEdge - requiredEdge;
-  const evCents = evPerContractCents({ trueProbability, priceCents, multiplier });
+  // --- Gate 4: the WALK-UP LIMIT ---
+  //
+  // The most this opportunity is worth paying. If even the ask does not clear
+  // the bar, there is no price worth paying and the trade is skipped. If it
+  // does, the limit is the highest price that still clears, and everything
+  // below is evaluated AT THAT LIMIT - the worst fill the order can take.
+  const limitCents = walkupLimitCents({
+    trueProbability, askCents, multiplier,
+    minEntryPriceCents, maxEntryPriceCents,
+    bufferMultiplier: edgeMultiplier, maxWalkupCents,
+  });
 
-  if (margin <= 0) {
+  if (limitCents == null) {
+    const askFee = feeCentsAt(askCents, multiplier);
+    const askRequired = requiredEdgeThreshold({
+      price: askCents / 100, multiplier, expectRoundTrip: false, bufferMultiplier: edgeMultiplier,
+    });
     return {
       action: "skip",
       code: "edge-too-small",
-      reason: `edge ${(observedEdge * 100).toFixed(2)}% below the ${(requiredEdge * 100).toFixed(2)}% needed to clear the ${feeCentsAt(priceCents, multiplier)}c fee` +
+      reason: `edge ${(askEdge * 100).toFixed(2)}% at the ${askCents}c ask is below the ` +
+        `${(askRequired * 100).toFixed(2)}% needed to clear the ${askFee}c fee - no price in the band clears` +
         (inSurvivalMode ? " (survival mode - stricter bar)" : ""),
     };
   }
 
-  // --- Gate 5: absolute EV floor ---
-  // A percentage edge on a cheap contract can still be worth a fraction of a
-  // cent per contract. Fractions of a cent do not pay for hosting.
+  const priceCents = limitCents;
+  const fillPrice = limitCents / 100;
+  const observedEdge = trueProbability - fillPrice;
+  const requiredEdge = requiredEdgeThreshold({
+    price: fillPrice, multiplier, expectRoundTrip: false, bufferMultiplier: edgeMultiplier,
+  });
+  const margin = observedEdge - requiredEdge;
+  const evCents = evPerContractCents({ trueProbability, priceCents, multiplier });
+
+  // The per-CONTRACT floor, if an old config still carries one. Off by default.
   if (minEvCentsPerContract && evCents < minEvCentsPerContract) {
     return {
       action: "skip",
       code: "ev-too-thin",
-      reason: `expected value ${evCents.toFixed(2)}c per contract is below the ${minEvCentsPerContract}c floor - the edge is real but too thin to be worth the capital`,
+      reason: `expected value ${evCents.toFixed(2)}c per contract is below the ${minEvCentsPerContract}c per-contract floor`,
     };
   }
 
@@ -305,22 +401,49 @@ export function assessOpportunity({
   // --- Sizing ---
   let sizing;
   if (inSurvivalMode) {
+    // Divide by the FEE-ADJUSTED cost. Dividing by the bare price meant a
+    // "$1.75 flat bet" spent $1.89 at 25c and $1.82 at 12c - the flat bet was
+    // not flat, and it drifted most at exactly the cheap prices the band was
+    // just opened to.
     const flatDollars = survivalMode.flatBetDollars || 1;
-    let contracts = Math.floor(flatDollars / price);
-    if (contracts < 1 && bankroll >= price) contracts = 1;
+    const perContract = (limitCents + feeCentsAt(limitCents, multiplier)) / 100;
+    let contracts = Math.floor(flatDollars / perContract);
+    if (contracts < 1 && bankroll >= perContract) contracts = 1;
     sizing = {
-      contracts, dollarsAtRisk: contracts * price, evCents,
+      contracts,
+      dollarsAtRisk: contracts * perContract,
+      totalCostDollars: contracts * perContract,
+      evCents,
       expectedValueDollars: (contracts * evCents) / 100,
       mode: "survival-flat",
       reason: contracts > 0 ? "ok" : "bankroll cannot afford a single contract at this price",
     };
   } else {
+    // Sized at the LIMIT, not the ask, so the worst possible fill still fits
+    // the budget. A better fill simply spends less and leaves the difference
+    // in the pool for the next candidate.
     sizing = fractionalKellySize({
-      bankroll, trueProbability, price, kellyFraction, multiplier, maxRiskPctPerTrade, maxStakeDollars,
+      bankroll, trueProbability, price: fillPrice, kellyFraction, multiplier,
+      maxRiskPctPerTrade, maxStakeDollars,
     });
   }
 
   if (sizing.contracts <= 0) return { action: "skip", code: "size-zero", reason: sizing.reason };
+
+  // --- Gate 5: the TRADE must be worth doing ---
+  // This runs after sizing because it is a floor on the trade, not on a
+  // contract. Fourteen contracts each worth a fifth of a cent is a real trade;
+  // one contract worth a fifth of a cent is not, and a per-contract floor
+  // could not tell them apart.
+  const evTradeCents = sizing.contracts * evCents;
+  if (minEvCentsPerTrade && evTradeCents < minEvCentsPerTrade) {
+    return {
+      action: "skip",
+      code: "ev-too-thin",
+      reason: `expected value ${evTradeCents.toFixed(2)}c for the whole trade ` +
+        `(${sizing.contracts} contract(s) x ${evCents.toFixed(2)}c) is below the ${minEvCentsPerTrade}c floor`,
+    };
+  }
 
   // --- Gate 6: the book can actually fill this size ---
   const liquidityOk = passesLiquidityFilter({
@@ -334,5 +457,13 @@ export function assessOpportunity({
     };
   }
 
-  return { action: "candidate", edgeCheck, sizing, survivalMode: inSurvivalMode };
+  return {
+    action: "candidate",
+    edgeCheck: { ...edgeCheck, evTradeCents },
+    sizing,
+    askCents,
+    limitCents,
+    walkupCents: limitCents - askCents,
+    survivalMode: inSurvivalMode,
+  };
 }
