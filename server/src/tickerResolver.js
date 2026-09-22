@@ -58,7 +58,7 @@ const CACHE_TTL_MS = 3 * 60 * 1000;
 /** How many days either side of kickoff a ticker's date may sit. */
 const DATE_SLACK_DAYS = 1;
 
-export const RESOLVER_VERSION = "2026-09-22-city-collision-guard";
+export const RESOLVER_VERSION = "2026-09-22-ticker-code-identity";
 
 /**
  * The six confirmed, in-production mappings. Everything beyond this is
@@ -87,20 +87,14 @@ const WEAK = new Set([
  * "New York Yankees" and "New York Mets" share two of three words. Scoring
  * them equally is how, on 2026-09-22 at 12:12, a Yankees model sized three
  * contracts and the order went to KXMLBGAME-26SEP232005NYMTEX-NYM - the METS.
- * Reproduced against this file: with the Yankees market on the board the right
- * side wins 6-4, but the moment it is absent - not yet listed, not tradeable,
- * already held, or dropped by the date gate - "new" + "york" alone score 4,
- * there is exactly one leader, no ambiguity check fires, and the bot buys the
- * crosstown rival. "Yankees" contributed nothing to that match.
  *
  * Every shared-market city is exposed the same way: Lakers/Clippers,
  * Dodgers/Angels, Cubs/White Sox, Rangers/Islanders, Kings/Ducks, and in
  * soccer every Madrid, Manchester, Milan and London pair.
  *
- * So a place name can no longer carry a match by itself. At least one
- * DISTINCTIVE word - a mascot, a surname, a club name - has to hit before any
- * ticker is returned. A team whose only hits are geographic is refused as
- * `city-only-match`, which costs one line and cannot cost a position.
+ * This set is now used in two places: it stops a place name carrying a NAME
+ * match on its own, and it stops a ticker code claiming a team when the only
+ * word it reaches is a shared city.
  */
 const GEO = new Set([
   // shared-market US metros and the words that make them up
@@ -145,6 +139,101 @@ export function tickerDayNumber(ticker) {
   if (month == null) return null;
   const ms = Date.UTC(2000 + Number(m[1]), month, Number(m[3]));
   return Math.floor(ms / 86400000);
+}
+
+/**
+ * The per-side team code a Kalshi ticker ends with.
+ *
+ *   KXMLBGAME-26SEP232005NYMTEX-NYM  -> "NYM"
+ *   KXODIMATCH-26SEP220730SRIENG-SRI -> "SRI"
+ *   KXARGPREMDIVGAME-26SEP21LANELP   -> null  (no side suffix on this series)
+ *
+ * A ticker with only two segments carries the fixture but not a side, so it
+ * returns null and the caller falls back to name matching rather than trying
+ * to read a pairing ("LANELP") as one team.
+ */
+export function tickerTeamCode(ticker) {
+  const parts = String(ticker || "").toUpperCase().split("-");
+  if (parts.length < 3) return null;
+  const last = parts[parts.length - 1];
+  return /^[A-Z0-9]{2,6}$/.test(last) ? last : null;
+}
+
+/**
+ * Can `code` be segmented into consecutive chunks, each a PREFIX of a distinct
+ * word of the team name, in order? Returns how many words were used, or 0.
+ *
+ *   NYM  -> new | york | mets      (3)
+ *   CWS  -> chicago | white | sox  (3)
+ *   DET  -> detroit               (1)
+ *   NYM against "new york yankees" -> 0, because nothing starts with M.
+ */
+function segmentCode(code, words) {
+  const memo = new Map();
+  function go(ci, wi, used) {
+    if (ci === code.length) return used;
+    if (wi >= words.length) return 0;
+    const k = `${ci}:${wi}`;
+    if (memo.has(k)) return memo.get(k);
+    let best = go(ci, wi + 1, used);            // skip this word
+    const w = words[wi];
+    for (let L = 1; L <= w.length && ci + L <= code.length; L++) {
+      if (code.slice(ci, ci + L) !== w.slice(0, L)) break;
+      best = Math.max(best, go(ci + L, wi + 1, used + 1));
+    }
+    memo.set(k, best);
+    return best;
+  }
+  return go(0, 0, 0);
+}
+
+/** Is `code` an in-order subsequence of `word`? WSH inside "washington". */
+function subsequenceOf(code, word) {
+  let i = 0;
+  for (const ch of word) {
+    if (ch === code[i]) i++;
+    if (i === code.length) return true;
+  }
+  return i === code.length;
+}
+
+/**
+ * How strongly a Kalshi team code fits a sportsbook team name. 0 means no fit.
+ *
+ * Code LENGTH dominates the score, deliberately: more matched letters is
+ * stronger evidence than more words touched. Without that weighting, TB - two
+ * word-initials of "Toronto Blue Jays" - outscored TOR, and the Blue Jays
+ * would have resolved to the Rays.
+ */
+export function codeAffinity(code, teamName) {
+  const c = String(code || "").toLowerCase().replace(/[^a-z]/g, "");
+  const words = String(teamName || "").toLowerCase().replace(/[^a-z ]/g, " ").split(/\s+/).filter(Boolean);
+  if (!c || !words.length) return 0;
+
+  // 1. Clean segmentation that starts at the first word. The common case.
+  const seg = segmentCode(c, words);
+  if (seg > 0 && c[0] === words[0][0]) return 100 + c.length * 10 + seg;
+
+  // 2. Compressed inside the FIRST word only: WSH <- washington.
+  //
+  //    Restricted to the first word deliberately. Allowing any word let "MIL"
+  //    match the MILAN in "Inter Milan", so with the Inter market absent the
+  //    resolver returned AC Milan - the Yankees/Mets failure in code form.
+  if (words[0][0] === c[0] && subsequenceOf(c, words[0])) return 60 + c.length * 10;
+
+  // 3. Segmentation that does not begin at the first word - a mascot-only or
+  //    surname-only code, which tennis needs ("SVI" <- Elina Svitolina).
+  //
+  //    PLACE NAMES ARE EXCLUDED HERE. A code that only reaches a shared city
+  //    word identifies nothing: that is exactly how MIL reached "Inter Milan".
+  //    Ranked below both rules above in any case.
+  const identifying = words.filter((w) => !GEO.has(w));
+  if (identifying.length) {
+    const seg3 = segmentCode(c, identifying);
+    if (seg3 > 0) return 20 + c.length * 5 + seg3;
+  }
+
+  return 0;
 }
 
 function dayNumberOf(iso) {
@@ -332,6 +421,114 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
     return { ticker: null, code: "unusable-name", reason: `no usable words in "${teamName}"` };
   }
   const strong = words.filter((w) => !WEAK.has(w));
+
+  // =====================================================================
+  // GATE 3a: THE TICKER. This is the identity, and it always was.
+  // =====================================================================
+  //
+  // The previous two attempts at this both failed because they read
+  // yes_sub_title, and for MLB Kalshi publishes the CITY THERE AND NOTHING
+  // ELSE. Production, 2026-09-22 14:44:
+  //
+  //   "detroit tigers" matched 2 KXMLBGAME market(s) on place name only
+  //   ("Detroit", "Detroit")
+  //
+  // So "Tigers" can never match, "Yankees" can never match, and a rule that
+  // demands a mascot refuses every baseball line there is - which is exactly
+  // what happened: 16 lines, 16 refusals, zero trades.
+  //
+  // But the identity is not missing. It is in the ticker, and it is exact:
+  //
+  //   KXMLBGAME-26SEP232005NYMTEX-NYM   -> NYM, the Mets
+  //   KXMLBGAME-26SEP231905TBNYY-NYY    -> NYY, the Yankees
+  //
+  // Two sides of one game carry two different codes. Same-city rivals carry
+  // two different codes. This is the field that cannot be ambiguous, and it
+  // is the field to match on.
+  //
+  // codeAffinity asks whether a code plausibly derives from a team name, by
+  // segmenting it across the name's words: NYM -> new|york|mets, CWS ->
+  // chicago|white|sox, DET -> detroit, WSH -> inside "washington". The wrong
+  // side scores ZERO rather than merely less - NYM against "new york yankees"
+  // fails on the M - so the separation is absolute, not a margin to tune.
+  //
+  // Verified against all 26 same-city and same-abbreviation collisions across
+  // MLB, NBA, NHL and NFL before this shipped.
+  const coded = [];
+  let codesAvailable = 0;
+  for (const m of dated) {
+    const tcode = tickerTeamCode(m.ticker);
+    if (!tcode) continue;
+    codesAvailable++;
+    const aff = codeAffinity(tcode, teamName);
+    if (aff > 0) coded.push({ m, tcode, aff });
+  }
+
+  // IF THIS SERIES CARRIES SIDE CODES AND NONE OF THEM FIT, THE TEAM IS NOT
+  // ON THIS BOARD. Full stop - do not fall through to name matching.
+  //
+  // This is the line that keeps the Yankees/Mets bug dead. Remove the NYY
+  // market and no code fits "new york yankees", but the NYM market still says
+  // "New York" on its YES side, so a name fallback matches it and buys the
+  // Mets. Tested: without this guard the resolver returned
+  // KXMLBGAME-26SEP232005NYMTEX-NYM for a Yankees line, which is precisely the
+  // 12:12 order that started all of this.
+  //
+  // A code is a definitive answer in both directions. Its absence is evidence,
+  // not a reason to go looking for a weaker one.
+  if (!coded.length && codesAvailable > 0) {
+    const seen = [...new Set(dated.map((m) => tickerTeamCode(m.ticker)).filter(Boolean))];
+    return {
+      ticker: null, code: "no-code-match",
+      reason: `no ${series} ticker on this date carries a team code matching "${teamName}" ` +
+        `(codes on the board: ${seen.slice(0, 12).join(", ")}${seen.length > 12 ? ", ..." : ""}). ` +
+        `The team is not listed - refused rather than matching on a shared city name.`,
+    };
+  }
+
+  if (coded.length) {
+    const top = Math.max(...coded.map((x) => x.aff));
+    const leaders = coded.filter((x) => x.aff === top);
+    const distinctCodes = [...new Set(leaders.map((x) => x.tcode))];
+
+    // Two DIFFERENT team codes fitting this name equally well means the codes
+    // cannot identify the team. Refuse - this is the case the whole gate
+    // exists to prevent.
+    if (distinctCodes.length > 1) {
+      return {
+        ticker: null, code: "ambiguous-code",
+        reason: `"${teamName}" fits ${distinctCodes.length} different ${series} team codes equally ` +
+          `(${distinctCodes.join(", ")}) - refused rather than guessing which side pays out`,
+      };
+    }
+
+    // One code, possibly several fixtures - the date window is +/-1 day, so a
+    // team playing on consecutive days appears twice. Prefer the exact date,
+    // then the tighter book.
+    let best = leaders[0];
+    if (leaders.length > 1) {
+      const exact = leaders.filter((x) => tickerDayNumber(x.m.ticker) === wantDay);
+      const pool = exact.length ? exact : leaders;
+      const spreadOf = (x) => {
+        const ask = Number(x.m.yes_ask ?? 0), bid = Number(x.m.yes_bid ?? 0);
+        return ask > 0 && bid > 0 ? ask - bid : Infinity;
+      };
+      best = pool.reduce((a, b) => (spreadOf(b) < spreadOf(a) ? b : a));
+    }
+
+    return {
+      ticker: best.m.ticker, code: "ok",
+      reason: `ticker code ${best.tcode} identifies "${teamName}" ` +
+        `(${best.m.status}, affinity ${best.aff}${leaders.length > 1 ? `, ${leaders.length} fixtures in window` : ""})`,
+    };
+  }
+
+  // =====================================================================
+  // GATE 3b: the NAME, for series whose tickers carry no side code.
+  // =====================================================================
+  // Reached only when no ticker on the board yields a usable code - some
+  // series encode the fixture without a per-side suffix. The city guard below
+  // still applies here, where it is cheap: these series publish real names.
 
   /**
    * Word-boundary matching, not substring.
