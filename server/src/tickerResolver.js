@@ -58,7 +58,7 @@ const CACHE_TTL_MS = 3 * 60 * 1000;
 /** How many days either side of kickoff a ticker's date may sit. */
 const DATE_SLACK_DAYS = 1;
 
-export const RESOLVER_VERSION = "2026-09-21-yes-side-anchored";
+export const RESOLVER_VERSION = "2026-09-22-city-collision-guard";
 
 /**
  * The six confirmed, in-production mappings. Everything beyond this is
@@ -79,6 +79,44 @@ const NON_TEAM_OUTCOMES = new Set(["draw", "tie"]);
 const WEAK = new Set([
   "state", "university", "college", "the", "saint", "north", "south", "east", "west",
   "central", "eastern", "western", "northern", "southern", "tech",
+]);
+
+/**
+ * PLACE NAMES. These locate a team; they never identify one.
+ *
+ * "New York Yankees" and "New York Mets" share two of three words. Scoring
+ * them equally is how, on 2026-09-22 at 12:12, a Yankees model sized three
+ * contracts and the order went to KXMLBGAME-26SEP232005NYMTEX-NYM - the METS.
+ * Reproduced against this file: with the Yankees market on the board the right
+ * side wins 6-4, but the moment it is absent - not yet listed, not tradeable,
+ * already held, or dropped by the date gate - "new" + "york" alone score 4,
+ * there is exactly one leader, no ambiguity check fires, and the bot buys the
+ * crosstown rival. "Yankees" contributed nothing to that match.
+ *
+ * Every shared-market city is exposed the same way: Lakers/Clippers,
+ * Dodgers/Angels, Cubs/White Sox, Rangers/Islanders, Kings/Ducks, and in
+ * soccer every Madrid, Manchester, Milan and London pair.
+ *
+ * So a place name can no longer carry a match by itself. At least one
+ * DISTINCTIVE word - a mascot, a surname, a club name - has to hit before any
+ * ticker is returned. A team whose only hits are geographic is refused as
+ * `city-only-match`, which costs one line and cannot cost a position.
+ */
+const GEO = new Set([
+  // shared-market US metros and the words that make them up
+  "new", "york", "los", "angeles", "la", "san", "francisco", "jose", "diego", "antonio",
+  "chicago", "boston", "philadelphia", "philly", "washington", "dallas", "fort", "worth",
+  "houston", "miami", "atlanta", "detroit", "denver", "phoenix", "seattle", "portland",
+  "minnesota", "minneapolis", "tampa", "bay", "orlando", "cleveland", "cincinnati",
+  "pittsburgh", "baltimore", "kansas", "city", "louis", "paul", "oakland", "sacramento",
+  "vegas", "las", "nashville", "memphis", "milwaukee", "indianapolis", "columbus",
+  "charlotte", "jacksonville", "buffalo", "brooklyn", "queens", "bronx", "anaheim",
+  "arizona", "colorado", "carolina", "florida", "texas", "utah", "vancouver", "toronto",
+  "montreal", "ottawa", "calgary", "edmonton", "winnipeg", "jersey", "england",
+  // soccer cities with more than one club
+  "madrid", "manchester", "milan", "london", "rome", "roma", "turin", "torino",
+  "munich", "munchen", "liverpool", "barcelona", "sevilla", "seville",
+  "lisbon", "porto", "glasgow", "birmingham", "nottingham", "sheffield", "bilbao",
 ]);
 
 const MONTHS = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
@@ -323,18 +361,58 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
       return false;
     };
     let score = 0;
+    let distinctive = 0;
     // Strong words (mascot, surname, distinctive city) count double so
     // "NC State Wolfpack" does not match every school with "State" in it.
-    for (const w of strong) if (hit(w)) score += 2;
+    for (const w of strong) {
+      if (!hit(w)) continue;
+      score += 2;
+      // A place name adds to the score but never establishes identity. This
+      // counter is what separates "New York Yankees" from "New York Mets".
+      if (!GEO.has(w)) distinctive += 1;
+    }
     for (const w of words) if (WEAK.has(w) && hit(w)) score += 1;
-    return score;
+    // Whether the market itself offers anything but a place name. If its YES
+    // side reads "Texas" and nothing more, there is no distinctive word to
+    // match and geography is all either side has - handled below.
+    const selfDistinctive = [...bag].some((t) => !GEO.has(t) && !WEAK.has(t));
+    return { score, distinctive, selfDistinctive };
   };
 
   // --- Match on the YES SIDE, never on the title ------------------------
-  const onYesSide = [];
+  //
+  // A candidate must clear the identity test, not just score above zero.
+  // Geography alone is accepted in exactly one case: the market's own YES side
+  // carries no distinctive word either, so there is nothing better available -
+  // and even then only if no other market on the board answers to the same
+  // place, because two markets sharing a city is the collision this exists to
+  // stop.
+  const rawYes = [];
   for (const m of dated) {
-    const score = scoreAgainst(yesSideText(m));
-    if (score > 0) onYesSide.push({ m, score });
+    const s = scoreAgainst(yesSideText(m));
+    if (s.score > 0) rawYes.push({ m, ...s });
+  }
+
+  const identified = rawYes.filter((x) => x.distinctive > 0);
+  const geoOnly = rawYes.filter((x) => x.distinctive === 0);
+  let onYesSide = identified;
+
+  if (!identified.length && geoOnly.length) {
+    const noBetterAvailable = geoOnly.filter((x) => !x.selfDistinctive);
+    if (noBetterAvailable.length === 1 && geoOnly.length === 1) {
+      onYesSide = noBetterAvailable;
+    } else {
+      // This is the Yankees/Mets case. The team's identifying word matched
+      // nothing; only the city did. Refuse and say so, rather than buying
+      // whichever same-city market happened to be listed.
+      const names = geoOnly.slice(0, 3).map((x) => `"${x.m.yes_sub_title ?? x.m.title}"`).join(", ");
+      return {
+        ticker: null, code: "city-only-match",
+        reason: `"${teamName}" matched ${geoOnly.length} ${series} market(s) on place name only ` +
+          `(${names}) - no mascot or distinctive word matched, so which team a YES contract pays on ` +
+          `cannot be established. Refused rather than buying a same-city rival.`,
+      };
+    }
   }
 
   if (onYesSide.length) {
@@ -373,8 +451,11 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
   const anyYesField = dated.some((m) => (m.yes_sub_title ?? m.subtitle ?? "").trim());
   const onTitle = [];
   for (const m of dated) {
-    const score = scoreAgainst(contextText(m));
-    if (score > 0) onTitle.push({ m, score });
+    const s = scoreAgainst(contextText(m));
+    // The title names BOTH teams, so a place-name hit here is worth even less
+    // than on the YES side - it cannot distinguish the sides of one fixture,
+    // let alone two same-city clubs. Distinctive words only.
+    if (s.score > 0 && s.distinctive > 0) onTitle.push({ m, score: s.score });
   }
 
   if (!onTitle.length) {
