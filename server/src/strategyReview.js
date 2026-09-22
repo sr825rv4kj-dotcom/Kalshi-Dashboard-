@@ -209,13 +209,29 @@ const REASON_LABELS = {
   "no-model-for-sport": "no in-game model for that sport",
   "unmodellable": "could not model the game state",
   "no-fill": "order placed but nothing filled",
+  "skipped:shard-unfunded": "collateral was on the wrong Kalshi shard - order never placed",
   "skip-other": "other",
+
+  // --- Resolver refusals, itemised by cause --------------------------------
+  // These replaced a single "no matching Kalshi market" row. Splitting them up
+  // is the difference between one dead end and a list of fixable things.
+  "unresolved:no-name-match": "team name matched no market on its YES side",
+  "unresolved:opponent-side-only": "only found as the OPPONENT - buying it would take the other side",
+  "unresolved:wrong-date": "only found on a different date (last week's fixture)",
+  "unresolved:ambiguous-side": "could not tell which team a YES contract pays on - refused rather than guessed",
+  "unresolved:unusable-name": "no usable words in the team name",
+  "unresolved:unknown": "resolver refused without a reason code",
 
   // --- Not gates. These describe the board, not a threshold you set. --------
   "no-lines-from-provider": "no games on the board (nothing to price)",
   "odds-fetch-failed": "odds feed error",
   "scanner-error": "scan crashed and was contained",
   "order-error": "exchange rejected the order",
+  "unresolved:series-empty": "Kalshi lists no markets at all for this sport",
+  "unresolved:none-tradeable": "Kalshi has the sport but nothing is open right now",
+  "unresolved:no-series": "no Kalshi series is mapped for this sport",
+  "unresolved:draw-or-tie": "draw/tie - not a two-sided market",
+  "unresolved:fetch-failed": "Kalshi market list could not be read",
 };
 
 /**
@@ -232,22 +248,59 @@ const NOT_A_GATE = new Set([
   "odds-fetch-failed",
   "scanner-error",
   "order-error",
+  // The sport has no Kalshi market to trade. No threshold changes that.
+  "unresolved:series-empty",
+  "unresolved:none-tradeable",
+  "unresolved:no-series",
+  "unresolved:draw-or-tie",
+  "unresolved:fetch-failed",
 ]);
 
+/**
+ * THIS WAS NEVER "THE LAST SCAN", AND SAYING SO MADE IT UNREADABLE.
+ *
+ * state.lastScan holds ONE ENTRY PER SPORT and keeps each for an hour. This
+ * function sums every entry in it, so the figure labelled "last scan" was
+ * really a rolling one-hour union across up to seventy sports. A sport scanned
+ * once at 8:04 went on contributing its counts to every panel refresh until
+ * 9:04, whether or not it was ever scanned again.
+ *
+ * That is exactly why three rows never moved. Across 8:19pm, 9:58pm and the
+ * following 5:39am - different nights, different line counts - the tally kept
+ * reporting no-fill 5, no-name-match 4, odds-feed-error 11. Those were not
+ * recurring failures. They were the same handful of entries being re-counted,
+ * while the panel implied each refresh was a fresh measurement.
+ *
+ * So this now reports what it actually is: a WINDOW, with its age, how many
+ * sports are stale inside it, and a worked example for every refusal code.
+ * `stale` is the field that answers the question the panel could never answer -
+ * "is the bot even running right now".
+ */
 function lastScanSummary() {
   let scans = {};
   try { scans = loadState().lastScan || {}; } catch { return null; }
   const sports = Object.keys(scans);
   if (!sports.length) return null;
 
+  const now = Date.now();
   const totals = {};
-  let seen = 0, entered = 0, newest = null;
-  for (const [sport, row] of Object.entries(scans)) {
+  const samples = {};
+  let seen = 0, entered = 0, newest = null, oldest = null, staleSports = 0;
+
+  for (const row of Object.values(scans)) {
+    const at = Date.parse(row.at);
     seen += row.seen || 0;
     entered += row.entered || 0;
-    if (!newest || Date.parse(row.at) > Date.parse(newest)) newest = row.at;
+    if (Number.isFinite(at)) {
+      if (newest == null || at > newest) newest = at;
+      if (oldest == null || at < oldest) oldest = at;
+      if (now - at > 10 * 60 * 1000) staleSports++;
+    }
     for (const [code, n] of Object.entries(row.reasons || {})) {
       totals[code] = (totals[code] || 0) + n;
+    }
+    for (const [code, ex] of Object.entries(row.samples || {})) {
+      if (!samples[code]) samples[code] = ex;
     }
   }
 
@@ -256,12 +309,26 @@ function lastScanSummary() {
       code, count,
       label: REASON_LABELS[code] || code,
       actionable: !NOT_A_GATE.has(code),
+      example: samples[code] || null,
     }))
     // Real gates first, biggest first. Board conditions last, whatever their
     // count, because no threshold change affects them.
     .sort((a, b) => (Number(b.actionable) - Number(a.actionable)) || (b.count - a.count));
 
-  return { at: newest, sports: sports.length, seen, entered, blockers };
+  const ageSeconds = newest ? Math.round((now - newest) / 1000) : null;
+
+  return {
+    at: newest ? new Date(newest).toISOString() : null,
+    ageSeconds,
+    // How wide the window really is, so the counts can be read honestly.
+    windowMinutes: (newest && oldest) ? Math.max(1, Math.round((newest - oldest) / 60000)) : 0,
+    sports: sports.length,
+    staleSports,
+    // The bot scans on a 20s-300s cadence depending on the hour. Nothing at all
+    // for five minutes means it is not scanning, not that it is being choosy.
+    stale: ageSeconds == null || ageSeconds > 300,
+    seen, entered, blockers,
+  };
 }
 
 export function buildStrategyReview() {
