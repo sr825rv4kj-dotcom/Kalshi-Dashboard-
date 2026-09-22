@@ -20,7 +20,7 @@ const V2 = "/trade-api/v2";
  */
 const ORDERS_PATH = `${V2}/portfolio/events/orders`;
 
-export const EXECUTOR_VERSION = "2026-09-21-walkup-limit";
+export const EXECUTOR_VERSION = "2026-09-22-nonblocking-collateral";
 
 const ALLOCATION_PATH = `${V2}/portfolio/target_balance_allocation`;
 
@@ -77,38 +77,100 @@ async function shardBalanceDollars(exchangeIndex) {
 }
 
 /**
- * Target allocation is asynchronous: Kalshi accepts the request and moves the
- * money afterwards. This waits for the shard to actually hold what the order
- * needs before returning.
+ * Every shard's balance in dollars, as { exchangeIndex: dollars }.
+ * Lets the scanner trade what is funded instead of chasing money around.
  */
-async function allocateAllTo(exchangeIndex, needDollars = 0) {
-  await kalshiPost(ALLOCATION_PATH, {
-    allocations: [{ exchange_index: exchangeIndex, percent: 100 }],
-    resting_margin_reservation: "max",
-  });
+export async function readShardBalances() {
+  try {
+    const bal = await kalshiGet(`${V2}/portfolio/balance`);
+    const rows = bal.balance_breakdown ?? [];
+    if (!rows.length) return null;
+
+    const totalCents = Number(bal.balance);
+    let sum = 0;
+    for (const r of rows) sum += Number(r.balance) || 0;
+
+    let divisor = 100;
+    if (Number.isFinite(totalCents) && totalCents > 0 && sum > 0) {
+      const asCents = Math.abs(sum - totalCents) / totalCents;
+      const asDollars = Math.abs(sum * 100 - totalCents) / totalCents;
+      divisor = asDollars < asCents ? 1 : 100;
+    }
+
+    const out = {};
+    for (const r of rows) out[Number(r.exchange_index)] = (Number(r.balance) || 0) / divisor;
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ASKS KALSHI TO MOVE COLLATERAL, AND DOES NOT STAND THERE WATCHING.
+ *
+ * This used to poll for a full SIXTY SECONDS, inside the scan loop, before
+ * giving up on one market. From the live log:
+ *
+ *     6:19:18  Shard 3 has no collateral for ...NYMTEX-NYM - reallocating.
+ *     6:20:19  Shard 3 holds $0.00 of the $1.76 needed after 60s.
+ *     6:20:19  Skipping ...NYMTEX-NYM: collateral has not reached shard 3 yet.
+ *
+ * Sixty-one seconds, one market, no trade - and at a 20s cadence that is three
+ * entire scan cycles skipped, every time, for every candidate that happens to
+ * sit on an unfunded shard. That alone is why a bot with ten slots was holding
+ * one position.
+ *
+ * Worse, the wait could not succeed. It posts percent:100 to a single shard,
+ * but collateral backing an OPEN POSITION on another shard is not free to
+ * move, so "put everything here" is a request Kalshi cannot honour while
+ * anything is open. The bot waited a minute for something that was never going
+ * to arrive, then repeated it on the next scan.
+ *
+ * The transfer is asynchronous on Kalshi's side regardless, so waiting on it
+ * synchronously was never buying anything. The request is fired, the market is
+ * skipped, and the NEXT scan - seconds later - finds the shard funded and
+ * takes the trade. A short confirmation probe is kept only so the log can say
+ * whether money actually started moving.
+ */
+async function requestCollateralMove(exchangeIndex, needDollars = 0, { probeMs = 9000 } = {}) {
+  try {
+    await kalshiPost(ALLOCATION_PATH, {
+      allocations: [{ exchange_index: exchangeIndex, percent: 100 }],
+      resting_margin_reservation: "max",
+    });
+  } catch (err) {
+    appendLog(`Could not request collateral for shard ${exchangeIndex}: ${err.message}`, "warn");
+    return false;
+  }
   allocatedShard = exchangeIndex;
 
-  // Kalshi settles the transfer on its own schedule - 15 seconds was not
-  // enough. Poll for up to a minute, reporting progress so the log shows
-  // whether money is moving at all.
+  // Short probe: three quick looks, not twenty. Enough to report progress,
+  // far too short to stall a scan.
+  const steps = Math.max(1, Math.round(probeMs / 3000));
   let last = null;
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < steps; i++) {
     await new Promise((r) => setTimeout(r, 3000));
     const have = await shardBalanceDollars(exchangeIndex);
-    if (have == null) break;                       // cannot read - proceed and let the order decide
+    if (have == null) break;
     last = have;
     if (have >= needDollars) {
-      appendLog(`Collateral on shard ${exchangeIndex}: $${have.toFixed(2)} (needed $${needDollars.toFixed(2)}).`);
+      appendLog(`Collateral reached shard ${exchangeIndex}: $${have.toFixed(2)} (needed $${needDollars.toFixed(2)}).`);
       return true;
     }
   }
 
   appendLog(
-    `Shard ${exchangeIndex} holds $${last == null ? "?" : last.toFixed(2)} of the $${needDollars.toFixed(2)} needed ` +
-    `after 60s. Kalshi moves collateral on its own schedule - it should settle before the next scan.`,
-    "warn"
+    `Collateral requested for shard ${exchangeIndex} ($${needDollars.toFixed(2)} needed, ` +
+    `$${last == null ? "?" : last.toFixed(2)} there now). Not waiting - Kalshi settles this on its own ` +
+    `and the next scan will pick the market up.`
   );
   return false;
+}
+
+/** Marks an error as a collateral-routing failure rather than a system fault. */
+function tagBalanceError(err) {
+  err.isShardFunding = true;
+  return err;
 }
 
 function newClientOrderId() {
@@ -168,7 +230,12 @@ async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = fals
     if (isBalanceIssue && exchangeIndex != null) {
       appendLog(`Shard ${exchangeIndex} has no collateral for ${ticker} - reallocating.`, "warn");
       const needDollars = (clampPrice(limitCents) / 100) * Number(contracts) * 1.15; // + fee headroom
-      await allocateAllTo(exchangeIndex, needDollars);
+      const funded = await requestCollateralMove(exchangeIndex, needDollars);
+      if (!funded) {
+        // Do not re-send an order that will be rejected again. The move is in
+        // flight; the next scan takes this market.
+        throw tagBalanceError(new Error(`insufficient_shard_balance (shard ${exchangeIndex}, move requested)`));
+      }
       body.client_order_id = newClientOrderId();
       res = await kalshiPost(ORDERS_PATH, body);
     } else {
@@ -226,18 +293,20 @@ export async function enterPosition({
 
   let result;
   try {
-    if (exchangeIndex != null && allocatedShard != null && allocatedShard !== exchangeIndex) {
-      await allocateAllTo(exchangeIndex, (limitCents / 100) * contracts * 1.15);
-    }
+    // No pre-emptive reallocation. The old code moved collateral whenever the
+    // target shard differed from the last one used, which on a multi-shard
+    // board meant a transfer - and a wait - before most orders. The order is
+    // simply attempted; if Kalshi rejects it for collateral, the handler below
+    // requests the move and leaves the market for the next scan.
     result = await placeIOC({ ticker, side: "bid", limitCents, contracts, exchangeIndex });
   } catch (err) {
     // A collateral-routing failure is not a system fault. Throwing here tripped
     // the circuit breaker after three markets on an unfunded shard and stopped
     // the bot outright, so it is reported and skipped instead.
-    if (/insufficient_(shard_)?balance/.test(String(err.message))) {
+    if (err.isShardFunding || /insufficient_(shard_)?balance/.test(String(err.message))) {
       appendLog(
-        `Skipping ${ticker}: collateral has not reached shard ${exchangeIndex} yet. ` +
-        `Trading continues on funded shards.`, "warn"
+        `${ticker}: collateral is on another shard. Move requested for shard ${exchangeIndex}; ` +
+        `this market is picked up on the next scan. Trading continues on funded shards now.`, "warn"
       );
       return { filled: 0, skipped: "shard-unfunded" };
     }
