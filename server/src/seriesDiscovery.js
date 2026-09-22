@@ -4,49 +4,47 @@
  * Works out which Kalshi series each odds-feed sport should trade against.
  *
  * ---------------------------------------------------------------------------
- * THE MATCHER USED TO BIND REAL MONEY TO THE WRONG LEAGUE (2026-09-22)
+ * TWO FAILURES, IN OPPOSITE DIRECTIONS
  * ---------------------------------------------------------------------------
- * The previous scorer awarded +10 for ANY substring hit anywhere in a series
- * ticker, +8 more if the ticker contained "game", and accepted anything at or
- * above 10. One substring was therefore always enough. Run against the live
- * board, using the tickers the production log actually printed:
+ * ROUND ONE - TOO LOOSE. The original scorer awarded +10 for ANY substring hit
+ * anywhere in a series ticker and accepted anything at or above 10, so one
+ * substring was always enough. Against the live board:
  *
- *   soccer_brazil_serie_b          -> KXSERIECGAME   (18)  on the word "serie"
- *   icehockey_sweden_hockey_league -> KXBALLERLEAGUEGAME (18) on "league"
- *   basketball_wnba                -> KXWNBAASGAME   (18)  All-Star, not WNBA
+ *   soccer_brazil_serie_b          -> KXSERIECGAME        on the word "serie"
+ *   icehockey_sweden_hockey_league -> KXBALLERLEAGUEGAME  on "league"
+ *   basketball_wnba                -> KXWNBAASGAME        All-Star, not WNBA
  *
- * A Brazilian club bound to an Italian league with 42 tradeable markets. The
- * only thing that prevented a wrong-league fill was the ticker date gate in
- * tickerResolver - one guard, load-bearing, with nothing behind it.
+ * A Brazilian club bound to an Italian league with 42 tradeable markets, and
+ * ties were broken by list order - a coin flip in front of the order router.
  *
- * And the decisive detail: baseball_mlb scored 18 too. So did soccer_epl. The
- * correct bindings and the garbage bindings scored IDENTICALLY, which means no
- * threshold could ever have separated them. Raising the bar to 19 would have
- * switched the bot off; leaving it at 10 kept trading the wrong leagues.
+ * ROUND TWO - TOO TIGHT, AND WORSE. The fix demanded a token EQUAL the series
+ * core. That killed every league Kalshi abbreviates:
  *
- * Worse, ties were resolved by list order. `if (sc > bestScore)` keeps the
- * FIRST series seen at the top score, so KXSERIECGAME vs KXSERIEAGAME and
- * KXWNBAASGAME vs KXWNBAGAME were decided by however Kalshi happened to order
- * its response that morning. That is not a heuristic with a weak spot. That is
- * a coin flip in front of the order router.
+ *   soccer_argentina_primera_division -> KXARGPREMDIVGAME  core ARGPREMDIV
+ *                                        score 0, REFUSED
  *
- * WHAT REPLACES IT. Kalshi series tickers are structured: KX + CORE + GAME
- * (or MATCH). The core is the league. So the core is extracted and matched
- * ANCHORED - a token must BE the core, not merely appear somewhere inside it:
+ * which is the market that produced +162% ROI on lanus vs ELP - the single
+ * biggest winner in the account. What survived the tightening was MLB, the
+ * most efficiently priced board there is, where the 2c fee demands a 2pt edge
+ * that consensus devig cannot find. The bot went a full day at
+ * "edge-too-small x16" and traded nothing, and the cause was here, not in the
+ * edge bar.
  *
- *   "mlb"    vs core "MLB"          -> exact, bind
- *   "wnba"   vs core "WNBAAS"       -> not exact, refuse
- *   "serie"  vs core "SERIEC"       -> not exact, refuse
- *   "league" vs core "BALLERLEAGUE" -> not exact, refuse
+ * WHAT THIS DOES NOW. Kalshi series tickers are KX + CORE + GAME, and the core
+ * is often abbreviated. So a token may match a CHUNK of the core, but the
+ * chunks must be ANCHORED AND ORDERED: the first starts at position 0, later
+ * ones follow it, and together they must explain at least half the core.
  *
- * Under that rule every one of the 12 named sports still resolves, and all
- * three wrong bindings above are refused. A tie at the top is a REFUSAL rather
- * than a list-order coin flip, and the refusal is logged with both candidates
- * so an ambiguity is something you can go and look at.
+ *   ARGPREMDIV  <- arg(entina) ... div(ision)    anchored, ordered, 6/10  BIND
+ *   BALLERLEAGUE <- "all" from Allsvenskan        at index 1, not 0      REFUSE
+ *   BALLERLEAGUE <- "league" from Ireland         at index 6, not 0      REFUSE
+ *   SERIEC      <- "brazil"                       no chunk at all        REFUSE
  *
- * The bar this sets is deliberately harsh: a sport whose league has no
- * matching Kalshi core is simply not traded. Missing a sport costs nothing.
- * Trading the wrong one costs the position.
+ * A tie between two different series is still a REFUSAL, never list order.
+ *
+ * Verified against every real series ticker in the production logs: MLB, NHL,
+ * WNBA, Serie A, ODI cricket, WTA and the Argentine Primera - 25 assertions,
+ * no mock tickers anywhere.
  * ---------------------------------------------------------------------------
  */
 
@@ -55,7 +53,7 @@ import { appendLog } from "./stateStore.js";
 const V2 = "/trade-api/v2";
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;   // series lists barely move
 
-export const DISCOVERY_VERSION = "2026-09-22-anchored-core";
+export const DISCOVERY_VERSION = "2026-09-22-abbreviated-core";
 
 let cache = null;
 
@@ -78,14 +76,15 @@ export const CONFIRMED_SERIES = {
  * when working out what makes a sport key distinctive, so soccer_epl is matched
  * on "epl" rather than on "soccer", which would match every league at once.
  *
- * "league" is now in here. It is not distinctive - it appears in Baller League,
- * Major League Soccer, National League and a dozen others - and on its own it
- * was enough to bind Swedish hockey to a streamer exhibition series.
+ * "league", "liga" and "serie" are here because on their own they bound
+ * Swedish hockey to a streamer exhibition series and Brazilian soccer to the
+ * Italian third tier. "division" is NOT here - it is the DIV in ARGPREMDIV and
+ * removing it is what let the Argentine Primera bind again.
  */
 const GENERIC_TOKENS = new Set([
   "americanfootball", "basketball", "baseball", "icehockey", "soccer", "tennis",
   "cricket", "golf", "mma", "boxing", "rugbyleague", "rugbyunion", "aussierules",
-  "football", "hockey", "sport", "sports", "league", "liga", "serie", "division",
+  "football", "hockey", "sport", "sports", "league", "liga", "serie",
   "cup", "open", "championship", "pro", "premier", "national",
 ]);
 
@@ -93,10 +92,6 @@ const GENERIC_TOKENS = new Set([
  * How leagues are written in English versus how an odds feed abbreviates them.
  * These are language facts, not assumptions about Kalshi's ticker format - the
  * match still has to find a real series core before anything is used.
- *
- * Note these are deliberately written as the CORE would appear: "laliga", not
- * "la liga", because the comparison is against a ticker core with no spaces.
- * Both spellings are kept so a title match can still use the spaced form.
  */
 const ALIASES = {
   epl: ["epl", "premierleague"],
@@ -180,16 +175,8 @@ export function distinctiveTokens(sportKey) {
 }
 
 /**
- * Scores a series against a sport's tokens. ANCHORED, not substring.
- *
- * Only three things earn a bind:
- *   100  a token IS the series core exactly
- *    40  a token is the core with a country/gender qualifier attached that the
- *        sport key also carries (e.g. token "mlscup" vs core "MLSCUP")
- *    20  the series TITLE contains every distinctive token as a whole word
- *
- * Everything else scores 0. A partial overlap inside the core - the exact
- * thing that produced SERIEC, BALLERLEAGUE and WNBAAS - is worth nothing.
+ * Scores a series against a sport's tokens. Three ways to bind, in order of
+ * confidence. Everything else scores 0.
  */
 export function scoreSeries(series, tokens) {
   const core = seriesCore(series.ticker);
@@ -199,6 +186,7 @@ export function scoreSeries(series, tokens) {
   const lowerCore = core.toLowerCase();
   let best = 0;
 
+  // 1. A token IS the core. MLB, NHL, EPL, LALIGA, ODI, WTA.
   for (const t of tokens) {
     const tok = t.replace(/[^a-z0-9]/g, "");
     if (!tok) continue;
@@ -206,19 +194,42 @@ export function scoreSeries(series, tokens) {
   }
   if (best) return best;
 
-  // Whole-word title match, and ONLY if every distinctive token is present.
-  // One word in a title is how "league" found Baller League; requiring all of
-  // them means a title match has to actually describe the same competition.
+  // 2. ABBREVIATED CORES. Kalshi writes ARGPREMDIV, not
+  //    ARGENTINAPRIMERADIVISION.
+  //
+  //    A token's leading letters may match a CHUNK of the core, but the chunks
+  //    must be ANCHORED AND IN ORDER: the first starts at position 0, each
+  //    later one after the previous. Floating matches are how "all" (from
+  //    Allsvenskan) found the ALL inside bALLerleague, and how the compound
+  //    token "leagueofireland" found LEAGUE inside ballerLEAGUE - both binding
+  //    to a streamer exhibition series.
+  const singleWordTokens = tokens.filter((t) => t.length >= 4 && !/\s/.test(t));
+  let pos = 0, hits = 0, covered = 0;
+  for (const t of singleWordTokens) {
+    const tok = t.replace(/[^a-z0-9]/g, "");
+    for (let n = Math.min(tok.length, 6); n >= 3; n--) {
+      const at = lowerCore.indexOf(tok.slice(0, n), pos);
+      // The FIRST chunk must start the core. Later chunks may sit after a gap
+      // (ARG_PREM_DIV skips PREM) but never before an earlier one.
+      if (at < 0) continue;
+      if (hits === 0 && at !== 0) continue;
+      pos = at + n; hits++; covered += n; break;
+    }
+  }
+  // The core must be MOSTLY explained. ARGPREMDIV covered by arg+div is 6 of
+  // 10 letters with the unmatched PREM sitting between them, which is a real
+  // abbreviation; a single 3-letter hit against a long core is not.
+  if (hits > 0 && covered * 2 >= lowerCore.length) return 40 + covered * 2 + hits;
+
+  // 3. Whole-word title match, and ONLY if every distinctive single word is
+  //    present. Compound tokens are excluded here: "argentinaprimeradivision"
+  //    never appears in a title and its absence must not veto a real match.
   const title = String(series.title || "").toLowerCase();
   if (title) {
     const words = new Set(title.split(/[^a-z0-9]+/).filter(Boolean));
-    const joinedTitle = title.replace(/[^a-z0-9]/g, "");
-    const meaningful = tokens.filter((t) => t.length >= 3);
-    if (meaningful.length) {
-      const allPresent = meaningful.every((t) => {
-        const tok = t.replace(/[^a-z0-9]/g, "");
-        return words.has(tok) || joinedTitle === tok;
-      });
+    const singles = tokens.filter((t) => t.length >= 3 && !/\s/.test(t));
+    if (singles.length) {
+      const allPresent = singles.every((t) => words.has(t.replace(/[^a-z0-9]/g, "")));
       if (allPresent) return 20;
     }
   }
