@@ -20,7 +20,7 @@ const V2 = "/trade-api/v2";
  */
 const ORDERS_PATH = `${V2}/portfolio/events/orders`;
 
-export const EXECUTOR_VERSION = "2026-09-19-shard-patient";
+export const EXECUTOR_VERSION = "2026-09-21-walkup-limit";
 
 const ALLOCATION_PATH = `${V2}/portfolio/target_balance_allocation`;
 
@@ -32,15 +32,45 @@ const ALLOCATION_PATH = `${V2}/portfolio/target_balance_allocation`;
  */
 let allocatedShard = null;
 
-/** Per-shard balance in dollars, from balance_breakdown. */
+/**
+ * Per-shard balance in DOLLARS, from balance_breakdown.
+ *
+ * The unit is detected rather than assumed. The top-level `balance` on this
+ * same response is known to be cents - every other caller in this codebase
+ * divides it by 100 - but nothing documents the unit of the per-shard rows,
+ * and getting it wrong is expensive in both directions: read cents as dollars
+ * and the collateral wait passes instantly against an unfunded shard, so the
+ * order fails and the trade is dropped; read dollars as cents and every shard
+ * looks broke and nothing ever trades.
+ *
+ * So the rows are compared against the total, which is a known quantity. If
+ * they sum to roughly the total they are cents; if they sum to roughly a
+ * hundredth of it they are dollars. When the sum is unusable the code falls
+ * back to treating them as cents, which matches the top-level field.
+ */
 async function shardBalanceDollars(exchangeIndex) {
   try {
     const bal = await kalshiGet(`${V2}/portfolio/balance`);
     const rows = bal.balance_breakdown ?? [];
+    if (!rows.length) return 0;
+
+    const totalCents = Number(bal.balance);
+    let sum = 0;
+    let mine = null;
     for (const r of rows) {
-      if (Number(r.exchange_index) === Number(exchangeIndex)) return Number(r.balance) || 0;
+      const v = Number(r.balance) || 0;
+      sum += v;
+      if (Number(r.exchange_index) === Number(exchangeIndex)) mine = v;
     }
-    return 0;
+    if (mine == null) return 0;
+
+    let divisor = 100;                       // default: rows are cents, like bal.balance
+    if (Number.isFinite(totalCents) && totalCents > 0 && sum > 0) {
+      const asCents = Math.abs(sum - totalCents) / totalCents;
+      const asDollars = Math.abs(sum * 100 - totalCents) / totalCents;
+      divisor = asDollars < asCents ? 1 : 100;
+    }
+    return mine / divisor;
   } catch {
     return null; // unknown - caller should not block on it
   }
@@ -162,20 +192,36 @@ async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = fals
 
 export async function enterPosition({
   ticker, side, priceCents, contracts, exchangeIndex = null,
+  limitCents: providedLimit = null,
   reason = null, edgePct = null, teamName = null, sportKey = null, commenceTime = null,
 }) {
   if (contracts <= 0) return { filled: 0 };
 
   const config = loadConfig();
 
-  // Cross the spread by this much. At 0 the order quotes the ask exactly and
-  // never takes, so it expires unfilled on an IOC.
+  // THE LIMIT COMES FROM THE ENTRY DECISION.
+  //
+  // riskManager computes a WALK-UP LIMIT: the highest price at which this
+  // opportunity still clears the edge bar, and the price the trade was judged
+  // at. Quoting that instead of a flat ask+1c widens the fill window from one
+  // cent to as many as four, and cannot produce a negative-expectancy fill
+  // because the limit IS the threshold. Kalshi is a central limit order book,
+  // so a taker pays the MAKER's price - a limit at 52c against resting offers
+  // at 49/50/51 fills at 49, 50 and 51, not 52. The walk-up is free unless the
+  // book has genuinely moved away.
+  //
+  // The flat-cross path stays as a fallback for any caller that has no limit
+  // to hand, because an IOC quoted at the ask exactly never takes.
   const slippage = config.entrySlippageCents ?? 1;
-  const limitCents = clampPrice(priceCents + slippage);
+  const limitCents = providedLimit != null
+    ? clampPrice(Math.max(providedLimit, priceCents))
+    : clampPrice(priceCents + slippage);
 
   appendLog(
     `Placing entry order: BUY ${contracts}x ${ticker} @ ${limitCents}c ` +
-    `(ask ${priceCents}c + ${slippage}c cross)`
+    (providedLimit != null
+      ? `(ask ${priceCents}c, walk-up limit +${limitCents - priceCents}c - fills anywhere in between)`
+      : `(ask ${priceCents}c + ${slippage}c cross)`)
   );
 
   let result;
