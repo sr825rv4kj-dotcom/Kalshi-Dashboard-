@@ -6,7 +6,27 @@
  * edge check.
  *
  * ---------------------------------------------------------------------------
- * WHY THIS FILE WAS REPLACED: A CRASH THAT SILENTLY STOPPED TRADING
+ * THE ORDER LIMIT IS THE BAR (2026-09-21)
+ * ---------------------------------------------------------------------------
+ * riskManager now returns a WALK-UP LIMIT: the highest price at which this
+ * opportunity still clears the edge test, capped a few cents above the ask.
+ * That limit is passed straight through to the executor instead of a flat
+ * ask+1c cross, which widens the fill window from one cent to as many as four
+ * without moving the bar - the limit IS the bar, so any fill inside the band is
+ * positive by construction.
+ *
+ * Also here: the "best YES bid + 1c" price fallback is gone. It invented an ask
+ * when the book had no offers at all, reported resting BUY size as offer size,
+ * and hardcoded the spread to 1c so the spread gate could never fire. Every one
+ * of those was a guaranteed no-fill dressed up as a candidate.
+ *
+ * And every resolver refusal is now tallied by its CAUSE - wrong-date,
+ * opponent-side-only, none-tradeable - so "no matching Kalshi market" stops
+ * being one dead end and becomes a list of named, fixable things.
+ * ---------------------------------------------------------------------------
+ *
+ * ---------------------------------------------------------------------------
+ * EARLIER: A CRASH THAT SILENTLY STOPPED TRADING
  * ---------------------------------------------------------------------------
  * The in-play corroboration block called bump() on five paths. bump was
  * declared with `const` AFTER that block. `const` is in the temporal dead
@@ -54,7 +74,7 @@ import { corroboratedProbability, fractionRemaining, paramsFor } from "./liveMod
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-21-tdz-contained";
+export const SCANNER_VERSION = "2026-09-21-walkup";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -131,7 +151,7 @@ function bestLevel(levels) {
  * Price to buy YES, in order of reliability:
  *   1. market.yes_ask when the endpoint populates it
  *   2. 100c minus the best NO bid - buying YES means selling NO to a bidder
- *   3. best YES bid + 1c when nobody is offering
+ *   3. nothing - an empty NO side means there are no YES offers to take
  *
  * Also returns the spread, which is a liquidity signal in its own right: a
  * 15c-wide book means the fill price is a guess and the edge is imaginary.
@@ -183,10 +203,20 @@ export async function priceFor(ticker, market) {
     };
   }
 
-  if (bestYes && bestYes.price > 0 && bestYes.price < 99) {
+  // NO fallback to "best YES bid + 1".
+  //
+  // Reaching here means the NO side is empty, which means there are no YES
+  // offers at all. The old code invented a price one cent above the best BID,
+  // reported the size of resting BUY orders as though they were offers, and
+  // hardcoded spreadCents to 1 so the spread gate could never fire. The entry
+  // gate then approved a trade and the executor sent an order into a book with
+  // nothing to take. Every one of those was a guaranteed no-fill dressed up as
+  // a candidate.
+  if (bestYes && bestYes.price > 0) {
     return {
-      askCents: bestYes.price + 1, askSize: bestYes.size, bidCents,
-      spreadCents: 1, source: "book-yes-bid+1",
+      askCents: 0, askSize: 0, bidCents,
+      spreadCents: null,
+      source: `no-offers (best bid ${bestYes.price}c, nothing offered)`,
     };
   }
 
@@ -304,7 +334,11 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     if (!ticker) {
       const resolved = await resolveTicker({ sportKey, teamName, commenceTime });
       if (!resolved.ticker) {
+        // Tally the CAUSE, not just the count. "33 no matching Kalshi market"
+        // was one dead end; "18 wrong-date, 11 opponent-side-only, 4
+        // none-tradeable" is three fixable things.
         drops.unresolved++;
+        bump(`unresolved:${resolved.code || "unknown"}`);
         if (!sampleReason) sampleReason = `${teamName}: ${resolved.reason}`;
         return null;
       }
@@ -424,7 +458,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   // Assign the COUNT, not a single bump. The old line called bump() once per
   // key, so "6 unresolved" was recorded in the tally as "dropped:unresolved x1"
   // and the Strategy Review under-reported every bulk drop by its whole size.
-  for (const [k, n] of Object.entries(drops)) if (n) tally[`dropped:${k}`] = n;
+  // `unresolved` is already itemised by cause above, so it is not repeated here.
+  for (const [k, n] of Object.entries(drops)) {
+    if (n && k !== "unresolved") tally[`dropped:${k}`] = n;
+  }
   for (const [st, n] of Object.entries(statusCounts)) tally[`status:${st}`] = n;
 
   const maxSpread = config.maxSpreadCents ?? 6;
@@ -467,7 +504,9 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       maxPlausibleEdge: config.maxPlausibleEdge ?? 0.18,
       minEntryPriceCents: config.minEntryPriceCents ?? 25,
       maxEntryPriceCents: config.maxEntryPriceCents ?? 88,
-      minEvCentsPerContract: config.minEvCentsPerContract ?? 1,
+      minEvCentsPerContract: config.minEvCentsPerContract ?? 0,
+      minEvCentsPerTrade: config.minEvCentsPerTrade ?? 1,
+      maxWalkupCents: config.maxWalkupCents ?? 4,
       isLiveGame: c.timing.live,
       allowLiveGames: allowLive,
       lineAgeSeconds: c.lineAgeSeconds,
@@ -489,11 +528,14 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         (c.lineAgeSeconds != null ? `, quote ${Math.round(c.lineAgeSeconds)}s old` : "")
       : (c.timing.minutesUntilStart != null ? `${c.timing.minutesUntilStart.toFixed(0)}m to start` : "start time unknown");
     const liveNote = c.liveContext ? ` | ${c.liveContext}` : "";
+    const walk = assessment.walkupCents > 0
+      ? `, limit ${assessment.limitCents}c (+${assessment.walkupCents}c walk-up)`
+      : `, limit ${assessment.limitCents}c`;
     appendLog(
       `Candidate ${c.ticker} (${c.teamName}): sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ` +
-      `[${c.pricing.source}], edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}%, ` +
-      `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract, ` +
-      `${assessment.sizing.contracts} contracts ($${assessment.sizing.dollarsAtRisk.toFixed(2)}), ${startsIn}${liveNote}`
+      `[${c.pricing.source}]${walk}, edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}% at the limit, ` +
+      `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract (${assessment.edgeCheck.evTradeCents.toFixed(1)}c the trade), ` +
+      `${assessment.sizing.contracts} contracts (max $${assessment.sizing.dollarsAtRisk.toFixed(2)}), ${startsIn}${liveNote}`
     );
 
     let result = null;
@@ -502,11 +544,12 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         ticker: c.ticker,
         side: "yes",
         priceCents: askCents,
+        limitCents: assessment.limitCents,
         exchangeIndex: c.market?.exchange_index ?? null,
         contracts: assessment.sizing.contracts,
         reason:
           `${c.timing.live ? "In-play" : "Pre-game"} edge via ${probResult.provider} on "${c.teamName}" ` +
-          `(sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c, ` +
+          `(sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ask / ${assessment.limitCents}c limit, ` +
           `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract, held to settlement)`,
         edgePct: assessment.edgeCheck.observedEdge * 100,
         teamName: c.teamName,
