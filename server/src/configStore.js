@@ -165,4 +165,154 @@ export const DEFAULTS = {
   // while the ask was ~17c, taking $0.45 for something worth about $0.70 held.
   // Settlement is free; selling pays a fee AND the whole spread, which on a 10c
   // contract is proportionally enormous. So the exit now also requires a TIGHT
-  // book - proof there is a real
+  // book - proof there is a real buyer near fair value, not a void to dump into.
+  //
+  // Lowered from 12c because minEntryPriceCents is now 12c. Leaving both at 12
+  // would mean a position entered at the floor sat one tick away from its own
+  // exit trigger, and any ordinary dip would sell it at a fee plus the spread.
+  blowoutExitBelowCents: 7,
+  blowoutExitCollapsePct: 0.6,
+  blowoutExitMaxSpreadCents: 2,
+
+  // How far an in-play sharp line may sit from the in-game model before it is
+  // treated as a stale pre-game number rather than a live quote.
+  maxModelDisagreementPoints: 12,
+
+  reentryCooldownMinutes: 60,
+  dailyLossHaltPct: 0.15,
+  feeMultiplier: 0.07,
+  circuitBreakerFailures: 3,
+
+  // Survival mode: flat bets and a stricter edge bar at a small balance.
+  //
+  // The concurrency cap was 3, and that number was chosen when the bot FLIPPED
+  // positions - a slot freed up in minutes, so it was never the binding
+  // constraint. Holding to settlement changed that completely: a slot is now
+  // occupied for a whole game, three-plus hours. On a full Sunday slate the bot
+  // filled all three slots in minutes and then logged "at the concurrent
+  // position cap" every twenty seconds for the rest of the afternoon, with
+  // $12.89 of $18.89 sitting idle through the busiest window of the week.
+  //
+  // Ten slots at $1.75, up from six at $2. Near-identical capital at risk,
+  // spread across ten independent games instead of six. With a small edge per
+  // trade, what turns that edge into a reliable return is the NUMBER of
+  // independent bets, not the size of any one of them - six slots were filling
+  // within minutes of a full slate and then sitting at the cap while the rest
+  // of the board went untraded.
+  //
+  // At ~$20 tradable this deploys up to $17.50 and keeps a small buffer. On a
+  // smaller balance the one-contract floor still applies, so fewer slots simply
+  // fill rather than any order being rejected.
+  survivalMode: {
+    balanceThreshold: 40,
+    flatBetDollars: 1.75,
+    maxConcurrentPositions: 10,
+    // Was 1.25. The strategy has produced +37.6% ROI over 18 completed trades,
+    // so taxing every survival-mode entry by a further 25% of required edge was
+    // no longer buying safety - it was the difference between a 2.5% bar and a
+    // 3.1% one on trades that already clear break-even.
+    edgeMultiplier: 1.0,
+  },
+
+  // A held position ties up its slot for the length of a game, so concurrency
+  // is the throughput limit, not stake size.
+  //
+  // These caps used to go DOWN as the balance went up - 12 slots at $40, then
+  // 10 at $100; 14 at $500, then 12 at $2,500. Crossing a milestone would have
+  // REDUCED how many games the bot could hold at once, which is backwards and
+  // would have looked exactly like the bot mysteriously slowing down after a
+  // good run. They are monotonic now.
+  milestoneTiers: [
+    { at: 0,     kellyFraction: 0.25, maxConcurrentPositions: 10, maxStakeDollars: 3,   reservePct: 0.00 },
+    // First tier clear of survival mode: real Kelly sizing, more slots, because
+    // the constraint above $40 is opportunity rather than ruin.
+    { at: 40,    kellyFraction: 0.25, maxConcurrentPositions: 12, maxStakeDollars: 8,   reservePct: 0.00 },
+    { at: 100,   kellyFraction: 0.25, maxConcurrentPositions: 14, maxStakeDollars: 15,  reservePct: 0.10 },
+    { at: 500,   kellyFraction: 0.25, maxConcurrentPositions: 16, maxStakeDollars: 50,  reservePct: 0.20 },
+    { at: 2500,  kellyFraction: 0.30, maxConcurrentPositions: 18, maxStakeDollars: 200, reservePct: 0.30 },
+    { at: 10000, kellyFraction: 0.30, maxConcurrentPositions: 20, maxStakeDollars: 600, reservePct: 0.40 },
+  ],
+
+  // --- Account-level, never touched by the strategy migration ------------
+  oddsProviderOrder: ["the-odds-api", "oddspapi"],
+  oddsPapiTournamentIds: {},
+  scanIntervalMinutes: 15,
+  nonSportsEnabled: false,
+  autoStartOnBoot: true,
+  milestones: [100, 500, 1000, 5000, 10000, 50000],
+  monthlyCosts: { hosting: 25, oddsApi: 129, other: 0 },
+};
+
+function readRaw() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeRaw(obj) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(obj, null, 2));
+}
+
+/**
+ * Applies the strategy migration if the persisted file predates this build,
+ * then returns defaults merged with whatever the file holds.
+ */
+export function loadConfig() {
+  const stored = readRaw();
+
+  if ((stored.strategyVersion ?? 0) < STRATEGY_VERSION) {
+    const migrated = { ...stored };
+    for (const key of STRATEGY_KEYS) migrated[key] = DEFAULTS[key];
+    migrated.strategyVersion = STRATEGY_VERSION;
+    migrated.strategyMigratedAt = new Date().toISOString();
+    writeRaw(migrated);
+    console.log(
+      `[config] Strategy parameters migrated to v${STRATEGY_VERSION} ` +
+      `(live trading on, held to settlement, ${DEFAULTS.minEntryPriceCents}-${DEFAULTS.maxEntryPriceCents}c band, ` +
+      `up to ${DEFAULTS.survivalMode.maxConcurrentPositions} concurrent). Account settings preserved.`
+    );
+    return { ...DEFAULTS, ...migrated };
+  }
+
+  return { ...DEFAULTS, ...stored };
+}
+
+export function saveConfig(partial) {
+  const stored = readRaw();
+  const next = { ...stored, ...partial, strategyVersion: STRATEGY_VERSION };
+  writeRaw(next);
+  return { ...DEFAULTS, ...next };
+}
+
+export function setEnvironment(environment, confirmed) {
+  if (environment === "production" && !confirmed) {
+    throw new Error("Switching to production requires explicit confirmation of the real-funds warning.");
+  }
+  return saveConfig({
+    environment,
+    confirmedProductionAt: environment === "production" ? new Date().toISOString() : null,
+  });
+}
+
+/** What the dashboard shows so the active strategy is never a guess. */
+export function describeStrategy() {
+  const c = loadConfig();
+  return {
+    strategyVersion: c.strategyVersion ?? STRATEGY_VERSION,
+    migratedAt: c.strategyMigratedAt ?? null,
+    liveGames: c.allowLiveGames !== false
+      ? `ENABLED - in-play quotes accepted up to ${c.maxLineAgeSecondsLive}s old`
+      : "switched off in config",
+    exitPolicy: c.holdToSettlement === false
+      ? "active exits enabled"
+      : `held to settlement, except a take-out at ${c.ceilingExitAtCents}c+ and a blowout below ${c.blowoutExitBelowCents}c`,
+    priceBand: `${c.minEntryPriceCents}c - ${c.maxEntryPriceCents}c`,
+    minEv: `${c.minEvCentsPerContract}c per contract`,
+    sizing: `${(c.kellyFraction * 100).toFixed(0)}% Kelly, max ${(c.maxRiskPctPerTrade * 100).toFixed(0)}% of bankroll per trade`,
+    concurrency: `up to ${c.survivalMode?.maxConcurrentPositions ?? "tier"} positions at once ` +
+      `(flat $${c.survivalMode?.flatBetDollars ?? "-"} while the balance is under $${c.survivalMode?.balanceThreshold ?? "-"})`,
+  };
+}
