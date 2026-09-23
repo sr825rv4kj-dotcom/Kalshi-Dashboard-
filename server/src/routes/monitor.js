@@ -38,11 +38,34 @@ import { EXECUTOR_VERSION } from "../executor.js";
 import { describeCadence } from "../cadence.js";
 import { diagnose, startHealthAlerts, HEALTH_VERSION } from "../healthReport.js";
 
+/**
+ * Read MONITOR_TOKEN the way a phone-edited Railway variable actually arrives.
+ *
+ * Pasting on a phone can leave invisible characters: a trailing space or
+ * newline, wrapping quotes, a trailing comma, or a space inside the variable
+ * NAME. Any one of those made the exact comparison fail and the route answer
+ * 404 with no hint why. The name is matched case- and whitespace-insensitively
+ * and the value is stripped of whitespace, quotes and trailing punctuation.
+ * The token itself is hex, so none of the stripped characters can be part of it.
+ */
+function expectedToken() {
+  let raw = process.env.MONITOR_TOKEN;
+  if (raw == null) {
+    const key = Object.keys(process.env).find(
+      (k) => k.replace(/\s+/g, "").toUpperCase() === "MONITOR_TOKEN"
+    );
+    raw = key ? process.env[key] : "";
+  }
+  return String(raw || "")
+    .replace(/[\s"'`]+/g, "")
+    .replace(/[,;.]+$/, "");
+}
+
 /** Constant-time compare, so the token cannot be recovered by timing. */
 function tokenMatches(supplied) {
-  const expected = process.env.MONITOR_TOKEN || "";
+  const expected = expectedToken();
   if (!expected || !supplied) return false;
-  const a = Buffer.from(String(supplied));
+  const a = Buffer.from(String(supplied).trim());
   const b = Buffer.from(expected);
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
