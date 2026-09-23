@@ -37,6 +37,7 @@ import { SCANNER_VERSION } from "../scanner.js";
 import { EXECUTOR_VERSION } from "../executor.js";
 import { describeCadence } from "../cadence.js";
 import { diagnose, startHealthAlerts, HEALTH_VERSION } from "../healthReport.js";
+import { getRestingOrders, MAKER_VERSION } from "../makerEngine.js";
 
 /**
  * Read MONITOR_TOKEN the way a phone-edited Railway variable actually arrives.
@@ -112,7 +113,15 @@ export function registerMonitorRoutes(app) {
 
   app.get("/api/monitor/:token", (req, res) => {
     if (!tokenMatches(req.params.token)) {
-      return res.status(404).json({ error: "Not found." });
+      // DISTINCT STATUS CODES, so a failed check says WHY without a login.
+      // Every attempt so far came back a bare 404, and a 404 could mean the
+      // variable is missing, the token differs, or the route is not deployed.
+      //   503 - MONITOR_TOKEN is not set on the running server
+      //   403 - it is set, and the supplied token does not match it
+      //   404 - (from Express itself) this route is not deployed at all
+      // Neither reveals anything about the token's value.
+      if (!expectedToken()) return res.status(503).json({ error: "Monitor not configured on this server." });
+      return res.status(403).json({ error: "Wrong monitor token." });
     }
 
     const out = { at: new Date().toISOString() };
@@ -131,6 +140,7 @@ export function registerMonitorRoutes(app) {
       resolver: RESOLVER_VERSION,
       scanner: SCANNER_VERSION,
       executor: EXECUTOR_VERSION,
+      maker: MAKER_VERSION,
       cadence: describeCadence(),
     }));
 
@@ -165,6 +175,13 @@ export function registerMonitorRoutes(app) {
         samples: row.samples,
       })).sort((a, b) => a.ageSeconds - b.ageSeconds);
     });
+
+    // Every bid resting on Kalshi right now, and any cancel still clearing.
+    section("resting", () => Object.values(getRestingOrders()).map((o) => ({
+      ticker: o.ticker, teamName: o.teamName, priceCents: o.priceCents, contracts: o.contracts,
+      filledSeen: o.filledSeen || 0, placedAt: o.placedAt, refreshedAt: o.refreshedAt,
+      commenceTime: o.commenceTime, cancelPendingAt: o.cancelPendingAt ?? null, cancelAttempts: o.cancelAttempts ?? 0,
+    })));
 
     section("seriesMap", () => ({
       map: getSeriesMap(),
