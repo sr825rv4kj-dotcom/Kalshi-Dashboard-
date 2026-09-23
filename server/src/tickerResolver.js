@@ -58,7 +58,7 @@ const CACHE_TTL_MS = 3 * 60 * 1000;
 /** How many days either side of kickoff a ticker's date may sit. */
 const DATE_SLACK_DAYS = 1;
 
-export const RESOLVER_VERSION = "2026-09-22-ticker-code-identity";
+export const RESOLVER_VERSION = "2026-09-22-fixture-time";
 
 /**
  * The six confirmed, in-production mappings. Everything beyond this is
@@ -236,11 +236,64 @@ export function codeAffinity(code, teamName) {
   return 0;
 }
 
+/**
+ * KALSHI DATES AND TIMES ITS TICKERS IN US EASTERN, NOT UTC.
+ *
+ * Verified against real tickers and the scores feed on 2026-09-22:
+ *   KXMLBGAME-26SEP221840WSHDET  -> 6:40pm ET Sep 22 = 22:40Z  (feed: 22:40Z)
+ *   KXMLBGAME-26SEP221905TBNYY   -> 7:05pm ET Sep 22 = 23:05Z  (feed: 23:05Z)
+ *
+ * The odds feed publishes kickoff in UTC. Comparing the two DATES directly is
+ * the bug that bought tomorrow's games: any start at 8pm ET or later is
+ * already the NEXT day in UTC, so a 10:10pm ET game on Sep 22 (02:10Z Sep 23)
+ * "matched" the Sep 23 ticker - tomorrow night's game. Production held
+ * KXMLBGAME-26SEP232210SDLAD-SD and ...HOUSEA-HOU, both for Sep 23, priced
+ * off tonight's live odds.
+ */
+const ET_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York", year: "numeric", month: "numeric", day: "numeric",
+  hour: "numeric", minute: "numeric", hourCycle: "h23",
+});
+
+function etParts(ms) {
+  const o = {};
+  for (const p of ET_FMT.formatToParts(new Date(ms))) if (p.type !== "literal") o[p.type] = Number(p.value);
+  return o;
+}
+
+/** A US Eastern wall-clock time to UTC milliseconds, DST included. */
+function easternToUtcMs(year, monthIdx, day, hour, minute) {
+  const guess = Date.UTC(year, monthIdx, day, hour, minute);
+  const p = etParts(guess);
+  const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute);
+  const offset = asUtc - guess;                  // ET minus UTC, e.g. -4h in EDT
+  return guess - offset;
+}
+
+/** The Eastern calendar date of an instant, as a day number comparable to tickerDayNumber(). */
 function dayNumberOf(iso) {
   const ms = Date.parse(iso);
   if (!Number.isFinite(ms)) return null;
-  return Math.floor(ms / 86400000);
+  const p = etParts(ms);
+  return Math.floor(Date.UTC(p.year, p.month - 1, p.day) / 86400000);
 }
+
+/**
+ * The scheduled start a ticker encodes, in UTC ms, or null when the ticker
+ * carries a date but no time (e.g. KXNHLGAME-26SEP21STLDAL).
+ *   KXMLBGAME-26SEP222210SDLAD-SD -> Sep 22 22:10 ET -> 2026-09-23T02:10Z
+ */
+export function tickerStartMs(ticker) {
+  const m = /-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})(?=[A-Z])/.exec(String(ticker || "").toUpperCase());
+  if (!m) return null;
+  const month = MONTHS[m[2]];
+  const hh = Number(m[4]), mm = Number(m[5]);
+  if (month == null || hh > 23 || mm > 59) return null;
+  return easternToUtcMs(2000 + Number(m[1]), month, Number(m[3]), hh, mm);
+}
+
+/** A timed ticker further than this from kickoff is a different fixture. */
+const FIXTURE_WINDOW_MS = 12 * 60 * 60 * 1000;
 
 function normalize(t) {
   return (t || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
@@ -415,6 +468,35 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
     }
   }
 
+  // --- Gate 2b: it must be THIS fixture, to the hour --------------------
+  // The day gate above allows +/-1 day, which keeps tonight's AND tomorrow's
+  // game for any team that plays on consecutive days. Where the ticker carries
+  // its start time, anything more than 12 hours from this kickoff is a
+  // different game and is dropped here - tomorrow's same matchup is 24 hours
+  // away, so it can never be chosen for tonight's line again.
+  const commenceMs = Date.parse(commenceTime);
+  if (Number.isFinite(commenceMs)) {
+    const before = dated.length;
+    const kept = dated.filter((m) => {
+      const s0 = tickerStartMs(m.ticker);
+      return s0 == null || Math.abs(s0 - commenceMs) <= FIXTURE_WINDOW_MS;
+    });
+    if (!kept.length && before) {
+      return {
+        ticker: null, code: "wrong-date",
+        reason: `${series}: ${before} market(s) near this date, but none starting within 12h of ` +
+          `${new Date(commenceMs).toISOString()} - this fixture is not listed; refused rather than trading another day's game`,
+      };
+    }
+    dated = kept;
+  }
+
+  /** How far a market's scheduled start is from this kickoff; unknown sorts last. */
+  const startGap = (m) => {
+    const s0 = tickerStartMs(m.ticker);
+    return s0 == null || !Number.isFinite(commenceMs) ? Infinity : Math.abs(s0 - commenceMs);
+  };
+
   // --- Gate 3: the name ---------------------------------------------------
   const words = usableWords(teamName);
   if (!words.length) {
@@ -502,13 +584,18 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
       };
     }
 
-    // One code, possibly several fixtures - the date window is +/-1 day, so a
-    // team playing on consecutive days appears twice. Prefer the exact date,
-    // then the tighter book.
+    // One code, possibly several fixtures (a doubleheader, or a date-only
+    // ticker on consecutive days). Closest scheduled start wins; for tickers
+    // with no time, the Eastern calendar date must match; the tighter book
+    // breaks what is left.
     let best = leaders[0];
     if (leaders.length > 1) {
-      const exact = leaders.filter((x) => tickerDayNumber(x.m.ticker) === wantDay);
-      const pool = exact.length ? exact : leaders;
+      const minGap = Math.min(...leaders.map((x) => startGap(x.m)));
+      let pool = Number.isFinite(minGap) ? leaders.filter((x) => startGap(x.m) === minGap) : leaders;
+      if (!Number.isFinite(minGap)) {
+        const exact = pool.filter((x) => tickerDayNumber(x.m.ticker) === wantDay);
+        if (exact.length) pool = exact;
+      }
       const spreadOf = (x) => {
         const ask = Number(x.m.yes_ask ?? 0), bid = Number(x.m.yes_bid ?? 0);
         return ask > 0 && bid > 0 ? ask - bid : Infinity;
@@ -630,7 +717,11 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
       const ask = Number(x.m.yes_ask ?? 0), bid = Number(x.m.yes_bid ?? 0);
       return ask > 0 && bid > 0 ? ask - bid : Infinity;
     };
-    const best = leaders.reduce((a, b) => (spreadOf(b) < spreadOf(a) ? b : a));
+    const best = leaders.reduce((a, b) => {
+      const ga = startGap(a.m), gb = startGap(b.m);
+      if (ga !== gb) return gb < ga ? b : a;
+      return spreadOf(b) < spreadOf(a) ? b : a;
+    });
     return {
       ticker: best.m.ticker, code: "ok",
       reason: `matched YES side "${best.m.yes_sub_title ?? best.m.title}" ` +
