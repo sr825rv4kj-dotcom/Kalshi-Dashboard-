@@ -55,7 +55,7 @@ import { notifyEntry } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 import { currentCadenceSeconds } from "./cadence.js";
 
-export const MAKER_VERSION = "2026-09-22-exact-fee-quarter-cent";
+export const MAKER_VERSION = "2026-09-22-fill-or-toss";
 
 const V2 = "/trade-api/v2";
 const ORDERS_V2 = `${V2}/portfolio/events/orders`;
@@ -101,6 +101,12 @@ export function makerSettings(config = {}) {
     maxLineAgeSeconds: m.maxLineAgeSeconds ?? 1200,
     minEvCentsPerTrade: m.minEvCentsPerTrade ?? 1,
     staleScans: m.staleScans ?? 3,
+    // FILL OR TOSS. A bid gets this long to be filled. Unfilled, it is
+    // cancelled, and that market is not bid again at the same price or lower
+    // for the cooldown - only if the sharp line moves enough to justify a
+    // HIGHER bid. No bid sits on the book for hours waiting on a dip.
+    maxRestMinutes: m.maxRestMinutes ?? 10,
+    tossCooldownMinutes: m.tossCooldownMinutes ?? 30,
   };
 }
 
@@ -136,6 +142,40 @@ function writeResting(mutator) {
   state.restingOrders = resting;
   saveState(state);
   return resting;
+}
+
+/** Pure: has this bid used up its time on the book? */
+export function bidExpired(order, now = Date.now(), s = makerSettings()) {
+  const placed = Date.parse(order && order.placedAt);
+  return Number.isFinite(placed) && now - placed > s.maxRestMinutes * 60_000;
+}
+
+/**
+ * Pure: does a recent toss on this market block a new bid at `priceCents`?
+ * Blocked unless the new bid is HIGHER than the tossed one - a higher bid
+ * means the sharp line moved in its favour, which is new information; the
+ * same bid again is just the same unfilled order back on the book.
+ */
+export function tossBlocks(tossed, priceCents, now = Date.now(), s = makerSettings()) {
+  if (!tossed) return false;
+  const at = Date.parse(tossed.at);
+  if (!Number.isFinite(at) || now - at > s.tossCooldownMinutes * 60_000) return false;
+  return priceCents <= tossed.priceCents;
+}
+
+function readTossed(state = loadState()) {
+  const t = state.makerTossed;
+  return t && typeof t === "object" && !Array.isArray(t) ? t : {};
+}
+
+function recordToss(order) {
+  const state = loadState();
+  const tossed = readTossed(state);
+  tossed[order.ticker] = { at: new Date().toISOString(), priceCents: order.priceCents };
+  const cutoff = Date.now() - 24 * 3600_000;
+  for (const [k, v] of Object.entries(tossed)) if (Date.parse(v.at) < cutoff) delete tossed[k];
+  state.makerTossed = tossed;
+  saveState(state);
 }
 
 /** Tracked resting bids, keyed by ticker. */
@@ -415,6 +455,14 @@ export async function syncResting({ cap = null } = {}) {
         }
         continue;
       }
+      if (bidExpired(order, now)) {
+        const s = makerSettings();
+        if (await cancelResting(order.ticker, `unfilled after ${s.maxRestMinutes} min - tossed`)) {
+          recordToss(order);
+          out.tossed = (out.tossed || 0) + 1;
+        }
+        continue;
+      }
       if (now - Date.parse(order.refreshedAt || order.placedAt) > staleMs) {
         if (await cancelResting(order.ticker, "no scan has re-confirmed its price recently")) out.stale++;
       }
@@ -503,6 +551,11 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
     }
 
     if (!existing) {
+      const tossed = readTossed()[c.ticker];
+      if (tossBlocks(tossed, plan.priceCents, Date.now(), s)) {
+        const mins = Math.round((Date.now() - Date.parse(tossed.at)) / 60000);
+        return { action: "none", line: `${c.ticker}: ${tossed.priceCents}c bid went unfilled and was tossed ${mins}m ago - not re-posting at ${plan.priceCents}c` };
+      }
       const positions = loadState().positions.length;
       if (cap && positions + restingCount() >= cap) return { action: "none", line: `no free slot (${positions} held + ${restingCount()} bids, cap ${cap})` };
     }
