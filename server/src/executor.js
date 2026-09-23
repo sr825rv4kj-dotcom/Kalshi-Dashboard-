@@ -20,61 +20,7 @@ const V2 = "/trade-api/v2";
  */
 const ORDERS_PATH = `${V2}/portfolio/events/orders`;
 
-export const EXECUTOR_VERSION = "2026-09-22-auto-routed";
-
-const ALLOCATION_PATH = `${V2}/portfolio/target_balance_allocation`;
-
-/**
- * Kalshi splits collateral across exchange shards. A market names its shard in
- * market.exchange_index, and an order against a shard holding no collateral is
- * rejected even when the account has cash, because the cash is sitting on a
- * different shard. This tracks which shard the balance was last moved to.
- */
-let allocatedShard = null;
-
-/**
- * Per-shard balance in DOLLARS, from balance_breakdown.
- *
- * The unit is detected rather than assumed. The top-level `balance` on this
- * same response is known to be cents - every other caller in this codebase
- * divides it by 100 - but nothing documents the unit of the per-shard rows,
- * and getting it wrong is expensive in both directions: read cents as dollars
- * and the collateral wait passes instantly against an unfunded shard, so the
- * order fails and the trade is dropped; read dollars as cents and every shard
- * looks broke and nothing ever trades.
- *
- * So the rows are compared against the total, which is a known quantity. If
- * they sum to roughly the total they are cents; if they sum to roughly a
- * hundredth of it they are dollars. When the sum is unusable the code falls
- * back to treating them as cents, which matches the top-level field.
- */
-async function shardBalanceDollars(exchangeIndex) {
-  try {
-    const bal = await kalshiGet(`${V2}/portfolio/balance`);
-    const rows = bal.balance_breakdown ?? [];
-    if (!rows.length) return 0;
-
-    const totalCents = Number(bal.balance);
-    let sum = 0;
-    let mine = null;
-    for (const r of rows) {
-      const v = Number(r.balance) || 0;
-      sum += v;
-      if (Number(r.exchange_index) === Number(exchangeIndex)) mine = v;
-    }
-    if (mine == null) return 0;
-
-    let divisor = 100;                       // default: rows are cents, like bal.balance
-    if (Number.isFinite(totalCents) && totalCents > 0 && sum > 0) {
-      const asCents = Math.abs(sum - totalCents) / totalCents;
-      const asDollars = Math.abs(sum * 100 - totalCents) / totalCents;
-      divisor = asDollars < asCents ? 1 : 100;
-    }
-    return mine / divisor;
-  } catch {
-    return null; // unknown - caller should not block on it
-  }
-}
+export const EXECUTOR_VERSION = "2026-09-22-proven-routing";
 
 /**
  * Every shard's balance in dollars, as { exchangeIndex: dollars }.
@@ -103,65 +49,6 @@ export async function readShardBalances() {
   } catch {
     return null;
   }
-}
-
-/**
- * ASKS KALSHI TO MOVE COLLATERAL, AND DOES NOT STAND THERE WATCHING.
- *
- * This is now a LAST RESORT and should essentially never run. Orders no longer
- * pin themselves to a shard (see placeIOC), so Kalshi routes them itself and
- * there is nothing to move. It is kept only for the case where Kalshi rejects
- * an auto-routed order for balance anyway.
- *
- * It used to poll for a full SIXTY SECONDS, inside the scan loop, before
- * giving up on one market. From the live log:
- *
- *     6:19:18  Shard 3 has no collateral for ...NYMTEX-NYM - reallocating.
- *     6:20:19  Shard 3 holds $0.00 of the $1.76 needed after 60s.
- *     6:20:19  Skipping ...NYMTEX-NYM: collateral has not reached shard 3 yet.
- *
- * Sixty-one seconds, one market, no trade - and at a 20s cadence that is three
- * entire scan cycles skipped, every time. The request is now fired, the market
- * is skipped, and the next scan takes it. A short probe is kept only so the
- * log can say whether money actually started moving.
- */
-async function requestCollateralMove(exchangeIndex, needDollars = 0, { probeMs = 9000 } = {}) {
-  try {
-    // The response was previously discarded, which left the one call that
-    // mattered completely unobservable: it returned 2xx while moving nothing,
-    // and nothing in the log could show that. It is logged now.
-    const res = await kalshiPost(ALLOCATION_PATH, {
-      allocations: [{ exchange_index: exchangeIndex, percent: 100 }],
-      resting_margin_reservation: "max",
-    });
-    appendLog(`Allocation request for shard ${exchangeIndex} accepted by Kalshi: ${JSON.stringify(res).slice(0, 300)}`);
-  } catch (err) {
-    appendLog(`Could not request collateral for shard ${exchangeIndex}: ${err.message}`, "warn");
-    return false;
-  }
-  allocatedShard = exchangeIndex;
-
-  // Short probe: three quick looks, not twenty. Enough to report progress,
-  // far too short to stall a scan.
-  const steps = Math.max(1, Math.round(probeMs / 3000));
-  let last = null;
-  for (let i = 0; i < steps; i++) {
-    await new Promise((r) => setTimeout(r, 3000));
-    const have = await shardBalanceDollars(exchangeIndex);
-    if (have == null) break;
-    last = have;
-    if (have >= needDollars) {
-      appendLog(`Collateral reached shard ${exchangeIndex}: $${have.toFixed(2)} (needed $${needDollars.toFixed(2)}).`);
-      return true;
-    }
-  }
-
-  appendLog(
-    `Collateral requested for shard ${exchangeIndex} ($${needDollars.toFixed(2)} needed, ` +
-    `$${last == null ? "?" : last.toFixed(2)} there now). Not waiting - Kalshi settles this on its own ` +
-    `and the next scan will pick the market up.`
-  );
-  return false;
 }
 
 /** Marks an error as a collateral-routing failure rather than a system fault. */
@@ -214,30 +101,27 @@ async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = fals
   };
   if (reduceOnly) body.reduce_only = true;
 
-  // EXCHANGE_INDEX IS DELIBERATELY NOT SENT.
+  // EXCHANGE_INDEX IS SENT - AND REMOVING IT WAS A MISTAKE.
   //
-  // This one field is why the bot held zero positions with a funded account.
-  // Kalshi's API changelog:
+  // Every fill in the account's history (Sep 19 19:39 through Sep 22 06:52 -
+  // lanus +162%, the Blackhawks, the Blues, Sri Lanka) was placed by a version
+  // of this file that sent the market's own exchange_index. The 12:23 version
+  // removed it on the belief that omitting it auto-routes. Kalshi's sharding
+  // guide says otherwise, verbatim:
   //
-  //   "Exchange auto-routing enabled by default when providing market_ticker
-  //    and excluding exchange_index parameter."
+  //   "If exchange_index is omitted and market_ticker is provided, auto-routes
+  //    using market_ticker. Otherwise, defaults to exchange index 0."
   //
-  // So sending the market's own shard index DISABLES auto-routing and pins the
-  // order to that shard. On 2026-09-22 every viable MLB market sat on shard 3,
-  // shard 3 held $0.00, and all six positive-EV candidates were rejected -
-  // while the account's whole balance sat idle on another shard with NO open
-  // positions holding it there.
+  // This body carries `ticker`, not `market_ticker`, so omission sent every
+  // order to shard 0 - where a shard-3 MLB market does not exist. Zero fills
+  // followed. And auto-routing would not have helped anyway: it routes the
+  // ORDER to the market's shard, it does not move COLLATERAL there.
   //
-  // The reallocation dance built around that rejection could never have fixed
-  // it. The POST returned 2xx every time - there is no "Could not request
-  // collateral" line anywhere in the production log - so Kalshi was accepting
-  // the request and treating it as a no-op, and the bot waited on money that
-  // was never in transit. Omitting the field hands routing back to Kalshi,
-  // which is what it does by default and what it does correctly.
-  //
-  // The caller still passes exchangeIndex; it is recorded on the position and
-  // used by the balance-error fallback below, but it never goes on the order.
-  void exchangeIndex;
+  // So the order goes to the market's own shard, exactly as it did for every
+  // trade that ever filled. Whether that shard HAS money is decided by the
+  // target balance allocation set in the Kalshi UI - see the balance-error
+  // handler below, which says so in the log.
+  if (exchangeIndex != null) body.exchange_index = exchangeIndex;
 
   let res;
   try {
@@ -245,21 +129,23 @@ async function placeIOC({ ticker, side, limitCents, contracts, reduceOnly = fals
   } catch (err) {
     // Kalshi reports a shard with no collateral as either
     // insufficient_shard_balance (404) or the generic insufficient_balance
-    // (400). Reaching here now means auto-routing itself could not find the
-    // money, which is a genuinely different situation from the one this used
-    // to fire on constantly.
+    // (400). Both mean the same thing when the account plainly has cash: the
+    // money is on a different shard from the one this market trades on.
     const isBalanceIssue = /insufficient_(shard_)?balance/.test(String(err.message));
     if (isBalanceIssue && exchangeIndex != null) {
-      appendLog(`Auto-routed order for ${ticker} still refused for balance - requesting collateral on shard ${exchangeIndex}.`, "warn");
-      const needDollars = (clampPrice(limitCents) / 100) * Number(contracts) * 1.15; // + fee headroom
-      const funded = await requestCollateralMove(exchangeIndex, needDollars);
-      if (!funded) {
-        // Do not re-send an order that will be rejected again. The move is in
-        // flight; the next scan takes this market.
-        throw tagBalanceError(new Error(`insufficient_shard_balance (shard ${exchangeIndex}, move requested)`));
-      }
-      body.client_order_id = newClientOrderId();
-      res = await kalshiPost(ORDERS_PATH, body);
+      // NO AUTOMATIC REALLOCATION. The bot used to POST
+      // {exchange_index: N, percent: 100} here - an instruction to put the
+      // ENTIRE balance on this one shard. It never demonstrably moved money
+      // (the production log shows $0.00 on the shard after 9s and after 60s),
+      // and if Kalshi ever did act on it, it would overwrite the account's
+      // own allocation and starve every other shard, so the next market on the
+      // other shard would fail and flip it back. The allocation belongs to the
+      // account holder, set once in the Kalshi UI; Kalshi then rebalances to it
+      // every 10 seconds on its own.
+      throw tagBalanceError(new Error(
+        `insufficient_shard_balance on shard ${exchangeIndex} - fund it by setting a target ` +
+        `allocation at kalshi.com/account/exchange-indexes`
+      ));
     } else {
       throw err;
     }
@@ -322,8 +208,10 @@ export async function enterPosition({
     // the bot outright, so it is reported and skipped instead.
     if (err.isShardFunding || /insufficient_(shard_)?balance/.test(String(err.message))) {
       appendLog(
-        `${ticker}: collateral is on another shard. Move requested for shard ${exchangeIndex}; ` +
-        `this market is picked up on the next scan. Trading continues on funded shards now.`, "warn"
+        `${ticker}: shard ${exchangeIndex} holds no collateral, so Kalshi refused the order. ` +
+        `Fix once, permanently: set a target balance allocation that funds shard ${exchangeIndex} at ` +
+        `kalshi.com/account/exchange-indexes - Kalshi then keeps it funded every 10 seconds. ` +
+        `Trading continues on funded shards meanwhile.`, "warn"
       );
       return { filled: 0, skipped: "shard-unfunded" };
     }
