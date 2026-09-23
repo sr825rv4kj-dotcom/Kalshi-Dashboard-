@@ -55,7 +55,7 @@ import { notifyEntry } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 import { currentCadenceSeconds } from "./cadence.js";
 
-export const MAKER_VERSION = "2026-09-22-resting-bids";
+export const MAKER_VERSION = "2026-09-22-async-cancel";
 
 const V2 = "/trade-api/v2";
 const ORDERS_V2 = `${V2}/portfolio/events/orders`;
@@ -174,6 +174,13 @@ export function planBid({ trueProbability, bidCents, askCents, existingPriceCent
   if (target < (minEntryPriceCents || 1) || (askCents > 0 && target >= askCents)) {
     return { priceCents: null, maxBid, reason: "no room between the bid and the ask" };
   }
+  // Already resting at exactly the price it would be re-placed at. Leave it:
+  // cancelling and re-placing at the same price only gives up queue position.
+  // (Production 21:23-21:25: every bid sat below a better outside bid at its
+  // own ceiling, so each scan "re-priced" it to the price it already had.)
+  if (existingPriceCents != null && existingPriceCents === target) {
+    return { priceCents: existingPriceCents, maxBid, keep: true, reason: "already at the best qualifying price" };
+  }
   return { priceCents: target, maxBid, keep: false, reason: target === maxBid ? "at the highest qualifying price" : "one cent over the best bid" };
 }
 
@@ -198,19 +205,27 @@ function sizeFor({ bankroll, trueProbability, priceCents, config }) {
 // Exchange calls
 // ---------------------------------------------------------------------------
 
-async function cancelOnExchange(order) {
-  const query = order.exchangeIndex != null
-    ? `?exchange_index=${order.exchangeIndex}&market_ticker=${encodeURIComponent(order.ticker)}`
-    : `?exchange_index=-1&market_ticker=${encodeURIComponent(order.ticker)}`;
+/**
+ * Sends the cancel. Returns { sent, reducedBy, note }.
+ *
+ * The first attempt goes to the order's own shard; a retry (attempt >= 2)
+ * auto-routes by market ticker instead, so a wrong stored shard cannot leave
+ * an order uncancellable.
+ */
+async function cancelOnExchange(order, attempt = 1) {
+  const t = encodeURIComponent(order.ticker);
+  const query = order.exchangeIndex != null && attempt < 2
+    ? `?exchange_index=${order.exchangeIndex}&market_ticker=${t}`
+    : `?exchange_index=-1&market_ticker=${t}`;
   try {
-    await kalshiDelete(`${ORDERS_V2}/${order.orderId}`, query);
-    return true;
+    const res = await kalshiDelete(`${ORDERS_V2}/${order.orderId}`, query);
+    return { sent: true, reducedBy: countOf(res.reduced_by), note: `reduced_by ${res.reduced_by ?? "?"}` };
   } catch (err) {
-    // 404: already gone - filled, expired or cancelled. The fill check below
-    // decides which; it is not an error.
-    if (/\b404\b/.test(String(err.message))) return true;
-    appendLog(`Could not cancel resting bid ${order.ticker} (${err.message}) - will retry next cycle.`, "warn");
-    return false;
+    // 404: nothing to cancel - already filled, expired or cancelled. The next
+    // sync reads the order and books any fill; it is not an error.
+    if (/\b404\b/.test(String(err.message))) return { sent: true, reducedBy: 0, note: "404 - already off the book" };
+    appendLog(`Could not cancel resting bid ${order.ticker} (${String(err.message).slice(0, 160)}) - will retry next cycle.`, "warn");
+    return { sent: false, reducedBy: 0, note: String(err.message).slice(0, 80) };
   }
 }
 
@@ -289,25 +304,36 @@ function bookFill(order, contracts, priceCents, feeCentsReported = null, feesToD
     .catch(() => {});
 }
 
-/** Cancels one tracked order, books any fills it took first, and stops tracking it. */
+/**
+ * Requests a cancel. Returns true once the request is on its way.
+ *
+ * CANCELS ARE ASYNCHRONOUS. Production, 21:23:34: every order read back as
+ * "resting" the instant after a successful cancel, and read back as gone on
+ * the very next cycle 20 seconds later. Treating the instant read-back as a
+ * failure produced a wall of false "not confirmed" warnings.
+ *
+ * So the order stays TRACKED, marked cancelPending, until a later sync sees
+ * Kalshi report it off the book - and books any contracts it filled in the
+ * meantime. While a cancel is pending, no replacement bid is placed on that
+ * game and no taker entry is made on it, so the game can never be bought twice.
+ */
 export async function cancelResting(ticker, why) {
   const order = readResting()[ticker];
   if (!order) return true;
-  const ok = await cancelOnExchange(order);
-  if (!ok) return false;
-  // VERIFY, do not assume. A 404 can mean "already gone" - or a cancel sent to
-  // the wrong shard. Only stop tracking once Kalshi itself says the order is no
-  // longer resting; otherwise it would sit on the book with nobody watching it.
-  try {
-    const { status } = await absorbFills(order);
-    if (status === "resting") {
-      appendLog(`Cancel of resting bid ${ticker} was not confirmed by Kalshi - still resting, retrying next cycle.`, "warn");
-      return false;
-    }
-  } catch { /* unreadable - keep tracking; the next sync re-reads it */ return false; }
-  writeResting((r) => { delete r[ticker]; });
-  appendLog(`Cancelled resting bid ${ticker} @ ${order.priceCents}c - ${why}.`);
+  if (order.cancelPendingAt) return true;               // already requested; sync confirms it
+  const r = await cancelOnExchange(order, 1);
+  if (!r.sent) return false;
+  writeResting((all) => {
+    if (all[ticker]) { all[ticker].cancelPendingAt = new Date().toISOString(); all[ticker].cancelAttempts = 1; all[ticker].cancelWhy = why; }
+  });
+  appendLog(`Cancel requested for resting bid ${ticker} @ ${order.priceCents}c (${r.note}) - ${why}.`);
   return true;
+}
+
+/** True while this ticker, or any ticker on the same game, has a cancel still clearing. */
+export function cancelPendingOnEvent(ticker) {
+  const ev = eventKeyOf(ticker);
+  return Object.values(readResting()).some((o) => o.cancelPendingAt && eventKeyOf(o.ticker) === ev);
 }
 
 export async function cancelAllResting(why) {
@@ -342,6 +368,24 @@ export async function syncResting({ cap = null } = {}) {
       if (status !== "resting") {
         writeResting((r) => { delete r[order.ticker]; });
         out.dropped++;
+        if (order.cancelPendingAt) {
+          appendLog(`Cancel confirmed: resting bid ${order.ticker} @ ${order.priceCents}c is off the book (${status}).`);
+        }
+        continue;
+      }
+      if (order.cancelPendingAt) {
+        // Still resting a full cycle after the cancel was sent. Re-send, the
+        // second time auto-routed by ticker in case the stored shard is wrong.
+        const waited = now - Date.parse(order.cancelPendingAt);
+        if (waited > 15_000) {
+          const attempt = (order.cancelAttempts || 1) + 1;
+          const r = await cancelOnExchange(order, attempt);
+          writeResting((all) => { if (all[order.ticker]) { all[order.ticker].cancelAttempts = attempt; all[order.ticker].cancelPendingAt = new Date().toISOString(); } });
+          appendLog(
+            `Resting bid ${order.ticker} still on the book ${Math.round(waited / 1000)}s after cancel - re-sent ` +
+            `(attempt ${attempt}, ${r.note}).`, attempt >= 3 ? "warn" : "info"
+          );
+        }
         continue;
       }
       if (now - Date.parse(order.refreshedAt || order.placedAt) > staleMs) {
@@ -355,8 +399,9 @@ export async function syncResting({ cap = null } = {}) {
   if (cap) {
     try {
       const positions = loadState().positions.length;
-      const live = Object.values(readResting()).sort((a, b) => Date.parse(b.placedAt) - Date.parse(a.placedAt));
-      let excess = positions + live.length - cap;
+      const all = Object.values(readResting());
+      const live = all.filter((o) => !o.cancelPendingAt).sort((a, b) => Date.parse(b.placedAt) - Date.parse(a.placedAt));
+      let excess = positions + all.length - cap;
       for (const o of live) {
         if (excess <= 0) break;
         if (await cancelResting(o.ticker, `making room - ${positions} position(s) plus bids reached the ${cap} cap`)) {
@@ -386,6 +431,9 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
   };
 
   try {
+    if (existing && existing.cancelPendingAt) {
+      return { action: "none", line: `${c.ticker}: waiting for the previous bid's cancel to clear` };
+    }
     if (!s.enabled) return refuse("resting bids switched off");
     if (c.timing.live && !s.allowLive) return refuse("game is live - resting bids are pre-game only");
 
@@ -402,6 +450,7 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
     const ev = eventKeyOf(c.ticker);
     if (heldEvents.has(ev)) return refuse("already holding this game");
     const otherSide = Object.values(readResting()).find((o) => o.ticker !== c.ticker && eventKeyOf(o.ticker) === ev);
+    if (!existing && cancelPendingOnEvent(c.ticker)) return { action: "none", line: "a cancel on this game is still clearing" };
     if (otherSide) return { action: "none", line: `already bidding the other side (${otherSide.ticker})` };
 
     const plan = planBid({
@@ -432,11 +481,10 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
     }
 
     if (existing) {
+      // Re-price in two steps: cancel now, place the new bid once Kalshi has
+      // confirmed the old one is off the book (next cycle). Never two bids live.
       const ok = await cancelResting(c.ticker, `re-pricing ${existing.priceCents}c -> ${plan.priceCents}c`);
-      if (!ok) return { action: "none", line: "cancel failed - left as is" };
-      if (loadState().positions.some((p) => eventKeyOf(p.ticker) === ev)) {
-        return { action: "filled", line: `${c.ticker} filled while re-pricing` };
-      }
+      return { action: ok ? "repriced" : "none", line: ok ? `${c.ticker}: re-pricing ${existing.priceCents}c -> ${plan.priceCents}c (new bid after the cancel clears)` : "cancel failed - left as is" };
     }
 
     const expireSec = Math.floor(startMs / 1000) - s.expireBeforeStartSeconds;
