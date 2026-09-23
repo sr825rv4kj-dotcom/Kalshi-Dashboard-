@@ -20,7 +20,7 @@ const V2 = "/trade-api/v2";
  */
 const ORDERS_PATH = `${V2}/portfolio/events/orders`;
 
-export const EXECUTOR_VERSION = "2026-09-22-proven-routing";
+export const EXECUTOR_VERSION = "2026-09-22-fees-recorded";
 
 /**
  * Every shard's balance in dollars, as { exchangeIndex: dollars }.
@@ -74,6 +74,17 @@ function centsToDollarString(cents) {
 /** Kalshi's fixed-point count string, e.g. 3 -> "3.00". */
 function countString(n) {
   return Number(n).toFixed(2);
+}
+
+/**
+ * Total fee Kalshi charged on a fill, in whole cents. `average_fee_paid` is a
+ * per-contract dollar string ("0.0175"); rounding it to cents BEFORE
+ * multiplying would turn 1.75c into 2c on every contract.
+ */
+function totalFeeCents(raw, filled) {
+  const perContract = Number(raw?.average_fee_paid);
+  if (!Number.isFinite(perContract) || !(filled > 0)) return null;
+  return Math.round(perContract * 100 * filled * 1e6) / 1e6;
 }
 
 /** Dollar string back to cents, e.g. "0.3100" -> 31. */
@@ -237,6 +248,7 @@ export async function enterPosition({
     action: "enter", ticker, side: "yes", contracts, priceCents: fillPrice, filled,
     reason: reason || "no reason recorded", edgePct, environment: config.environment,
     teamName, sportKey, commenceTime,
+    feeCents: filled > 0 ? totalFeeCents(result.raw, filled) : 0,
   });
 
   if (filled > 0) {
@@ -258,6 +270,8 @@ export async function exitPosition(position, reason) {
   let remaining = contracts;
   let attempts = 0;
   let lastExitPriceCents = null;
+  let exitFeeCents = 0;
+  let exitFeeKnown = true;
 
   while (remaining > 0 && attempts < 3) {
     attempts++;
@@ -293,6 +307,8 @@ export async function exitPosition(position, reason) {
     try {
       const res = await placeIOC({ ticker, side: "ask", limitCents, contracts: remaining, reduceOnly: true, exchangeIndex });
       if (res.filled > 0) {
+        const f = totalFeeCents(res.raw, res.filled);
+        if (f == null) exitFeeKnown = false; else exitFeeCents += f;
         lastExitPriceCents = res.priceCents;
         remaining -= res.filled;
         appendLog(`Sold ${res.filled}x ${ticker} @ ${res.priceCents}c (${reason})`);
@@ -317,6 +333,7 @@ export async function exitPosition(position, reason) {
     action: "exit", ticker, side: "yes", contracts, priceCents: position.entryPriceCents,
     exitPriceCents: lastExitPriceCents,
     filled: contracts - remaining, reason, edgePct: null, environment: config.environment,
+    feeCents: exitFeeKnown ? exitFeeCents : null,
     teamName: position.teamName ?? null,
     sportKey: position.sportKey ?? null,
     commenceTime: position.commenceTime ?? null,
