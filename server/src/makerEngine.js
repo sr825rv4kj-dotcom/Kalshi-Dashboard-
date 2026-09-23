@@ -50,12 +50,12 @@
 import { kalshiGet, kalshiPost, kalshiDelete } from "./kalshiClient.js";
 import { appendLog, loadState, saveState } from "./stateStore.js";
 import { recordTrade, scheduleFeeCents } from "./tradeLedgerStore.js";
-import { feeCentsAt, requiredEdgeThreshold, fractionalKellySize } from "./riskManager.js";
+import { feeCentsAt, requiredEdgeThreshold, fractionalKellySize, feePerContractCents, flatBetContracts } from "./riskManager.js";
 import { notifyEntry } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 import { currentCadenceSeconds } from "./cadence.js";
 
-export const MAKER_VERSION = "2026-09-22-series-maker-fee";
+export const MAKER_VERSION = "2026-09-22-exact-fee-quarter-cent";
 
 const V2 = "/trade-api/v2";
 const ORDERS_V2 = `${V2}/portfolio/events/orders`;
@@ -160,20 +160,20 @@ export function restingEventKeys() {
  * plus the buffer. Strictly below the ask, so a post-only order is accepted.
  * Returns null when no price in the band qualifies.
  */
-export function maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents = 12, maxEntryPriceCents = 95, multiplier = MAKER_FEE_MULTIPLIER }) {
+export function maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents = 12, maxEntryPriceCents = 95, multiplier = MAKER_FEE_MULTIPLIER, contractsAt = () => 1 }) {
   const ceiling = Math.min(maxEntryPriceCents || 99, 99, askCents > 0 ? askCents - 1 : 99);
   const floor = Math.max(1, minEntryPriceCents || 1);
   for (let c = ceiling; c >= floor; c--) {
     const edge = trueProbability - c / 100;
-    const required = requiredEdgeThreshold({ price: c / 100, multiplier, expectRoundTrip: false });
+    const required = requiredEdgeThreshold({ price: c / 100, multiplier, expectRoundTrip: false, contracts: contractsAt(c) });
     if (edge > required) return c;
   }
   return null;
 }
 
 /** Expected value per contract of a maker fill at `priceCents`, held to settlement. */
-export function makerEvCents(trueProbability, priceCents, multiplier = MAKER_FEE_MULTIPLIER) {
-  return trueProbability * 100 - priceCents - feeCentsAt(priceCents, multiplier);
+export function makerEvCents(trueProbability, priceCents, multiplier = MAKER_FEE_MULTIPLIER, contracts = 1) {
+  return trueProbability * 100 - priceCents - feePerContractCents(priceCents, contracts, multiplier);
 }
 
 /**
@@ -187,8 +187,8 @@ export function makerEvCents(trueProbability, priceCents, multiplier = MAKER_FEE
  *
  * Pure, so it can be checked against real book numbers.
  */
-export function planBid({ trueProbability, bidCents, askCents, existingPriceCents = null, minEntryPriceCents, maxEntryPriceCents, multiplier = MAKER_FEE_MULTIPLIER }) {
-  const maxBid = maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents, maxEntryPriceCents, multiplier });
+export function planBid({ trueProbability, bidCents, askCents, existingPriceCents = null, minEntryPriceCents, maxEntryPriceCents, multiplier = MAKER_FEE_MULTIPLIER, contractsAt = () => 1 }) {
+  const maxBid = maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents, maxEntryPriceCents, multiplier, contractsAt });
   if (maxBid == null) return { priceCents: null, maxBid: null, reason: "no price below the ask clears the maker fee" };
 
   if (existingPriceCents != null && existingPriceCents <= maxBid && existingPriceCents < askCents
@@ -215,8 +215,8 @@ function sizeFor({ bankroll, trueProbability, priceCents, config, multiplier = M
   const perContract = (priceCents + fee) / 100;
   const sm = config.survivalMode;
   if (sm && bankroll < sm.balanceThreshold) {
-    let n = Math.floor((sm.flatBetDollars || 1) / perContract);
-    if (n < 1 && bankroll >= perContract) n = 1;
+    let n = flatBetContracts(sm.flatBetDollars || 1, priceCents, multiplier);
+    if (n * perContract > bankroll) n = Math.floor(bankroll / perContract);
     return n;
   }
   const s = fractionalKellySize({
@@ -315,7 +315,7 @@ function bookFill(order, contracts, priceCents, feeCentsReported = null, feesToD
   state.restingOrders = resting;
   saveState(state);
 
-  const ev = makerEvCents(order.trueProbability ?? 0, priceCents, mult);
+  const ev = makerEvCents(order.trueProbability ?? 0, priceCents, mult, contracts);
   const reason =
     `Resting bid filled on "${order.teamName}" (sharp ${((order.trueProbability ?? 0) * 100).toFixed(1)}% vs ${priceCents}c bid, ` +
     `maker fee ${feeCents}c for ${contracts}, EV ${ev.toFixed(1)}c/contract, held to settlement)`;
@@ -481,8 +481,13 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
     if (otherSide) return { action: "none", line: `already bidding the other side (${otherSide.ticker})` };
 
     const mult = makerMultiplierFor(c.ticker);
+    const sm = config.survivalMode;
+    const contractsAt = sm && bankroll < sm.balanceThreshold
+      ? (px) => flatBetContracts(sm.flatBetDollars || 1, px, mult)
+      : () => 1;
     const plan = planBid({
       multiplier: mult,
+      contractsAt,
       trueProbability: c.trueProbability,
       bidCents: c.pricing.bidCents,
       askCents: c.pricing.askCents,
@@ -504,7 +509,7 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
 
     const contracts = sizeFor({ bankroll, trueProbability: c.trueProbability, priceCents: plan.priceCents, config, multiplier: mult });
     if (contracts < 1) return refuse("bankroll cannot fund one contract");
-    const evCents = makerEvCents(c.trueProbability, plan.priceCents, mult);
+    const evCents = makerEvCents(c.trueProbability, plan.priceCents, mult, contracts);
     if (evCents * contracts < s.minEvCentsPerTrade) {
       return refuse(`expected value ${(evCents * contracts).toFixed(2)}c for the trade is under the ${s.minEvCentsPerTrade}c floor`);
     }
