@@ -82,7 +82,7 @@ import { appendLog, loadState, saveState } from "./stateStore.js";
 import { resolveTicker } from "./tickerResolver.js";
 import { getLiveScores, findLiveGameForTeam } from "./scoresFetcher.js";
 import { corroboratedProbability, fractionRemaining, paramsFor } from "./liveModel.js";
-import { workCandidate, cancelResting, getRestingOrders } from "./makerEngine.js";
+import { workCandidate, cancelResting, getRestingOrders, cancelPendingOnEvent } from "./makerEngine.js";
 
 const V2 = "/trade-api/v2";
 
@@ -614,8 +614,18 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
 
     // A taker entry beats a resting bid on the same game. Cancel the bid
     // first so the account never ends up holding the game twice.
+    let bidOnGame = false;
     for (const o of Object.values(getRestingOrders())) {
-      if (eventKeyOf(o.ticker) === eventKeyOf(c.ticker)) await dropResting(o.ticker, `taking ${c.ticker} at the ask instead`);
+      if (eventKeyOf(o.ticker) === eventKeyOf(c.ticker)) {
+        bidOnGame = true;
+        await dropResting(o.ticker, `taking ${c.ticker} at the ask instead`);
+      }
+    }
+    // Cancels clear asynchronously. Until Kalshi confirms the bid is off the
+    // book, taking would risk holding this game twice - wait one cycle.
+    if (bidOnGame || cancelPendingOnEvent(c.ticker)) {
+      rejected.push(`${c.ticker}: taker entry waits one cycle for a resting bid on this game to clear`);
+      continue;
     }
 
     const startsIn = c.timing.live
