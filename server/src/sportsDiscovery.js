@@ -47,7 +47,7 @@ import { loadState, saveState, appendLog } from "./stateStore.js";
 const ODDS_API_BASE = "https://api.the-odds-api.com/v4";
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h - season status barely moves
 
-export const SPORTS_DISCOVERY_VERSION = "2026-09-22-quarantine";
+export const SPORTS_DISCOVERY_VERSION = "2026-09-22-no-outrights";
 
 /** Consecutive barren scans before a sport is parked. */
 const STRIKES_TO_PARK = 3;
@@ -78,6 +78,21 @@ const BOARD_CONDITIONS = new Set([
   "dropped:window",
 ]);
 
+/**
+ * FUTURES ARE NOT GAMES (2026-09-22).
+ *
+ * The odds feed lists outright markets - "golf_masters_tournament_winner",
+ * "politics_us_presidential_election_winner", "..._super_bowl_winner" - as
+ * sports in their own right, flagged has_outrights. The scanner prices
+ * head-to-head GAME lines only, so every one of those failed its odds request
+ * every cycle. Production 22:06: six "Sharp odds feed failed" rows, all six
+ * outrights, which the health report then named as the MAIN blocker - pointing
+ * at the odds API key when nothing was wrong with it.
+ */
+function isGameSport(s) {
+  return s && s.active && !s.has_outrights && !/_winner$/.test(String(s.key || ""));
+}
+
 /** Every sport the odds feed currently reports as active, mapped or not. */
 export async function allActiveSportKeys() {
   const apiKey = process.env.THE_ODDS_API_KEY;
@@ -86,7 +101,7 @@ export async function allActiveSportKeys() {
     const res = await fetch(`${ODDS_API_BASE}/sports?apiKey=${apiKey}`);
     if (!res.ok) return [];
     const all = await res.json();
-    return all.filter((s) => s.active).map((s) => s.key);
+    return all.filter(isGameSport).map((s) => s.key);
   } catch {
     return [];
   }
@@ -210,7 +225,7 @@ export async function discoverActiveSports() {
       const res = await fetch(`${ODDS_API_BASE}/sports?apiKey=${apiKey}`);
       if (!res.ok) return cache?.sports ?? [];
       const body = await res.json();
-      all = body.filter((s) => s.active).map((s) => s.key);
+      all = body.filter(isGameSport).map((s) => s.key);
       cache = { all, sports: cache?.sports ?? [], fetchedAt: Date.now() };
     } catch {
       return cache?.sports ?? [];
