@@ -1,134 +1,138 @@
 import fs from "fs";
-import path from "path";
-import { DATA_DIR } from "./paths.js";
+import crypto from "crypto";
 
-const LEDGER_PATH = path.join(DATA_DIR, "trade-ledger.json");
+let cachedPrivateKey = null;
 
-function ensureFile() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(LEDGER_PATH)) {
-    fs.writeFileSync(LEDGER_PATH, JSON.stringify([], null, 2));
-  }
-}
-
-export function loadLedger() {
-  ensureFile();
-  return JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8"));
-}
-
-function writeLedger(ledger) {
-  fs.writeFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2));
-}
-
-export function recordTrade({
-  action, ticker, side, contracts, priceCents, reason, environment, edgePct, filled,
-  teamName, sportKey, commenceTime, exitPriceCents,
-}) {
-  const ledger = loadLedger();
-  ledger.push({
-    timestamp: new Date().toISOString(),
-    action, ticker, side, contracts, priceCents, filled, edgePct, reason, environment,
-    exitPriceCents: exitPriceCents ?? null,
-    teamName: teamName ?? null,
-    sportKey: sportKey ?? null,
-    commenceTime: commenceTime ?? null,
-  });
-  writeLedger(ledger);
-}
-
-export function getRecentTrades(limit = 100) {
-  const ledger = loadLedger();
-  return ledger.slice(-limit).reverse();
+function getConfig() {
+  return {
+    keyId: process.env.KALSHI_API_KEY_ID,
+    keyPath: process.env.KALSHI_PRIVATE_KEY_PATH,
+    keyPem: process.env.KALSHI_PRIVATE_KEY_PEM,
+    baseUrl: process.env.KALSHI_API_BASE || "https://api.elections.kalshi.com/trade-api/v2",
+  };
 }
 
 /**
- * Pairs each entry with its matching exit to produce completed round-trips
- * with real cost, proceeds, net P&L and ROI.
- *
- * All dollar figures derive from actual fill prices and counts recorded at
- * execution time - nothing here is estimated or simulated.
+ * Key file wins over the env var. This order matters: the env var is set once
+ * at deploy time and never changes, while the file is what the app writes when
+ * you save new credentials. With the old precedence, rotating your Kalshi key
+ * in the app updated the Key ID but kept signing with the stale env-var key -
+ * which Kalshi rejects as INCORRECT_API_KEY_SIGNATURE, with no clue why.
  */
-export function getTradeLifecycles() {
-  const ledger = loadLedger();
+function getPrivateKey() {
+  if (cachedPrivateKey) return cachedPrivateKey;
+  const { keyPath, keyPem } = getConfig();
 
-  // Pair on LEDGER ORDER, not on a strict timestamp comparison. An exit that
-  // landed in the same second as its entry - routine with immediate-or-cancel
-  // orders - failed "exit.timestamp > entry.timestamp" and left the trade
-  // stranded as permanently open, with no cost, proceeds or ROI ever reported.
-  const entries = ledger
-    .map((t, i) => ({ ...t, _i: i }))
-    .filter((t) => t.action === "enter" && t.filled > 0);
-  const exits = ledger
-    .map((t, i) => ({ ...t, _i: i }))
-    .filter((t) => t.action === "exit" && t.filled > 0);
-  const usedExitIndexes = new Set();
-
-  const completed = [];
-  const open = [];
-
-  for (const entry of entries) {
-    const exitIndex = exits.findIndex(
-      (x, i) => !usedExitIndexes.has(i) && x.ticker === entry.ticker && x._i > entry._i
-    );
-
-    const costDollars = (entry.filled * entry.priceCents) / 100;
-
-    if (exitIndex === -1) {
-      open.push({
-        ...entry,
-        costDollars,
-        status: "open",
-      });
-      continue;
-    }
-
-    usedExitIndexes.add(exitIndex);
-    const exit = exits[exitIndex];
-    const proceedsDollars = (exit.filled * (exit.exitPriceCents ?? exit.priceCents)) / 100;
-    const netDollars = proceedsDollars - costDollars;
-    const roiPct = costDollars > 0 ? (netDollars / costDollars) * 100 : null;
-
-    completed.push({
-      ticker: entry.ticker,
-      side: entry.side,
-      teamName: entry.teamName,
-      sportKey: entry.sportKey,
-      commenceTime: entry.commenceTime,
-      environment: entry.environment,
-      entryTimestamp: entry.timestamp,
-      exitTimestamp: exit.timestamp,
-      contracts: entry.filled,
-      entryPriceCents: entry.priceCents,
-      exitPriceCents: exit.exitPriceCents ?? exit.priceCents,
-      costDollars,
-      proceedsDollars,
-      netDollars,
-      roiPct,
-      entryReason: entry.reason,
-      exitReason: exit.reason,
-      edgePct: entry.edgePct,
-      status: "closed",
-    });
+  if (keyPath && fs.existsSync(keyPath)) {
+    cachedPrivateKey = fs.readFileSync(keyPath, "utf8");
+    return cachedPrivateKey;
   }
 
-  return { completed: completed.reverse(), open: open.reverse() };
+  if (keyPem) {
+    cachedPrivateKey = keyPem.replace(/\\n/g, "\n"); // literal and escaped newlines
+    return cachedPrivateKey;
+  }
+
+  throw new Error(
+    "Kalshi private key not found. Enter your credentials in the app, or set " +
+    "KALSHI_PRIVATE_KEY_PEM as a fallback."
+  );
 }
 
-export function getTradeStats() {
-  const { completed, open } = getTradeLifecycles();
-  const wins = completed.filter((t) => t.netDollars > 0).length;
-  const losses = completed.filter((t) => t.netDollars < 0).length;
-  const totalNet = completed.reduce((sum, t) => sum + t.netDollars, 0);
-  const totalCost = completed.reduce((sum, t) => sum + t.costDollars, 0);
+export function resetCredentialsCache() {
+  cachedPrivateKey = null;
+}
+
+export function hasCredentialsConfigured() {
+  const { keyId, keyPath, keyPem } = getConfig();
+  if (!keyId) return false;
+  if (keyPath && fs.existsSync(keyPath)) return true;
+  return Boolean(keyPem);
+}
+
+/**
+ * Reports which source the key came from and a fingerprint of its public half.
+ * No private key material is ever returned. Surfacing this is the difference
+ * between "401" and "you are signing with the wrong key".
+ */
+export function describeCredentials() {
+  const { keyId, keyPath, keyPem } = getConfig();
+  const usingFile = Boolean(keyPath && fs.existsSync(keyPath));
+
+  let fingerprint = null;
+  let keyError = null;
+  try {
+    const pub = crypto.createPublicKey(getPrivateKey());
+    fingerprint = crypto
+      .createHash("sha256")
+      .update(pub.export({ type: "spki", format: "der" }))
+      .digest("hex")
+      .slice(0, 16);
+  } catch (err) {
+    keyError = err.message;
+  }
 
   return {
-    totalEntries: completed.length + open.length,
-    totalExits: completed.length,
-    openCount: open.length,
-    wins,
-    losses,
-    winRatePct: completed.length ? (wins / completed.length) * 100 : null,
-    totalNetDollars: totalNet,
-    overallRoiPct: totalCost > 0 ? (totalNet / totalCost) * 100 : null,
+    keyId: keyId ? `${keyId.slice(0, 8)}...` : null,
+    source: usingFile ? "saved in app" : keyPem ? "KALSHI_PRIVATE_KEY_PEM env var" : "none",
+    envVarAlsoSet: Boolean(keyPem),
+    keyFileExists: usingFile,
+    fingerprint,
+    keyError,
   };
+}
+
+function signRequest(method, requestPath) {
+  const { keyId } = getConfig();
+  if (!keyId) throw new Error("Kalshi API Key ID is not set. Enter your credentials in the app.");
+
+  const timestamp = Date.now().toString();
+  const message = timestamp + method.toUpperCase() + requestPath;
+
+  const signature = crypto.sign("sha256", Buffer.from(message, "utf8"), {
+    key: getPrivateKey(),
+    padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+    saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+  });
+
+  return {
+    "KALSHI-ACCESS-KEY": keyId,
+    "KALSHI-ACCESS-SIGNATURE": signature.toString("base64"),
+    "KALSHI-ACCESS-TIMESTAMP": timestamp,
+  };
+}
+
+function root() {
+  return getConfig().baseUrl.replace("/trade-api/v2", "");
+}
+
+export async function kalshiGet(requestPath, query = "") {
+  const headers = signRequest("GET", requestPath);
+  const res = await fetch(`${root()}${requestPath}${query}`, { method: "GET", headers });
+  if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+export async function kalshiPost(requestPath, body) {
+  const headers = { ...signRequest("POST", requestPath), "Content-Type": "application/json" };
+  const res = await fetch(`${root()}${requestPath}`, { method: "POST", headers, body: JSON.stringify(body) });
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
+  return data;
+}
+
+/**
+ * DELETE with an optional query string. The query is NOT part of the signed
+ * message - Kalshi signs the path only, exactly as kalshiGet does. Cancelling
+ * an order on a non-default exchange shard needs `?exchange_index=` here, or
+ * the cancel is sent to shard 0 and misses the order.
+ */
+export async function kalshiDelete(requestPath, query = "") {
+  const headers = signRequest("DELETE", requestPath);
+  const res = await fetch(`${root()}${requestPath}${query}`, { method: "DELETE", headers });
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
+  return data;
 }
