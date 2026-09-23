@@ -6,6 +6,17 @@
  * edge check.
  *
  * ---------------------------------------------------------------------------
+ * RESTING BIDS (2026-09-22)
+ * ---------------------------------------------------------------------------
+ * A market refused "edge-too-small" is no longer a dead end. It is handed to
+ * makerEngine.js, which rests a post-only bid at the highest price that clears
+ * the quarter-size MAKER fee. Tonight's slate: 16 of 20 MLB markets were in
+ * exactly that state - fairly priced for a taker, profitable for a maker.
+ * A bid on a market refused for any other reason is cancelled, and a taker
+ * entry on a game cancels any bid resting on that game first.
+ * ---------------------------------------------------------------------------
+ *
+ * ---------------------------------------------------------------------------
  * THE ORDER LIMIT IS THE BAR (2026-09-21)
  * ---------------------------------------------------------------------------
  * riskManager now returns a WALK-UP LIMIT: the highest price at which this
@@ -71,10 +82,11 @@ import { appendLog, loadState, saveState } from "./stateStore.js";
 import { resolveTicker } from "./tickerResolver.js";
 import { getLiveScores, findLiveGameForTeam } from "./scoresFetcher.js";
 import { corroboratedProbability, fractionRemaining, paramsFor } from "./liveModel.js";
+import { workCandidate, cancelResting, getRestingOrders } from "./makerEngine.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-22-shard-aware";
+export const SCANNER_VERSION = "2026-09-22-resting-bids";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -299,7 +311,7 @@ export async function scanSport(args) {
   }
 }
 
-async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvents }) {
+async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvents, positionCap = null }) {
   // ---------------------------------------------------------------------
   // Declared FIRST. This is the fix. Every path below - including the
   // in-play corroboration block, which runs long before the entry loop -
@@ -389,7 +401,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
 
       const pricing = await priceFor(ticker, market);
       return {
-        teamName, trueProbability, commenceTime, ticker, market, timing, pricing,
+        teamName, trueProbability, commenceTime, ticker, market, timing, pricing, sportKey,
         lineAgeSeconds: info.lineAgeSeconds ?? null,
       };
     } catch (err) {
@@ -496,6 +508,17 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   let entered = 0;
   let stopScanning = false;
 
+  // RESTING BIDS (makerEngine.js). A market refused as too tight to TAKE is
+  // handed to the maker path, which rests a post-only bid at the highest price
+  // that still clears the quarter-size maker fee. Any other refusal cancels a
+  // bid already resting on that market - its reason for resting is gone.
+  const maker = { rested: 0, repriced: 0, kept: 0, cancelled: 0, filled: 0, none: 0, error: 0 };
+  let makerExample = null;
+  const heldEvents = new Set(loadState().positions.map((p) => eventKeyOf(p.ticker)));
+  const dropResting = async (ticker, why) => {
+    if (getRestingOrders()[ticker] && await cancelResting(ticker, why)) maker.cancelled++;
+  };
+
   // FUNDED SHARDS FIRST.
   //
   // A candidate on a shard with no collateral cannot fill until Kalshi moves
@@ -537,6 +560,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     if (askCents <= 0 || askCents >= 100) {
       bump("no-price", `${c.ticker}: ${c.pricing.source}`);
       rejected.push(`${c.ticker}: ${c.pricing.source}`);
+      await dropResting(c.ticker, "no usable price in the book");
       continue;
     }
 
@@ -546,6 +570,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       const wide = `${c.ticker}: ${c.pricing.spreadCents}c spread exceeds the ${maxSpread}c limit`;
       bump("spread-too-wide", wide);
       rejected.push(wide);
+      await dropResting(c.ticker, "book too wide to trust");
       continue;
     }
 
@@ -577,7 +602,20 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       const line = `${c.ticker} ${askCents}c [${c.pricing.source}] (sharp ${(c.trueProbability * 100).toFixed(1)}%): ${assessment.reason}`;
       bump(assessment.code || "skip-other", line);
       rejected.push(line);
+      if (assessment.code === "edge-too-small") {
+        const m = await workCandidate({ c, config, bankroll, cap: positionCap, heldEvents });
+        maker[m.action] = (maker[m.action] || 0) + 1;
+        if (!makerExample || (m.action !== "none" && m.action !== "kept")) makerExample = m.line;
+      } else {
+        await dropResting(c.ticker, assessment.reason);
+      }
       continue;
+    }
+
+    // A taker entry beats a resting bid on the same game. Cancel the bid
+    // first so the account never ends up holding the game twice.
+    for (const o of Object.values(getRestingOrders())) {
+      if (eventKeyOf(o.ticker) === eventKeyOf(c.ticker)) await dropResting(o.ticker, `taking ${c.ticker} at the ask instead`);
     }
 
     const startsIn = c.timing.live
@@ -622,6 +660,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
 
     if (result && result.filled > 0) {
       openEvents.add(eventKeyOf(c.ticker));
+      heldEvents.add(eventKeyOf(c.ticker));
       entered += 1;
     } else if (result && result.skipped) {
       // NOT the same thing as an order that expired. The executor reports
@@ -647,6 +686,14 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   }
   if (rejected.length) {
     appendLog(`${sportKey}: e.g. ${rejected[0]}`);
+  }
+  const makerTouched = Object.values(maker).some((n) => n > 0);
+  if (makerTouched) {
+    appendLog(
+      `${sportKey}: resting bids - ${maker.rested} placed, ${maker.repriced} re-priced, ${maker.kept} kept, ` +
+      `${maker.cancelled} cancelled, ${maker.filled} filled while re-pricing, ${maker.none} not placed, ${maker.error} error(s)` +
+      (makerExample ? ` | e.g. ${makerExample}` : "")
+    );
   }
   recordScanTally(sportKey, tally, teamEntries.length, entered, samples);
   return stopScanning;
