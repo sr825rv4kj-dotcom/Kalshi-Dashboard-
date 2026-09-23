@@ -687,10 +687,10 @@ export async function runCycle() {
     // plus bids never exceed the cap. Runs BEFORE the cap check below, so a
     // fill is counted before the cycle decides whether it has room.
     const makerSync = await syncResting({ cap: positionCapFor(config, bankroll) });
-    if (makerSync.filled || makerSync.stale || makerSync.trimmed) {
+    if (makerSync.filled || makerSync.stale || makerSync.trimmed || makerSync.tossed) {
       appendLog(
-        `Resting bids: ${makerSync.filled} contract(s) filled, ${makerSync.stale} cancelled as unconfirmed, ` +
-        `${makerSync.trimmed} cancelled to stay under the position cap.`
+        `Resting bids: ${makerSync.filled} contract(s) filled, ${makerSync.tossed || 0} tossed unfilled, ` +
+        `${makerSync.stale} cancelled as unconfirmed, ${makerSync.trimmed} cancelled to stay under the position cap.`
       );
     }
 
