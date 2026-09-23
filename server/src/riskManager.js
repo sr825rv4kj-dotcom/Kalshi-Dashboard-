@@ -73,6 +73,52 @@
 
 const DEFAULT_FEE_MULTIPLIER = 0.07;
 
+export const RISK_VERSION = "2026-09-22-exact-fee-quarter-cent";
+
+/**
+ * ---------------------------------------------------------------------------
+ * 2026-09-22 (night): THE BAR IS NOW THE REAL FEE PLUS A QUARTER CENT
+ * ---------------------------------------------------------------------------
+ * Two changes, chosen by the account holder from three measured options.
+ *
+ * 1. THE FEE IS CHARGED THE WAY KALSHI CHARGES IT. Kalshi's schedule is
+ *    round up(0.07 x C x P x (1-P)) on the ORDER - C contracts together - not
+ *    rounded up per contract. At 79c, two contracts cost 3c in fees, not 4c;
+ *    at 50c, three cost 6c and five cost 9c, not 10c. Rounding per contract
+ *    overstated the fee by up to 0.9c per contract on every multi-contract
+ *    order, and the bar carried the overstatement.
+ *
+ * 2. THE SAFETY MARGIN IS A FLAT 0.25c PER CONTRACT, down from
+ *    max(0.5c, a quarter of the fee). It still sits on top of the exact fee,
+ *    so no trade is taken without positive expected value against the sharp
+ *    line - the margin is only the cushion for that line being slightly off.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Kalshi's fee for a whole ORDER of `contracts` at `priceCents`, in cents,
+ * rounded up once on the total as the fee schedule specifies. The product is
+ * rounded to 1e-9 first so float noise cannot add a phantom cent.
+ */
+export function orderFeeCents(priceCents, contracts = 1, multiplier = DEFAULT_FEE_MULTIPLIER) {
+  const p = priceCents / 100;
+  const n = Math.max(1, Math.floor(contracts || 1));
+  if (!(p > 0 && p < 1) || !(multiplier > 0)) return 0;
+  return Math.ceil(Math.round(multiplier * n * p * (1 - p) * 100 * 1e9) / 1e9);
+}
+
+/** Effective fee per contract, in cents, on an order of `contracts`. */
+export function feePerContractCents(priceCents, contracts = 1, multiplier = DEFAULT_FEE_MULTIPLIER) {
+  const n = Math.max(1, Math.floor(contracts || 1));
+  return orderFeeCents(priceCents, n, multiplier) / n;
+}
+
+/** Contracts a flat dollar stake buys at this price (fee included, conservatively per contract). */
+export function flatBetContracts(flatDollars, priceCents, multiplier = DEFAULT_FEE_MULTIPLIER) {
+  const perContract = (priceCents + orderFeeCents(priceCents, 1, multiplier)) / 100;
+  return Math.max(1, Math.floor((flatDollars || 1) / perContract));
+}
+
 /** Kalshi rounds the fee UP to a whole cent per contract, per trade. */
 export function feeCentsAt(priceCents, multiplier = DEFAULT_FEE_MULTIPLIER) {
   const p = priceCents / 100;
@@ -95,8 +141,8 @@ export function perContractFee(price, multiplier = DEFAULT_FEE_MULTIPLIER) {
  *
  *   EV = p*100 - priceCents - fee(priceCents)
  */
-export function evPerContractCents({ trueProbability, priceCents, multiplier = DEFAULT_FEE_MULTIPLIER }) {
-  return trueProbability * 100 - priceCents - feeCentsAt(priceCents, multiplier);
+export function evPerContractCents({ trueProbability, priceCents, multiplier = DEFAULT_FEE_MULTIPLIER, contracts = 1 }) {
+  return trueProbability * 100 - priceCents - feePerContractCents(priceCents, contracts, multiplier);
 }
 
 /**
@@ -110,12 +156,13 @@ export function requiredEdgeThreshold({
   price,
   multiplier = DEFAULT_FEE_MULTIPLIER,
   expectRoundTrip = false,
-  minTickBuffer = 0.005,
-  feeSafetyMultiplier = 0.25,
+  minTickBuffer = 0.0025,
+  feeSafetyMultiplier = 0,
   bufferMultiplier = 1,
+  contracts = 1,
 }) {
   const priceCents = Math.round(price * 100);
-  const entryFee = feeCentsAt(priceCents, multiplier) / 100;
+  const entryFee = feePerContractCents(priceCents, contracts, multiplier) / 100;
   const fees = expectRoundTrip ? entryFee * 2 : entryFee;
   // The fee is arithmetic - no multiplier belongs on it. Only the BUFFER is a
   // policy choice, so survival mode scales that and leaves break-even alone.
@@ -215,6 +262,7 @@ export function walkupLimitCents({
   maxEntryPriceCents = 95,
   bufferMultiplier = 1,
   maxWalkupCents = 4,
+  contractsAt = () => 1,
 }) {
   const ask = Math.round(askCents);
   if (!(ask > 0 && ask < 100)) return null;
@@ -228,7 +276,7 @@ export function walkupLimitCents({
   for (let c = top; c >= bottom; c--) {
     const edge = trueProbability - c / 100;
     const required = requiredEdgeThreshold({
-      price: c / 100, multiplier, expectRoundTrip: false, bufferMultiplier,
+      price: c / 100, multiplier, expectRoundTrip: false, bufferMultiplier, contracts: contractsAt(c),
     });
     if (edge > required) return c;
   }
@@ -352,6 +400,14 @@ export function assessOpportunity({
   const inSurvivalMode = survivalMode && bankroll < survivalMode.balanceThreshold;
   const edgeMultiplier = inSurvivalMode ? survivalMode.edgeMultiplier || 1 : 1;
 
+  // How many contracts the order would be at a given price, so the fee is
+  // charged on the order as Kalshi charges it. Survival mode is a flat stake,
+  // so the count is known exactly. Kelly sizing depends on the edge itself, so
+  // it is priced as a single contract - the most conservative fee.
+  const contractsAt = inSurvivalMode
+    ? (c) => flatBetContracts(survivalMode.flatBetDollars || 1, c, multiplier)
+    : () => 1;
+
   // --- Gate 4: the WALK-UP LIMIT ---
   //
   // The most this opportunity is worth paying. If even the ask does not clear
@@ -361,31 +417,33 @@ export function assessOpportunity({
   const limitCents = walkupLimitCents({
     trueProbability, askCents, multiplier,
     minEntryPriceCents, maxEntryPriceCents,
-    bufferMultiplier: edgeMultiplier, maxWalkupCents,
+    bufferMultiplier: edgeMultiplier, maxWalkupCents, contractsAt,
   });
 
   if (limitCents == null) {
-    const askFee = feeCentsAt(askCents, multiplier);
+    const n = contractsAt(askCents);
+    const askFee = feePerContractCents(askCents, n, multiplier);
     const askRequired = requiredEdgeThreshold({
-      price: askCents / 100, multiplier, expectRoundTrip: false, bufferMultiplier: edgeMultiplier,
+      price: askCents / 100, multiplier, expectRoundTrip: false, bufferMultiplier: edgeMultiplier, contracts: n,
     });
     return {
       action: "skip",
       code: "edge-too-small",
       reason: `edge ${(askEdge * 100).toFixed(2)}% at the ${askCents}c ask is below the ` +
-        `${(askRequired * 100).toFixed(2)}% needed to clear the ${askFee}c fee - no price in the band clears` +
-        (inSurvivalMode ? " (survival mode - stricter bar)" : ""),
+        `${(askRequired * 100).toFixed(2)}% needed (${askFee.toFixed(2)}c fee per contract on ${n}, plus the 0.25c margin) - no price in the band clears` +
+        (edgeMultiplier > 1 ? ` (survival mode - margin x${edgeMultiplier})` : ""),
     };
   }
 
   const priceCents = limitCents;
   const fillPrice = limitCents / 100;
   const observedEdge = trueProbability - fillPrice;
+  const nAtLimit = contractsAt(limitCents);
   const requiredEdge = requiredEdgeThreshold({
-    price: fillPrice, multiplier, expectRoundTrip: false, bufferMultiplier: edgeMultiplier,
+    price: fillPrice, multiplier, expectRoundTrip: false, bufferMultiplier: edgeMultiplier, contracts: nAtLimit,
   });
   const margin = observedEdge - requiredEdge;
-  const evCents = evPerContractCents({ trueProbability, priceCents, multiplier });
+  const evCents = evPerContractCents({ trueProbability, priceCents, multiplier, contracts: nAtLimit });
 
   // The per-CONTRACT floor, if an old config still carries one. Off by default.
   if (minEvCentsPerContract && evCents < minEvCentsPerContract) {
@@ -405,10 +463,9 @@ export function assessOpportunity({
     // "$1.75 flat bet" spent $1.89 at 25c and $1.82 at 12c - the flat bet was
     // not flat, and it drifted most at exactly the cheap prices the band was
     // just opened to.
-    const flatDollars = survivalMode.flatBetDollars || 1;
     const perContract = (limitCents + feeCentsAt(limitCents, multiplier)) / 100;
-    let contracts = Math.floor(flatDollars / perContract);
-    if (contracts < 1 && bankroll >= perContract) contracts = 1;
+    let contracts = nAtLimit;
+    if (contracts * perContract > bankroll) contracts = Math.floor(bankroll / perContract);
     sizing = {
       contracts,
       dollarsAtRisk: contracts * perContract,
