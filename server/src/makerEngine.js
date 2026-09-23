@@ -55,14 +55,40 @@ import { notifyEntry } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 import { currentCadenceSeconds } from "./cadence.js";
 
-export const MAKER_VERSION = "2026-09-22-async-cancel";
+export const MAKER_VERSION = "2026-09-22-series-maker-fee";
 
 const V2 = "/trade-api/v2";
 const ORDERS_V2 = `${V2}/portfolio/events/orders`;
 const ORDERS_READ = `${V2}/portfolio/orders`;
 
-/** Kalshi's maker multiplier where one applies. Assumed everywhere - conservative. */
+/** Kalshi's maker multiplier on the series that carry one. */
 export const MAKER_FEE_MULTIPLIER = 0.0175;
+
+/**
+ * THE SERIES THAT CHARGE MAKER FEES - verbatim from Kalshi's published fee
+ * schedule (kalshi.com/docs/kalshi-fee-schedule.pdf, July 2026 update). Every
+ * other series has a maker multiplier of zero.
+ *
+ * The first version assumed 0.0175 on EVERY series. On MLB that is wrong -
+ * KXMLBGAME is not on this list - and it cost a full cent on every bid: on
+ * tonight's board it held all seven bids one cent further from the best bid
+ * than the arithmetic required, which is a cent further from being filled.
+ */
+const MAKER_FEE_SERIES = new Set([
+  "KXAAAGASM", "KXGDP", "KXPAYROLLS", "KXU3", "KXEGGS", "KXCPI", "KXCPIYOY", "KXFEDDECISION", "KXFED",
+  "KXNBA", "KXNBAEAST", "KXNBAWEST", "KXNBASERIES", "KXNBAGAME", "KXNHL", "KXNHLEAST", "KXNHLWEST",
+  "KXNHLSERIES", "KXNHLGAME", "KXINDY500", "KXPGA", "KXUSOPEN", "KXPGARYDER", "KXTHEOPEN", "KXPGASOLHEIM",
+  "KXFOMENSINGLES", "KXFOWOMENSINGLES", "KXWMENSINGLES", "KXWWOMENSINGLES", "KXUSOMENSINGLES",
+  "KXUSOWOMENSINGLES", "KXAOMENSINGLES", "KXAOWOMENSINGLES", "KXNFLGAME", "KXUEFACL", "KXNBAFINALSMVP",
+  "KXCONNSMYTHE", "KXFOMEN", "KXFOWOMEN", "KXNATHANSHD", "KXNATHANDOGS", "KXCLUBWC", "KXTOURDEFRANCE",
+  "KXNASCARRACE",
+]);
+
+/** The maker multiplier for this market: 0.0175 on a listed series, 0 otherwise. */
+export function makerMultiplierFor(ticker) {
+  const series = String(ticker || "").split("-")[0].toUpperCase();
+  return MAKER_FEE_SERIES.has(series) ? MAKER_FEE_MULTIPLIER : 0;
+}
 
 /** Every setting, with the default that applies when config.maker omits it. */
 export function makerSettings(config = {}) {
@@ -134,20 +160,20 @@ export function restingEventKeys() {
  * plus the buffer. Strictly below the ask, so a post-only order is accepted.
  * Returns null when no price in the band qualifies.
  */
-export function maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents = 12, maxEntryPriceCents = 95 }) {
+export function maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents = 12, maxEntryPriceCents = 95, multiplier = MAKER_FEE_MULTIPLIER }) {
   const ceiling = Math.min(maxEntryPriceCents || 99, 99, askCents > 0 ? askCents - 1 : 99);
   const floor = Math.max(1, minEntryPriceCents || 1);
   for (let c = ceiling; c >= floor; c--) {
     const edge = trueProbability - c / 100;
-    const required = requiredEdgeThreshold({ price: c / 100, multiplier: MAKER_FEE_MULTIPLIER, expectRoundTrip: false });
+    const required = requiredEdgeThreshold({ price: c / 100, multiplier, expectRoundTrip: false });
     if (edge > required) return c;
   }
   return null;
 }
 
 /** Expected value per contract of a maker fill at `priceCents`, held to settlement. */
-export function makerEvCents(trueProbability, priceCents) {
-  return trueProbability * 100 - priceCents - feeCentsAt(priceCents, MAKER_FEE_MULTIPLIER);
+export function makerEvCents(trueProbability, priceCents, multiplier = MAKER_FEE_MULTIPLIER) {
+  return trueProbability * 100 - priceCents - feeCentsAt(priceCents, multiplier);
 }
 
 /**
@@ -161,8 +187,8 @@ export function makerEvCents(trueProbability, priceCents) {
  *
  * Pure, so it can be checked against real book numbers.
  */
-export function planBid({ trueProbability, bidCents, askCents, existingPriceCents = null, minEntryPriceCents, maxEntryPriceCents }) {
-  const maxBid = maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents, maxEntryPriceCents });
+export function planBid({ trueProbability, bidCents, askCents, existingPriceCents = null, minEntryPriceCents, maxEntryPriceCents, multiplier = MAKER_FEE_MULTIPLIER }) {
+  const maxBid = maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents, maxEntryPriceCents, multiplier });
   if (maxBid == null) return { priceCents: null, maxBid: null, reason: "no price below the ask clears the maker fee" };
 
   if (existingPriceCents != null && existingPriceCents <= maxBid && existingPriceCents < askCents
@@ -184,8 +210,8 @@ export function planBid({ trueProbability, bidCents, askCents, existingPriceCent
   return { priceCents: target, maxBid, keep: false, reason: target === maxBid ? "at the highest qualifying price" : "one cent over the best bid" };
 }
 
-function sizeFor({ bankroll, trueProbability, priceCents, config }) {
-  const fee = feeCentsAt(priceCents, MAKER_FEE_MULTIPLIER);
+function sizeFor({ bankroll, trueProbability, priceCents, config, multiplier = MAKER_FEE_MULTIPLIER }) {
+  const fee = feeCentsAt(priceCents, multiplier);
   const perContract = (priceCents + fee) / 100;
   const sm = config.survivalMode;
   if (sm && bankroll < sm.balanceThreshold) {
@@ -195,7 +221,7 @@ function sizeFor({ bankroll, trueProbability, priceCents, config }) {
   }
   const s = fractionalKellySize({
     bankroll, trueProbability, price: priceCents / 100,
-    kellyFraction: config.kellyFraction ?? 0.25, multiplier: MAKER_FEE_MULTIPLIER,
+    kellyFraction: config.kellyFraction ?? 0.25, multiplier,
     maxRiskPctPerTrade: config.maxRiskPctPerTrade ?? 0.2, maxStakeDollars: config.maxStakeDollars ?? null,
   });
   return s.contracts || 0;
@@ -284,11 +310,12 @@ function bookFill(order, contracts, priceCents, feeCentsReported = null, feesToD
   }
   order.filledSeen = (order.filledSeen || 0) + contracts;
   if (feesToDateCents != null) order.feesSeenCents = feesToDateCents;
-  const feeCents = feeCentsReported != null ? feeCentsReported : scheduleFeeCents(priceCents, contracts, true);
+  const mult = makerMultiplierFor(order.ticker);
+  const feeCents = feeCentsReported != null ? feeCentsReported : (mult > 0 ? scheduleFeeCents(priceCents, contracts, true) : 0);
   state.restingOrders = resting;
   saveState(state);
 
-  const ev = makerEvCents(order.trueProbability ?? 0, priceCents);
+  const ev = makerEvCents(order.trueProbability ?? 0, priceCents, mult);
   const reason =
     `Resting bid filled on "${order.teamName}" (sharp ${((order.trueProbability ?? 0) * 100).toFixed(1)}% vs ${priceCents}c bid, ` +
     `maker fee ${feeCents}c for ${contracts}, EV ${ev.toFixed(1)}c/contract, held to settlement)`;
@@ -453,7 +480,9 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
     if (!existing && cancelPendingOnEvent(c.ticker)) return { action: "none", line: "a cancel on this game is still clearing" };
     if (otherSide) return { action: "none", line: `already bidding the other side (${otherSide.ticker})` };
 
+    const mult = makerMultiplierFor(c.ticker);
     const plan = planBid({
+      multiplier: mult,
       trueProbability: c.trueProbability,
       bidCents: c.pricing.bidCents,
       askCents: c.pricing.askCents,
@@ -473,9 +502,9 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
       if (cap && positions + restingCount() >= cap) return { action: "none", line: `no free slot (${positions} held + ${restingCount()} bids, cap ${cap})` };
     }
 
-    const contracts = sizeFor({ bankroll, trueProbability: c.trueProbability, priceCents: plan.priceCents, config });
+    const contracts = sizeFor({ bankroll, trueProbability: c.trueProbability, priceCents: plan.priceCents, config, multiplier: mult });
     if (contracts < 1) return refuse("bankroll cannot fund one contract");
-    const evCents = makerEvCents(c.trueProbability, plan.priceCents);
+    const evCents = makerEvCents(c.trueProbability, plan.priceCents, mult);
     if (evCents * contracts < s.minEvCentsPerTrade) {
       return refuse(`expected value ${(evCents * contracts).toFixed(2)}c for the trade is under the ${s.minEvCentsPerTrade}c floor`);
     }
@@ -537,7 +566,8 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
     const line =
       `Resting bid ${c.ticker} (${c.teamName}): ${contracts}x @ ${plan.priceCents}c ` +
       `[book ${c.pricing.bidCents ?? "-"}/${c.pricing.askCents}c, sharp ${(c.trueProbability * 100).toFixed(1)}%, ` +
-      `max ${plan.maxBid}c], EV ${evCents.toFixed(1)}c/contract after the <=${feeCentsAt(plan.priceCents, MAKER_FEE_MULTIPLIER)}c maker fee, ` +
+      `max ${plan.maxBid}c], EV ${evCents.toFixed(1)}c/contract after ` +
+      (mult > 0 ? `the <=${feeCentsAt(plan.priceCents, mult)}c maker fee` : `no maker fee (series not on Kalshi's maker-fee list)`) + `, ` +
       `expires ${Math.round(minutesToStart - s.expireBeforeStartSeconds / 60)}m from now`;
     appendLog(line);
     return { action: existing ? "repriced" : "rested", line };
