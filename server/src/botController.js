@@ -19,7 +19,7 @@ const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-09-22-resting-bids";
+export const CONTROLLER_VERSION = "2026-09-23-hold-to-settlement";
 
 let intervalHandle = null;
 let positionMonitorHandle = null;
@@ -477,6 +477,13 @@ async function yesQuote(ticker) {
  * guaranteed loss 3 minutes after opening it.
  */
 function blowoutExitDecision(position, quote, config) {
+  // OFF BY DEFAULT (2026-09-23). The account's own record: 4 positions held to
+  // settlement, 4 won, +139%; 27 sold early, +4%. The two most recent blowout
+  // sells - Angels 85c -> 4c and Sri Lanka 12c -> 4c - each paid a fee and the
+  // spread to recover 4c that settlement would have paid out or lost for
+  // free, and gave up the whole payout on a comeback. Held positions settle
+  // at no fee. Set config.blowoutExit = true to bring this rule back.
+  if (config.blowoutExit !== true) return null;
   if (config.holdToSettlement === false) return null;
   const bestBid = quote?.bid;
   if (bestBid == null) return null;
