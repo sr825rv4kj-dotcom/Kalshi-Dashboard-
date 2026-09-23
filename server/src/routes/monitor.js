@@ -29,7 +29,7 @@
 import crypto from "crypto";
 import { loadState, getRecentLog } from "../stateStore.js";
 import { loadConfig } from "../configStore.js";
-import { getTradeStats } from "../tradeLedgerStore.js";
+import { getTradeStats, getTradeLifecycles } from "../tradeLedgerStore.js";
 import { buildStrategyReview } from "../strategyReview.js";
 import { lastDiscovery } from "../seriesDiscovery.js";
 import { getSeriesMap, RESOLVER_VERSION } from "../tickerResolver.js";
@@ -214,6 +214,14 @@ export function registerMonitorRoutes(app) {
     }));
 
     section("trades", () => getTradeStats());
+    // Every closed trade, compact, so strategy changes can be tested against
+    // the account's real history rather than argued about.
+    section("closedTrades", () => getTradeLifecycles().completed.map((t) => ({
+      ticker: t.ticker, team: t.teamName, sport: t.sportKey, n: t.contracts,
+      in: t.entryPriceCents, out: t.exitPriceCents, exit: t.exitReason,
+      net: Math.round(t.netDollars * 100) / 100, opened: t.entryTimestamp, closed: t.exitTimestamp,
+      live: /In-play/i.test(String(t.entryReason || "")),
+    })));
     section("review", () => {
       const r = buildStrategyReview();
       // The bucket tables are large and already derived from the ledger; the
