@@ -122,9 +122,15 @@ export async function kalshiPost(requestPath, body) {
   return data;
 }
 
-export async function kalshiDelete(requestPath) {
+/**
+ * DELETE with an optional query string. The query is NOT part of the signed
+ * message - Kalshi signs the path only, exactly as kalshiGet does. Cancelling
+ * an order on a non-default exchange shard needs `?exchange_index=` here, or
+ * the cancel is sent to shard 0 and misses the order.
+ */
+export async function kalshiDelete(requestPath, query = "") {
   const headers = signRequest("DELETE", requestPath);
-  const res = await fetch(`${root()}${requestPath}`, { method: "DELETE", headers });
+  const res = await fetch(`${root()}${requestPath}${query}`, { method: "DELETE", headers });
   const text = await res.text();
   const data = text ? JSON.parse(text) : {};
   if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
