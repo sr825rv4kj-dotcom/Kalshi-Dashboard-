@@ -57,16 +57,32 @@ function expectedToken() {
     );
     raw = key ? process.env[key] : "";
   }
-  return String(raw || "")
-    .replace(/[\s"'`]+/g, "")
-    .replace(/[,;.]+$/, "");
+  return hexOnly(raw);
+}
+
+/**
+ * The token is hexadecimal, so anything that is not 0-9 / a-f is not part of
+ * it - a zero-width space, a non-breaking space or a smart-punctuation
+ * character that a phone keyboard slipped into the Railway variable. The
+ * previous version only stripped ordinary whitespace, quotes and a trailing
+ * comma, and Safari still got "Wrong monitor token" on a value that looked
+ * identical on screen. Both sides are reduced to lowercase hex before comparing.
+ */
+function hexOnly(v) {
+  return String(v || "").toLowerCase().replace(/[^0-9a-f]/g, "");
+}
+
+/** First 8 hex chars of SHA-256 - enough to compare two values, useless for recovering either. */
+function fingerprint(v) {
+  return v ? crypto.createHash("sha256").update(v).digest("hex").slice(0, 8) : null;
 }
 
 /** Constant-time compare, so the token cannot be recovered by timing. */
 function tokenMatches(supplied) {
   const expected = expectedToken();
-  if (!expected || !supplied) return false;
-  const a = Buffer.from(String(supplied).trim());
+  const given = hexOnly(supplied);
+  if (!expected || !given) return false;
+  const a = Buffer.from(given);
   const b = Buffer.from(expected);
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
@@ -120,8 +136,17 @@ export function registerMonitorRoutes(app) {
       //   403 - it is set, and the supplied token does not match it
       //   404 - (from Express itself) this route is not deployed at all
       // Neither reveals anything about the token's value.
-      if (!expectedToken()) return res.status(503).json({ error: "Monitor not configured on this server." });
-      return res.status(403).json({ error: "Wrong monitor token." });
+      const expected = expectedToken();
+      if (!expected) return res.status(503).json({ error: "Monitor not configured on this server." });
+      // Lengths and short hash fingerprints of both sides: enough to see
+      // whether the server holds a different value (and how it differs in
+      // length), not enough to recover the token.
+      const given = hexOnly(req.params.token);
+      return res.status(403).json({
+        error: "Wrong monitor token.",
+        server: { length: expected.length, fingerprint: fingerprint(expected) },
+        supplied: { length: given.length, fingerprint: fingerprint(given) },
+      });
     }
 
     const out = { at: new Date().toISOString() };
