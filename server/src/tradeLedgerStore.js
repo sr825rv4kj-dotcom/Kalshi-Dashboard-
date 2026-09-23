@@ -1,138 +1,187 @@
 import fs from "fs";
-import crypto from "crypto";
+import path from "path";
+import { DATA_DIR } from "./paths.js";
 
-let cachedPrivateKey = null;
-
-function getConfig() {
-  return {
-    keyId: process.env.KALSHI_API_KEY_ID,
-    keyPath: process.env.KALSHI_PRIVATE_KEY_PATH,
-    keyPem: process.env.KALSHI_PRIVATE_KEY_PEM,
-    baseUrl: process.env.KALSHI_API_BASE || "https://api.elections.kalshi.com/trade-api/v2",
-  };
-}
+const LEDGER_PATH = path.join(DATA_DIR, "trade-ledger.json");
 
 /**
- * Key file wins over the env var. This order matters: the env var is set once
- * at deploy time and never changes, while the file is what the app writes when
- * you save new credentials. With the old precedence, rotating your Kalshi key
- * in the app updated the Key ID but kept signing with the stale env-var key -
- * which Kalshi rejects as INCORRECT_API_KEY_SIGNATURE, with no clue why.
+ * NET PROFIT IS AFTER FEES (2026-09-22).
+ *
+ * Every trade used to be scored as payout minus price paid. Kalshi's fee was
+ * never subtracted, so every win read higher and every loss read smaller than
+ * what actually hit the account - by 1-2c per contract on each side of a trade.
+ *
+ * Each ledger row now carries `feeCents`: the TOTAL fee for that row, taken
+ * from what Kalshi reported on the fill where it reported one. Rows written
+ * before this change carry none, so their fee is computed from Kalshi's
+ * published schedule - round up(0.07 x C x P x (1-P)) for a taker trade,
+ * round up(0.0175 x C x P x (1-P)) for a resting (maker) fill. Settlement is
+ * free, so a settled exit adds no fee.
  */
-function getPrivateKey() {
-  if (cachedPrivateKey) return cachedPrivateKey;
-  const { keyPath, keyPem } = getConfig();
+export function scheduleFeeCents(priceCents, contracts, maker = false) {
+  const p = Number(priceCents) / 100;
+  const c = Number(contracts) || 0;
+  if (!(p > 0 && p < 1) || c <= 0) return 0;
+  const rate = maker ? 0.0175 : 0.07;
+  // Round the product to 1e-9 before the ceiling so float noise (0.07*... =
+  // 1.7500000000000002) cannot add a phantom cent.
+  return Math.ceil(Math.round(rate * c * p * (1 - p) * 100 * 1e9) / 1e9);
+}
 
-  if (keyPath && fs.existsSync(keyPath)) {
-    cachedPrivateKey = fs.readFileSync(keyPath, "utf8");
-    return cachedPrivateKey;
+function isSettlement(row) {
+  return /^settled/.test(String(row.reason || ""));
+}
+
+function isMakerEntry(row) {
+  return row.maker === true || /as MAKER|Resting bid filled/i.test(String(row.reason || ""));
+}
+
+function entryFeeCents(row) {
+  if (Number.isFinite(row.feeCents)) return row.feeCents;
+  return scheduleFeeCents(row.priceCents, row.filled, isMakerEntry(row));
+}
+
+function exitFeeCents(row) {
+  if (isSettlement(row)) return 0;
+  if (Number.isFinite(row.feeCents)) return row.feeCents;
+  return scheduleFeeCents(row.exitPriceCents ?? row.priceCents, row.filled, false);
+}
+
+function ensureFile() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(LEDGER_PATH)) {
+    fs.writeFileSync(LEDGER_PATH, JSON.stringify([], null, 2));
   }
-
-  if (keyPem) {
-    cachedPrivateKey = keyPem.replace(/\\n/g, "\n"); // literal and escaped newlines
-    return cachedPrivateKey;
-  }
-
-  throw new Error(
-    "Kalshi private key not found. Enter your credentials in the app, or set " +
-    "KALSHI_PRIVATE_KEY_PEM as a fallback."
-  );
 }
 
-export function resetCredentialsCache() {
-  cachedPrivateKey = null;
+export function loadLedger() {
+  ensureFile();
+  return JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8"));
 }
 
-export function hasCredentialsConfigured() {
-  const { keyId, keyPath, keyPem } = getConfig();
-  if (!keyId) return false;
-  if (keyPath && fs.existsSync(keyPath)) return true;
-  return Boolean(keyPem);
+function writeLedger(ledger) {
+  fs.writeFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2));
 }
 
-/**
- * Reports which source the key came from and a fingerprint of its public half.
- * No private key material is ever returned. Surfacing this is the difference
- * between "401" and "you are signing with the wrong key".
- */
-export function describeCredentials() {
-  const { keyId, keyPath, keyPem } = getConfig();
-  const usingFile = Boolean(keyPath && fs.existsSync(keyPath));
-
-  let fingerprint = null;
-  let keyError = null;
-  try {
-    const pub = crypto.createPublicKey(getPrivateKey());
-    fingerprint = crypto
-      .createHash("sha256")
-      .update(pub.export({ type: "spki", format: "der" }))
-      .digest("hex")
-      .slice(0, 16);
-  } catch (err) {
-    keyError = err.message;
-  }
-
-  return {
-    keyId: keyId ? `${keyId.slice(0, 8)}...` : null,
-    source: usingFile ? "saved in app" : keyPem ? "KALSHI_PRIVATE_KEY_PEM env var" : "none",
-    envVarAlsoSet: Boolean(keyPem),
-    keyFileExists: usingFile,
-    fingerprint,
-    keyError,
-  };
-}
-
-function signRequest(method, requestPath) {
-  const { keyId } = getConfig();
-  if (!keyId) throw new Error("Kalshi API Key ID is not set. Enter your credentials in the app.");
-
-  const timestamp = Date.now().toString();
-  const message = timestamp + method.toUpperCase() + requestPath;
-
-  const signature = crypto.sign("sha256", Buffer.from(message, "utf8"), {
-    key: getPrivateKey(),
-    padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-    saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+export function recordTrade({
+  action, ticker, side, contracts, priceCents, reason, environment, edgePct, filled,
+  teamName, sportKey, commenceTime, exitPriceCents, feeCents, maker,
+}) {
+  const ledger = loadLedger();
+  ledger.push({
+    timestamp: new Date().toISOString(),
+    action, ticker, side, contracts, priceCents, filled, edgePct, reason, environment,
+    exitPriceCents: exitPriceCents ?? null,
+    feeCents: Number.isFinite(feeCents) ? feeCents : null,
+    maker: maker === true ? true : undefined,
+    teamName: teamName ?? null,
+    sportKey: sportKey ?? null,
+    commenceTime: commenceTime ?? null,
   });
-
-  return {
-    "KALSHI-ACCESS-KEY": keyId,
-    "KALSHI-ACCESS-SIGNATURE": signature.toString("base64"),
-    "KALSHI-ACCESS-TIMESTAMP": timestamp,
-  };
+  writeLedger(ledger);
 }
 
-function root() {
-  return getConfig().baseUrl.replace("/trade-api/v2", "");
-}
-
-export async function kalshiGet(requestPath, query = "") {
-  const headers = signRequest("GET", requestPath);
-  const res = await fetch(`${root()}${requestPath}${query}`, { method: "GET", headers });
-  if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-export async function kalshiPost(requestPath, body) {
-  const headers = { ...signRequest("POST", requestPath), "Content-Type": "application/json" };
-  const res = await fetch(`${root()}${requestPath}`, { method: "POST", headers, body: JSON.stringify(body) });
-  const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
-  return data;
+export function getRecentTrades(limit = 100) {
+  const ledger = loadLedger();
+  return ledger.slice(-limit).reverse();
 }
 
 /**
- * DELETE with an optional query string. The query is NOT part of the signed
- * message - Kalshi signs the path only, exactly as kalshiGet does. Cancelling
- * an order on a non-default exchange shard needs `?exchange_index=` here, or
- * the cancel is sent to shard 0 and misses the order.
+ * Pairs each entry with its matching exit to produce completed round-trips
+ * with real cost, proceeds, net P&L and ROI.
+ *
+ * All dollar figures derive from actual fill prices and counts recorded at
+ * execution time - nothing here is estimated or simulated.
  */
-export async function kalshiDelete(requestPath, query = "") {
-  const headers = signRequest("DELETE", requestPath);
-  const res = await fetch(`${root()}${requestPath}${query}`, { method: "DELETE", headers });
-  const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
-  return data;
+export function getTradeLifecycles() {
+  const ledger = loadLedger();
+
+  // Pair on LEDGER ORDER, not on a strict timestamp comparison. An exit that
+  // landed in the same second as its entry - routine with immediate-or-cancel
+  // orders - failed "exit.timestamp > entry.timestamp" and left the trade
+  // stranded as permanently open, with no cost, proceeds or ROI ever reported.
+  const entries = ledger
+    .map((t, i) => ({ ...t, _i: i }))
+    .filter((t) => t.action === "enter" && t.filled > 0);
+  const exits = ledger
+    .map((t, i) => ({ ...t, _i: i }))
+    .filter((t) => t.action === "exit" && t.filled > 0);
+  const usedExitIndexes = new Set();
+
+  const completed = [];
+  const open = [];
+
+  for (const entry of entries) {
+    const exitIndex = exits.findIndex(
+      (x, i) => !usedExitIndexes.has(i) && x.ticker === entry.ticker && x._i > entry._i
+    );
+
+    // What was put up: the contracts at the price paid, PLUS the entry fee.
+    const entryFeeDollars = entryFeeCents(entry) / 100;
+    const costDollars = (entry.filled * entry.priceCents) / 100 + entryFeeDollars;
+
+    if (exitIndex === -1) {
+      open.push({
+        ...entry,
+        costDollars,
+        feesDollars: entryFeeDollars,
+        status: "open",
+      });
+      continue;
+    }
+
+    usedExitIndexes.add(exitIndex);
+    const exit = exits[exitIndex];
+    // What came back: the payout, MINUS the exit fee (zero at settlement).
+    const exitFeeDollars = exitFeeCents(exit) / 100;
+    const proceedsDollars = (exit.filled * (exit.exitPriceCents ?? exit.priceCents)) / 100 - exitFeeDollars;
+    const netDollars = proceedsDollars - costDollars;
+    const roiPct = costDollars > 0 ? (netDollars / costDollars) * 100 : null;
+
+    completed.push({
+      ticker: entry.ticker,
+      side: entry.side,
+      teamName: entry.teamName,
+      sportKey: entry.sportKey,
+      commenceTime: entry.commenceTime,
+      environment: entry.environment,
+      entryTimestamp: entry.timestamp,
+      exitTimestamp: exit.timestamp,
+      contracts: entry.filled,
+      entryPriceCents: entry.priceCents,
+      exitPriceCents: exit.exitPriceCents ?? exit.priceCents,
+      costDollars,
+      proceedsDollars,
+      feesDollars: entryFeeDollars + exitFeeDollars,
+      netDollars,
+      roiPct,
+      entryReason: entry.reason,
+      exitReason: exit.reason,
+      edgePct: entry.edgePct,
+      status: "closed",
+    });
+  }
+
+  return { completed: completed.reverse(), open: open.reverse() };
+}
+
+export function getTradeStats() {
+  const { completed, open } = getTradeLifecycles();
+  const wins = completed.filter((t) => t.netDollars > 0).length;
+  const losses = completed.filter((t) => t.netDollars < 0).length;
+  const totalNet = completed.reduce((sum, t) => sum + t.netDollars, 0);
+  const totalCost = completed.reduce((sum, t) => sum + t.costDollars, 0);
+
+  return {
+    totalEntries: completed.length + open.length,
+    totalExits: completed.length,
+    openCount: open.length,
+    wins,
+    losses,
+    winRatePct: completed.length ? (wins / completed.length) * 100 : null,
+    totalNetDollars: totalNet,
+    totalFeesDollars: completed.reduce((sum, t) => sum + (t.feesDollars || 0), 0),
+    netIsAfterFees: true,
+    overallRoiPct: totalCost > 0 ? (totalNet / totalCost) * 100 : null,
+  };
 }
