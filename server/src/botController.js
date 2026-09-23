@@ -12,13 +12,14 @@ import { currentCadenceSeconds, describeCadence } from "./cadence.js";
 import { scanSport } from "./scanner.js";
 import { notifyMilestone, notifyDailyHalt, notifyDailySummary } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
-import { getRecentTrades, recordTrade } from "./tradeLedgerStore.js";
+import { getRecentTrades, recordTrade, scheduleFeeCents } from "./tradeLedgerStore.js";
+import { syncResting, cancelAllResting } from "./makerEngine.js";
 
 const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-09-21-self-healing";
+export const CONTROLLER_VERSION = "2026-09-22-resting-bids";
 
 let intervalHandle = null;
 let positionMonitorHandle = null;
@@ -127,13 +128,18 @@ async function checkDailySummary(config, currentBalance) {
   saveState(state);
 }
 
-function atConcurrentPositionCap(config, bankroll) {
+/** The position cap in force at this bankroll (survival mode or milestone tier). */
+function positionCapFor(config, bankroll) {
   const sm = config.survivalMode;
   const inSurvival = sm && bankroll < sm.balanceThreshold;
   const tier = tierFor(bankroll, config);
-  const cap = inSurvival
+  return inSurvival
     ? sm.maxConcurrentPositions
     : (config.maxConcurrentPositions ?? tier.maxConcurrentPositions);
+}
+
+function atConcurrentPositionCap(config, bankroll) {
+  const cap = positionCapFor(config, bankroll);
   if (!cap) return false;
   return loadState().positions.length >= cap;
 }
@@ -250,9 +256,11 @@ async function reconcileSettledPositions() {
         commenceTime: position.commenceTime ?? null,
       });
 
+      // Net AFTER the entry fee - what actually reached the account.
+      const entryFee = scheduleFeeCents(position.entryPriceCents, position.contracts, position.source === "maker");
       const net = settlementCents == null
         ? "outcome unavailable"
-        : `$${(((settlementCents - position.entryPriceCents) * position.contracts) / 100).toFixed(2)}`;
+        : `$${(((settlementCents - position.entryPriceCents) * position.contracts - entryFee) / 100).toFixed(2)} after the ${entryFee}c entry fee`;
       appendLog(
         `${position.ticker} settled ${settlementCents == null ? "(result unreadable)" : settlementCents === 100 ? "YES - won" : "NO - lost"}: ` +
         `${position.contracts} contracts @ ${position.entryPriceCents}c entry, net ${net}. No exit fee - settlement is free.`
@@ -660,7 +668,9 @@ export async function runCycle() {
     const { halted, reason } = await checkDailyHalt(config);
     markExchangeReachable();   // checkDailyHalt reads the balance - the exchange answered
     if (halted) {
-      appendLog(`Skipping cycle - halted for today: ${reason}`);
+      // A halted day must not keep buying through resting bids either.
+      const n = await cancelAllResting("trading halted for the day").catch(() => 0);
+      appendLog(`Skipping cycle - halted for today: ${reason}` + (n ? ` (${n} resting bid(s) cancelled)` : ""));
       return;
     }
 
@@ -671,6 +681,18 @@ export async function runCycle() {
     const bankroll = (balanceData.balance ?? 0) / 100;
     await checkMilestones(config, bankroll);
     await checkDailySummary(config, bankroll);
+
+    // RESTING BIDS: book any fills since the last cycle, drop finished orders,
+    // cancel any the scan has stopped confirming, and trim bids so positions
+    // plus bids never exceed the cap. Runs BEFORE the cap check below, so a
+    // fill is counted before the cycle decides whether it has room.
+    const makerSync = await syncResting({ cap: positionCapFor(config, bankroll) });
+    if (makerSync.filled || makerSync.stale || makerSync.trimmed) {
+      appendLog(
+        `Resting bids: ${makerSync.filled} contract(s) filled, ${makerSync.stale} cancelled as unconfirmed, ` +
+        `${makerSync.trimmed} cancelled to stay under the position cap.`
+      );
+    }
 
     const { tier, reserve, tradable } = tradableBankroll(bankroll, config);
     if (tradable <= 0) {
@@ -725,6 +747,7 @@ export async function runCycle() {
         tickerMap,
         skipEvents,
         atCap: () => atConcurrentPositionCap(config, bankroll),
+        positionCap: positionCapFor(config, bankroll),
       });
       if (stop) break;
     }
@@ -885,6 +908,8 @@ export function stopBot() {
   state.running = false;
   saveState(state);
   appendLog("Bot stopped.");
+  // A stopped bot must not leave bids on the book that nobody is re-pricing.
+  cancelAllResting("bot stopped").catch((err) => appendLog(`Could not cancel resting bids on stop: ${err.message}`, "error"));
   return { stopped: true };
 }
 
