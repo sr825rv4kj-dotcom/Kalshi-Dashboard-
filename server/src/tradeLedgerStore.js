@@ -36,9 +36,17 @@ function isMakerEntry(row) {
   return row.maker === true || /as MAKER|Resting bid filled/i.test(String(row.reason || ""));
 }
 
+/** Series that carry a maker fee (Kalshi fee schedule); a maker fill elsewhere pays none. */
+const MAKER_FEE_SERIES_PREFIXES = ["KXNBA", "KXNHL", "KXNFLGAME", "KXUEFACL", "KXPGA", "KXCLUBWC"];
+
 function entryFeeCents(row) {
   if (Number.isFinite(row.feeCents)) return row.feeCents;
-  return scheduleFeeCents(row.priceCents, row.filled, isMakerEntry(row));
+  if (isMakerEntry(row)) {
+    const series = String(row.ticker || "").split("-")[0].toUpperCase();
+    if (!MAKER_FEE_SERIES_PREFIXES.some((p) => series.startsWith(p))) return 0;
+    return scheduleFeeCents(row.priceCents, row.filled, true);
+  }
+  return scheduleFeeCents(row.priceCents, row.filled, false);
 }
 
 function exitFeeCents(row) {
