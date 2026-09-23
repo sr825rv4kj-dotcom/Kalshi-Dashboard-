@@ -36,6 +36,7 @@ import { getSeriesMap, RESOLVER_VERSION } from "../tickerResolver.js";
 import { SCANNER_VERSION } from "../scanner.js";
 import { EXECUTOR_VERSION } from "../executor.js";
 import { describeCadence } from "../cadence.js";
+import { diagnose, startHealthAlerts, HEALTH_VERSION } from "../healthReport.js";
 
 /** Constant-time compare, so the token cannot be recovered by timing. */
 function tokenMatches(supplied) {
@@ -81,6 +82,11 @@ function safeConfig(cfg) {
 }
 
 export function registerMonitorRoutes(app) {
+  // The self-diagnosis alerts run whether or not MONITOR_TOKEN is set: they go
+  // to the account holder's own Telegram, not to this route. Contained - a
+  // failure to start them must never stop the server from booting.
+  try { startHealthAlerts(); } catch (err) { console.warn("[health] alerts not started:", err.message); }
+
   app.get("/api/monitor/:token", (req, res) => {
     if (!tokenMatches(req.params.token)) {
       return res.status(404).json({ error: "Not found." });
@@ -94,7 +100,11 @@ export function registerMonitorRoutes(app) {
       try { out[name] = fn(); } catch (err) { out[name] = { error: err.message }; }
     };
 
+    // FIRST, because it is the answer: what is wrong and what fixes it.
+    section("problems", () => diagnose());
+
     section("versions", () => ({
+      health: HEALTH_VERSION,
       resolver: RESOLVER_VERSION,
       scanner: SCANNER_VERSION,
       executor: EXECUTOR_VERSION,
