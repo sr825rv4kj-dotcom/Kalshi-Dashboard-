@@ -86,7 +86,7 @@ import { workCandidate, cancelResting, getRestingOrders, cancelPendingOnEvent } 
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-22-resting-bids";
+export const SCANNER_VERSION = "2026-09-23-live-80c-cap";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -586,7 +586,13 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       maxStakeDollars: config.maxStakeDollars ?? null,
       maxPlausibleEdge: config.maxPlausibleEdge ?? 0.18,
       minEntryPriceCents: config.minEntryPriceCents ?? 25,
-      maxEntryPriceCents: config.maxEntryPriceCents ?? 88,
+      // LIVE GAMES CAP AT 80c (2026-09-23). In play, a buy at 85c risks 85c to
+      // win 15c, and the in-game model is a few points coarse - the Angels
+      // position (85c -> 4c) erased several small wins in one move. Pre-game
+      // keeps the full band.
+      maxEntryPriceCents: c.timing.live
+        ? Math.min(config.maxEntryPriceCents ?? 88, config.maxLiveEntryPriceCents ?? 80)
+        : (config.maxEntryPriceCents ?? 88),
       minEvCentsPerContract: config.minEvCentsPerContract ?? 0,
       minEvCentsPerTrade: config.minEvCentsPerTrade ?? 1,
       maxWalkupCents: config.maxWalkupCents ?? 4,
