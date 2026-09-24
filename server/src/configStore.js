@@ -29,7 +29,7 @@ import { CONFIG_DIR } from "./paths.js";
 const CONFIG_PATH = path.join(CONFIG_DIR, "bot-config.json");
 
 /** Bump this whenever a STRATEGY_KEYS default below changes meaningfully. */
-export const STRATEGY_VERSION = 13;
+export const STRATEGY_VERSION = 14;
 
 /**
  * Keys the migration is allowed to reset. Anything not listed here is the
@@ -43,7 +43,7 @@ export const STRATEGY_KEYS = [
   "maxSpreadCents", "minLiquidity", "kellyFraction", "maxRiskPctPerTrade",
   "perPositionStopLossPct", "takeProfitPct", "trailingStopPct", "exitBelowCost",
   "blowoutExitBelowCents", "blowoutExitCollapsePct", "blowoutExitMaxSpreadCents",
-  "ceilingExitAtCents", "ceilingExitMaxSpreadCents",
+  "ceilingExitAtCents", "ceilingExitMaxSpreadCents", "ceilingExitOnlyWhenNeeded",
   "maxModelDisagreementPoints", "reentryCooldownMinutes",
   "dailyLossHaltPct", "feeMultiplier", "circuitBreakerFailures", "maxConcurrentPositions",
   "survivalMode", "milestoneTiers",
@@ -216,6 +216,11 @@ export const DEFAULTS = {
   // free capital sooner and carry less tail risk. The give-up is 1c either way.
   ceilingExitAtCents: 97,
   ceilingExitMaxSpreadCents: 3,
+  // v14: only take the ceiling exit when the slot or the cash is actually
+  // needed (at the position cap, or cash below one stake). Otherwise hold -
+  // settlement pays the same 100c without the 1c/contract exit fee. The nine
+  // ceiling exits to date (96-99c) all sold with free slots available.
+  ceilingExitOnlyWhenNeeded: true,
 
   // The one real exit: a rout. Deep enough that it fires on blowouts, not noise.
   //
@@ -236,7 +241,11 @@ export const DEFAULTS = {
   // treated as a stale pre-game number rather than a live quote.
   maxModelDisagreementPoints: 12,
 
-  reentryCooldownMinutes: 60,
+  // v14: 60 -> 360. A game the bot has already exited stays off-limits for the
+  // rest of that game, not just an hour - a baseball or soccer match can still
+  // be live 60 minutes after an exit, and buying back in pays a second entry fee
+  // on a thesis the bot already closed.
+  reentryCooldownMinutes: 360,
   dailyLossHaltPct: 0.15,
   feeMultiplier: 0.07,
   circuitBreakerFailures: 3,
@@ -367,7 +376,9 @@ export function describeStrategy() {
       : "switched off in config",
     exitPolicy: c.holdToSettlement === false
       ? "active exits enabled"
-      : `held to settlement, except a take-out at ${c.ceilingExitAtCents}c+ and a blowout below ${c.blowoutExitBelowCents}c`,
+      : `held to settlement, except a take-out at ${c.ceilingExitAtCents}c+` +
+        (c.ceilingExitOnlyWhenNeeded !== false ? " (only when a slot or cash is needed)" : "") +
+        (c.blowoutExit === true ? ` and a blowout below ${c.blowoutExitBelowCents}c` : "; blowout exit off"),
     priceBand: `${c.minEntryPriceCents}c - ${c.maxEntryPriceCents}c`,
     minEv: `${c.minEvCentsPerTrade}c per trade` +
       (c.minEvCentsPerContract ? `, ${c.minEvCentsPerContract}c per contract` : ""),
