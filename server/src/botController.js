@@ -19,7 +19,37 @@ const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-09-23-hold-to-settlement";
+export const CONTROLLER_VERSION = "2026-09-23-settlement-verified";
+
+/**
+ * 2026-09-23 - three fixes in this file:
+ *
+ * 1. SETTLEMENT IS VERIFIED, NOT ASSUMED. A position missing from
+ *    /portfolio/positions was booked as settled on the spot. Kalshi reports an
+ *    unsettled market as status "active", result "" (checked live against
+ *    KXMLBGAME-26SEP251905BALNYY-NYY), and a finished one as "finalized",
+ *    result "yes"/"no" (KXNFLGAME-26SEP20JACDEN-DEN). The old code booked both
+ *    the same way. So a fresh fill the portfolio endpoint had not caught up
+ *    with yet was written off as "settled-unknown" and dropped from tracking,
+ *    which also removed its game from the one-position-per-game guard, so the
+ *    next scan was free to buy the same game again. Now a position is booked
+ *    only when the market reports a result. A live market that is simply
+ *    missing from the portfolio is kept, and only written off as
+ *    "closed-externally" after 30 minutes (e.g. sold by hand in the Kalshi app).
+ *
+ * 2. ONE POSITION CHECK AT A TIME. checkOpenPositions ran from two places, the
+ *    scan cycle and a 3-minute monitor, with nothing stopping them overlapping.
+ *    Both could read the same position at 97c and both could send the sell.
+ *    Selling YES you no longer hold opens a short. Now a second call waits its
+ *    turn and then re-reads state.
+ *
+ * 3. THE CEILING EXIT FIRES ONLY WHEN THE SLOT OR CASH IS NEEDED. Selling at a
+ *    97-99c bid pays a 1c/contract fee to bank what settlement pays for free.
+ *    It was sold every time (9 ceiling exits so far), even with slots and cash
+ *    free and nothing to redeploy into. It now sells only when the bot is at its
+ *    position cap or cash is below one stake. Set ceilingExitOnlyWhenNeeded:
+ *    false to restore the old behaviour.
+ */
 
 let intervalHandle = null;
 let positionMonitorHandle = null;
@@ -158,8 +188,19 @@ function recordExit(ticker) {
   const state = loadState();
   state.recentExits = state.recentExits || {};
   state.recentExits[eventKeyOf(ticker)] = new Date().toISOString();
+  // Prune anything older than two days so state.json does not grow forever.
+  const keepAfter = Date.now() - 48 * 60 * 60 * 1000;
+  for (const [key, iso] of Object.entries(state.recentExits)) {
+    if (new Date(iso).getTime() < keepAfter) delete state.recentExits[key];
+  }
   saveState(state);
 }
+
+/** Kalshi statuses that mean the market has a final answer. */
+const SETTLED_STATUSES = new Set(["finalized", "settled", "determined"]);
+
+/** A position missing from the portfolio on a still-live market is kept this long. */
+const MISSING_GRACE_MS = 30 * 60 * 1000;
 
 /** Games exited within the cooldown, which this cycle must leave alone. */
 function cooledDownEventKeys(config) {
@@ -188,7 +229,7 @@ function cooledDownEventKeys(config) {
  * reports. Anything the exchange no longer holds has settled, and is closed out
  * locally at its true settled value so the statement shows real profit and loss.
  */
-async function reconcileSettledPositions() {
+export async function reconcileSettledPositions() {
   const state = loadState();
   if (!state.positions.length) return { settled: 0 };
 
@@ -210,6 +251,7 @@ async function reconcileSettledPositions() {
 
   const stillOpen = [];
   let settledCount = 0;
+  const missingMarks = new Map();   // ticker|openedAt -> first-missing ISO, written back below
 
   for (const position of state.positions) {
     if (heldNow.has(position.ticker)) { stillOpen.push(position); continue; }
@@ -227,13 +269,59 @@ async function reconcileSettledPositions() {
       // Gone from the exchange: it settled. Read the real outcome so the ledger
       // records what actually happened rather than an assumption.
       let settlementCents = null;
+      let marketStatus = null;
+      let marketRead = false;
       try {
         const res = await kalshiGet(`${V2}/markets/${position.ticker}`);
+        marketRead = true;
+        marketStatus = String(res.market?.status || "").toLowerCase();
         const result = String(res.market?.result || "").toLowerCase();
         if (result === "yes") settlementCents = 100;
         else if (result === "no") settlementCents = 0;
       } catch {
-        // leave null - recorded as unknown rather than guessed
+        // could not read the market - handled below
+      }
+
+      const hasResult = settlementCents != null;
+      const marketFinished = hasResult || SETTLED_STATUSES.has(marketStatus);
+
+      // NOT SETTLED: keep tracking it. Either the portfolio has not caught up
+      // with a fresh fill, the market could not be read, or it was closed
+      // outside the bot. Only the last is ever written off, and only after the
+      // grace period, so the one-per-game guard keeps covering this game.
+      if (!marketFinished) {
+        const key = `${position.ticker}|${position.openedAt}`;
+        const firstMissing = position.missingSince ? Date.parse(position.missingSince) : Date.now();
+        const missingFor = Date.now() - firstMissing;
+        if (!marketRead || missingFor < MISSING_GRACE_MS) {
+          if (!position.missingSince) missingMarks.set(key, new Date(firstMissing).toISOString());
+          stillOpen.push(position);
+          continue;
+        }
+        // Live market, gone from the account for 30+ minutes: closed outside the bot.
+        recordTrade({
+          action: "exit",
+          ticker: position.ticker,
+          side: "yes",
+          contracts: position.contracts,
+          priceCents: position.entryPriceCents,
+          exitPriceCents: null,
+          filled: position.contracts,
+          reason: "closed-externally",
+          edgePct: null,
+          environment: loadConfig().environment,
+          teamName: position.teamName ?? null,
+          sportKey: position.sportKey ?? null,
+          commenceTime: position.commenceTime ?? null,
+          source: position.source ?? "taker",
+        });
+        appendLog(
+          `${position.ticker} is no longer held but the market is still ${marketStatus || "open"} - ` +
+          `it was closed outside the bot. Stopped tracking it after ${Math.round(missingFor / 60000)}m; ` +
+          `check the Kalshi app for the actual exit price.`, "warn"
+        );
+        settledCount++;
+        continue;
       }
 
       const outcome =
@@ -254,6 +342,8 @@ async function reconcileSettledPositions() {
         teamName: position.teamName ?? null,
         sportKey: position.sportKey ?? null,
         commenceTime: position.commenceTime ?? null,
+        // Maker vs taker, so resting-bid fills can be scored on their own.
+        source: position.source ?? "taker",
       });
 
       // Net AFTER the entry fee - what actually reached the account.
@@ -278,7 +368,10 @@ async function reconcileSettledPositions() {
     }
   }
 
-  if (settledCount) {
+  // Positions that reappear in the portfolio lose any stale missing mark.
+  const heldAgain = state.positions.filter((p) => p.missingSince && heldNow.has(p.ticker));
+
+  if (settledCount || missingMarks.size || heldAgain.length) {
     const fresh = loadState();
     const cleared = new Set(stillOpen.map((p) => `${p.ticker}|${p.openedAt}`));
     const settledKeys = new Set(
@@ -286,7 +379,17 @@ async function reconcileSettledPositions() {
         .filter((p) => !heldNow.has(p.ticker) && !cleared.has(`${p.ticker}|${p.openedAt}`))
         .map((p) => `${p.ticker}|${p.openedAt}`)
     );
-    fresh.positions = fresh.positions.filter((p) => !settledKeys.has(`${p.ticker}|${p.openedAt}`));
+    fresh.positions = fresh.positions
+      .filter((p) => !settledKeys.has(`${p.ticker}|${p.openedAt}`))
+      .map((p) => {
+        const key = `${p.ticker}|${p.openedAt}`;
+        if (missingMarks.has(key)) return { ...p, missingSince: missingMarks.get(key) };
+        if (p.missingSince && heldNow.has(p.ticker)) {
+          const { missingSince, ...rest } = p;
+          return rest;
+        }
+        return p;
+      });
     saveState(fresh);
   }
 
@@ -572,20 +675,92 @@ function ceilingExitDecision(position, quote, config) {
     `risking ${bid}c to win the last ${100 - bid}c`;
 }
 
-async function checkOpenPositions(config) {
+/**
+ * Is a slot or cash actually needed right now? The ceiling exit is only worth
+ * its 1c/contract fee if the capital it frees has somewhere to go. Unreadable
+ * balance counts as "needed", which falls back to the old always-sell behaviour
+ * rather than holding on a guess.
+ */
+export function capitalNeeded({ openPositions, cap, cashDollars, stakeDollars }) {
+  if (cap && openPositions >= cap) return { needed: true, why: `at the ${cap}-position cap` };
+  if (cashDollars == null) return { needed: true, why: "balance unreadable" };
+  if (cashDollars < stakeDollars) {
+    return { needed: true, why: `cash $${cashDollars.toFixed(2)} is below one $${stakeDollars.toFixed(2)} stake` };
+  }
+  return { needed: false, why: `${openPositions}/${cap || "no"} slots used and $${cashDollars.toFixed(2)} cash free` };
+}
+
+async function readCapitalNeed(config, openPositions) {
+  let cash = null;
+  try {
+    const b = await kalshiGet(`${V2}/portfolio/balance`);
+    cash = (b.balance ?? 0) / 100;
+  } catch {
+    cash = null;
+  }
+  const bankroll = cash ?? 0;
+  const sm = config.survivalMode;
+  const inSurvival = sm && bankroll < sm.balanceThreshold;
+  // Smallest stake worth freeing cash for: the survival flat bet, or $1.
+  const stake = inSurvival ? (sm.flatBetDollars ?? 1) : 1;
+  return capitalNeeded({ openPositions, cap: positionCapFor(config, bankroll), cashDollars: cash, stakeDollars: stake });
+}
+
+// Only one position check runs at a time. The scan cycle and the 3-minute
+// monitor both call this; overlapping runs could sell the same position twice.
+let positionCheckRunning = null;
+
+export async function checkOpenPositions(config) {
+  if (positionCheckRunning) {
+    // Let the running check finish. Its exits are then visible in state, so a
+    // position is never sold twice.
+    await positionCheckRunning.catch(() => {});
+    return;
+  }
+  positionCheckRunning = checkOpenPositionsOnce(config);
+  try {
+    await positionCheckRunning;
+  } finally {
+    positionCheckRunning = null;
+  }
+}
+
+async function checkOpenPositionsOnce(config) {
   const state = loadState();
   if (!state.positions.length) return;
 
+  let need = null;   // read lazily - only when a ceiling candidate exists
+
   for (const position of [...state.positions]) {
     try {
+      // Re-read: an earlier iteration may have exited or settled this one.
+      if (!loadState().positions.some((p) => p.ticker === position.ticker && p.openedAt === position.openedAt)) continue;
+
       const quote = await yesQuote(position.ticker);
 
       // Winners first: a position at the ceiling is the cheapest slot to free.
       const ceiling = ceilingExitDecision(position, quote, config);
       if (ceiling) {
-        appendLog(`${position.ticker} - ${ceiling}`);
+        if (config.ceilingExitOnlyWhenNeeded !== false) {
+          if (!need) need = await readCapitalNeed(config, loadState().positions.length);
+          if (!need.needed) {
+            // Holding: settlement pays the same for free. Logged once per position.
+            if (!position.ceilingHoldLogged) {
+              appendLog(`${position.ticker} - at ${quote.bid}c, holding to settlement instead of paying the exit fee (${need.why}).`);
+              const st = loadState();
+              const p = st.positions.find((x) => x.ticker === position.ticker && x.openedAt === position.openedAt);
+              if (p) { p.ceilingHoldLogged = true; saveState(st); }
+            }
+            continue;
+          }
+          appendLog(`${position.ticker} - ${ceiling} [${need.why}]`);
+        } else {
+          appendLog(`${position.ticker} - ${ceiling}`);
+        }
         await exitPosition(position, "ceiling-exit");
         recordExit(position.ticker);
+        // One freed slot answers the need; re-check before selling another.
+        need = null;
         continue;
       }
 
