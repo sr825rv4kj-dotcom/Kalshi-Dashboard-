@@ -4,6 +4,40 @@
  * Resolves a sportsbook team name + kickoff time to a live Kalshi ticker.
  *
  * ---------------------------------------------------------------------------
+ * 2026-09-23: CITY-CODED BOARDS (Liiga) AND ACCENTED NAMES
+ * ---------------------------------------------------------------------------
+ * Production refused every Karpat, Assat and Sport line all morning:
+ *
+ *   kärpät: no KXLIIGAGAME ticker on this date carries a team code matching
+ *   "kärpät" (codes on the board: SAI, POR, OUL, HIF, KOO, KAL, VAA, KIE)
+ *
+ * All three teams WERE on the board. Kalshi's live Liiga board (fetched
+ * 2026-09-23) codes Finnish clubs by their CITY, while the odds feed publishes
+ * the club name alone:
+ *
+ *   KXLIIGAGAME-26SEP261000OULVAA-OUL   yes_sub_title "Oulun Karpat"
+ *   KXLIIGAGAME-26SEP251130SAIPOR-POR   yes_sub_title "Porin Assat"
+ *   KXLIIGAGAME-26SEP261000OULVAA-VAA   yes_sub_title "Vaasan Sport"
+ *   KXLIIGAGAME-26SEP251130KOOTAM-TAM   yes_sub_title "Tampereen Ilves"
+ *   KXLIIGAGAME-26SEP251130KIEMIK-MIK   yes_sub_title "Mikkelin Jukurit"
+ *
+ * No code can be derived from "Karpat", so the code gate refused. And the
+ * accented name made it worse: normalize() stripped every non-ASCII letter,
+ * so "kärpät" became the three fragments "k rp t".
+ *
+ * Two fixes:
+ *   1. Names are accent-folded before anything else: kärpät -> karpat.
+ *   2. When a series carries side codes and NO code fits, the YES side is
+ *      consulted - but only on a DISTINCTIVE word (never a place name), and
+ *      only if exactly one team code answers to it. "Karpat" is on exactly one
+ *      YES side, so it resolves to OUL.
+ *
+ * This does NOT reopen the Yankees/Mets hole. Kalshi's MLB YES side reads
+ * "New York Y" / "New York M" - the only words there are place names and a
+ * single letter, so "yankees" matches nothing and the refusal stands. That
+ * case is re-run against the live MLB board before this shipped.
+ *
+ * ---------------------------------------------------------------------------
  * WHY THIS FILE WAS REPLACED: IT RETURNED LAST WEEK'S GAME
  * ---------------------------------------------------------------------------
  * A scan showed 33 "no matching Kalshi market", 11 "market not tradeable" and
@@ -58,7 +92,19 @@ const CACHE_TTL_MS = 3 * 60 * 1000;
 /** How many days either side of kickoff a ticker's date may sit. */
 const DATE_SLACK_DAYS = 1;
 
-export const RESOLVER_VERSION = "2026-09-22-fixture-time";
+export const RESOLVER_VERSION = "2026-09-23-yes-side-name-fallback";
+
+/**
+ * Accent folding. kärpät -> karpat, ässät -> assat, Malmö -> malmo.
+ * Letters NFD cannot decompose are mapped by hand.
+ */
+const FOLD_MAP = { "ø": "o", "Ø": "O", "æ": "ae", "Æ": "AE", "ß": "ss", "đ": "d", "Đ": "D", "ł": "l", "Ł": "L", "ı": "i", "œ": "oe", "Œ": "OE" };
+export function fold(s) {
+  return String(s ?? "")
+    .replace(/[øØæÆßđĐłŁıœŒ]/g, (ch) => FOLD_MAP[ch] || ch)
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "");
+}
 
 /**
  * The six confirmed, in-production mappings. Everything beyond this is
@@ -207,7 +253,7 @@ function subsequenceOf(code, word) {
  */
 export function codeAffinity(code, teamName) {
   const c = String(code || "").toLowerCase().replace(/[^a-z]/g, "");
-  const words = String(teamName || "").toLowerCase().replace(/[^a-z ]/g, " ").split(/\s+/).filter(Boolean);
+  const words = fold(teamName).toLowerCase().replace(/[^a-z ]/g, " ").split(/\s+/).filter(Boolean);
   if (!c || !words.length) return 0;
 
   // 1. Clean segmentation that starts at the first word. The common case.
@@ -296,7 +342,7 @@ export function tickerStartMs(ticker) {
 const FIXTURE_WINDOW_MS = 12 * 60 * 60 * 1000;
 
 function normalize(t) {
-  return (t || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  return fold(t || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 /**
@@ -504,6 +550,52 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
   }
   const strong = words.filter((w) => !WEAK.has(w));
 
+  /**
+   * Word-boundary matching, not substring.
+   *
+   * `text.includes(w)` matched "na" inside "rybakina" and resolved the player
+   * "Li Na" to the Rybakina contract. The same flaw matches "la" inside
+   * "dallas" and "ind" inside "indiana". A short token buried in a longer word
+   * is not a name match, and here a false match buys the wrong contract.
+   *
+   * A token counts when it IS one of the market's words, or when it is 4+
+   * characters and a market word starts with it - which keeps plurals and
+   * possessives ("star" vs "stars") working without letting two-letter
+   * fragments match anything.
+   */
+  const scoreAgainst = (text) => {
+    const bag = new Set(text.split(" ").filter(Boolean));
+    const hit = (w) => {
+      if (bag.has(w)) return true;
+      if (w.length < 4) return false;
+      // Prefix matching needs BOTH sides to be substantial. Allowing a short
+      // market word to prefix-match a long query word made "Stars" match the
+      // "St." in "St. Louis Blues" - which selected the opposing team.
+      for (const t of bag) {
+        if (t.length < 4) continue;
+        if (t.startsWith(w) || w.startsWith(t)) return true;
+      }
+      return false;
+    };
+    let score = 0;
+    let distinctive = 0;
+    // Strong words (mascot, surname, distinctive city) count double so
+    // "NC State Wolfpack" does not match every school with "State" in it.
+    for (const w of strong) {
+      if (!hit(w)) continue;
+      score += 2;
+      // A place name adds to the score but never establishes identity. This
+      // counter is what separates "New York Yankees" from "New York Mets".
+      if (!GEO.has(w)) distinctive += 1;
+    }
+    for (const w of words) if (WEAK.has(w) && hit(w)) score += 1;
+    // Whether the market itself offers anything but a place name. If its YES
+    // side reads "Texas" and nothing more, there is no distinctive word to
+    // match and geography is all either side has - handled below.
+    const selfDistinctive = [...bag].some((t) => !GEO.has(t) && !WEAK.has(t));
+    return { score, distinctive, selfDistinctive };
+  };
+
   // =====================================================================
   // GATE 3a: THE TICKER. This is the identity, and it always was.
   // =====================================================================
@@ -558,7 +650,49 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
   //
   // A code is a definitive answer in both directions. Its absence is evidence,
   // not a reason to go looking for a weaker one.
+  //
+  // ONE EXCEPTION, added 2026-09-23 for city-coded boards (Liiga: OUL is
+  // "Oulun Karpat"). If the team's DISTINCTIVE name - not a place name - sits
+  // on the YES side of markets carrying exactly one team code, that code is
+  // the team. The YES side names only the side a contract pays on, so this
+  // can never select the opponent; and a place-name-only hit (the Yankees/Mets
+  // shape) has distinctive === 0 and is ignored.
   if (!coded.length && codesAvailable > 0) {
+    const byName = [];
+    for (const m of dated) {
+      const tcode = tickerTeamCode(m.ticker);
+      if (!tcode) continue;
+      const s = scoreAgainst(yesSideText(m));
+      if (s.distinctive > 0) byName.push({ m, tcode, ...s });
+    }
+    if (byName.length) {
+      const topN = Math.max(...byName.map((x) => x.distinctive * 100 + x.score));
+      const leadersN = byName.filter((x) => x.distinctive * 100 + x.score === topN);
+      const codesN = [...new Set(leadersN.map((x) => x.tcode))];
+      if (codesN.length === 1) {
+        let bestN = leadersN[0];
+        if (leadersN.length > 1) {
+          const minGap = Math.min(...leadersN.map((x) => startGap(x.m)));
+          let pool = Number.isFinite(minGap) ? leadersN.filter((x) => startGap(x.m) === minGap) : leadersN;
+          if (!Number.isFinite(minGap)) {
+            const exact = pool.filter((x) => tickerDayNumber(x.m.ticker) === wantDay);
+            if (exact.length) pool = exact;
+          }
+          bestN = pool[0];
+        }
+        return {
+          ticker: bestN.m.ticker, code: "ok",
+          reason: `YES side "${bestN.m.yes_sub_title ?? ""}" names "${teamName}" on a distinctive word; ` +
+            `team code ${bestN.tcode} (${bestN.m.status}, city-coded board)`,
+        };
+      }
+      return {
+        ticker: null, code: "ambiguous-code",
+        reason: `"${teamName}" is named on the YES side of ${codesN.length} different ${series} team codes ` +
+          `(${codesN.join(", ")}) - refused rather than guessing which side pays out`,
+      };
+    }
+
     const seen = [...new Set(dated.map((m) => tickerTeamCode(m.ticker)).filter(Boolean))];
     return {
       ticker: null, code: "no-code-match",
@@ -616,52 +750,6 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
   // Reached only when no ticker on the board yields a usable code - some
   // series encode the fixture without a per-side suffix. The city guard below
   // still applies here, where it is cheap: these series publish real names.
-
-  /**
-   * Word-boundary matching, not substring.
-   *
-   * `text.includes(w)` matched "na" inside "rybakina" and resolved the player
-   * "Li Na" to the Rybakina contract. The same flaw matches "la" inside
-   * "dallas" and "ind" inside "indiana". A short token buried in a longer word
-   * is not a name match, and here a false match buys the wrong contract.
-   *
-   * A token counts when it IS one of the market's words, or when it is 4+
-   * characters and a market word starts with it - which keeps plurals and
-   * possessives ("star" vs "stars") working without letting two-letter
-   * fragments match anything.
-   */
-  const scoreAgainst = (text) => {
-    const bag = new Set(text.split(" ").filter(Boolean));
-    const hit = (w) => {
-      if (bag.has(w)) return true;
-      if (w.length < 4) return false;
-      // Prefix matching needs BOTH sides to be substantial. Allowing a short
-      // market word to prefix-match a long query word made "Stars" match the
-      // "St." in "St. Louis Blues" - which selected the opposing team.
-      for (const t of bag) {
-        if (t.length < 4) continue;
-        if (t.startsWith(w) || w.startsWith(t)) return true;
-      }
-      return false;
-    };
-    let score = 0;
-    let distinctive = 0;
-    // Strong words (mascot, surname, distinctive city) count double so
-    // "NC State Wolfpack" does not match every school with "State" in it.
-    for (const w of strong) {
-      if (!hit(w)) continue;
-      score += 2;
-      // A place name adds to the score but never establishes identity. This
-      // counter is what separates "New York Yankees" from "New York Mets".
-      if (!GEO.has(w)) distinctive += 1;
-    }
-    for (const w of words) if (WEAK.has(w) && hit(w)) score += 1;
-    // Whether the market itself offers anything but a place name. If its YES
-    // side reads "Texas" and nothing more, there is no distinctive word to
-    // match and geography is all either side has - handled below.
-    const selfDistinctive = [...bag].some((t) => !GEO.has(t) && !WEAK.has(t));
-    return { score, distinctive, selfDistinctive };
-  };
 
   // --- Match on the YES SIDE, never on the title ------------------------
   //
