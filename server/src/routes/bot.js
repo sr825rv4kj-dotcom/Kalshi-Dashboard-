@@ -5,7 +5,9 @@ import { kalshiGet } from "../kalshiClient.js";
 import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker } from "../botController.js";
 import { loadConfig, saveConfig, setEnvironment } from "../configStore.js";
 import { loadState, getRecentLog } from "../stateStore.js";
-import { getRecentTrades, getTradeStats, getTradeLifecycles } from "../tradeLedgerStore.js";
+import { getRecentTrades, getTradeStats, getTradeLifecycles, loadLedger } from "../tradeLedgerStore.js";
+import { clvReport, backfillFromLedger, clearKill } from "../clvTracker.js";
+import { fairValueReport } from "../fairValue.js";
 import { buildStrategyReview } from "../strategyReview.js";
 import { getRecentScores, findScoreForTeam } from "../scoresFetcher.js";
 import { getSharpProbabilities } from "../scraper.js";
@@ -163,6 +165,53 @@ export function registerBotRoutes(app) {
   app.get("/api/strategy-review", (_req, res) => {
     try {
       res.json(buildStrategyReview());
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * CLOSING LINE VALUE. Per-segment CLV (sport, timing, price band), what is
+   * killed, what is proven, and the most recent marks - every one a live
+   * Kalshi book read.
+   */
+  app.get("/api/clv", (_req, res) => {
+    try {
+      res.json(clvReport(loadConfig()));
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /**
+   * Marks the account's HISTORICAL trades from Kalshi's one-minute candles, so
+   * the kill switch starts from the real record. Safe to run more than once -
+   * trades already marked are skipped. Reports every skip with its reason.
+   */
+  app.post("/api/clv/backfill", async (_req, res) => {
+    try {
+      const entries = loadLedger().filter((t) => t.action === "enter" && t.filled > 0);
+      res.json(await backfillFromLedger(entries, loadConfig()));
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /** Clears a kill by hand: body { segment: "sport:baseball_mlb" } or { segment: "*" }. */
+  app.post("/api/clv/clear-kill", (req, res) => {
+    try {
+      const seg = String(req.body?.segment || "");
+      if (!seg) return res.status(400).json({ error: "segment is required (or \"*\" for all)" });
+      res.json({ cleared: clearKill(seg) });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /** Fair-value exit: mode, and every WOULD SELL / SOLD / SUSPECT decision with its real numbers. */
+  app.get("/api/fair-value", (_req, res) => {
+    try {
+      res.json(fairValueReport(loadConfig()));
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
