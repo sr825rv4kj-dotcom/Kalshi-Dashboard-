@@ -3,6 +3,25 @@
  */
 import { kalshiGet } from "../kalshiClient.js";
 import { assessOpportunity } from "../riskManager.js";
+import { getTradeLifecycles } from "../tradeLedgerStore.js";
+
+/**
+ * Pure: completed lifecycles -> chart series, oldest close first, running
+ * total of net-after-fees. Exported for testing against the real ledger.
+ */
+export function ledgerSeries(completed) {
+  const rows = [...(completed || [])]
+    .filter((t) => Number.isFinite(Number(t.netDollars)))
+    .sort((a, b) => Date.parse(a.exitTimestamp) - Date.parse(b.exitTimestamp));
+  let cumulative = 0;
+  return rows.map((t) => {
+    cumulative += t.netDollars;
+    return {
+      date: t.exitTimestamp, ticker: t.ticker, team: t.teamName ?? null, exit: t.exitReason ?? null,
+      pnl: Math.round(t.netDollars * 100) / 100, cumulativePnl: Math.round(cumulative * 100) / 100,
+    };
+  });
+}
 
 const V2 = "/trade-api/v2";
 
@@ -129,75 +148,61 @@ export function registerPortfolioRoutes(app) {
   });
 
   /**
-   * Cumulative P&L from Kalshi's own settlement records.
+   * CUMULATIVE P&L - FROM THE BOT'S OWN TRADE LEDGER (2026-09-24).
    *
-   * 2026-09-24: THE CHART ONLY EVER WENT UP. Cost was read from yes_total_cost /
-   * no_total_cost only. Kalshi now sends the dollar-string spellings
-   * (yes_total_cost_dollars ...), so both read as 0, every settlement's cost
-   * was $0, and the "P&L" line was really the sum of winning payouts - $37.00
-   * on an account that Kalshi itself shows down $7.62.
+   * This chart read Kalshi's /portfolio/settlements and showed -$199.85 over
+   * "52 settled trades" while the bot's ledger - every entry and exit with the
+   * fee Kalshi charged - showed +$2.96 over 59 closed trades. Two faults:
    *
-   * Every field is now read under both spellings. A settlement with NO readable
-   * cost field is left out and counted in `unreadable`, never scored as free.
-   * Add ?debug=1 to see the raw keys of the first settlement.
+   *   1. Settlements only cover positions HELD to settlement. Every position the
+   *      bot sold early (ceiling take-outs, blowout sells) is missing, so the
+   *      line could never match the Statement.
+   *   2. Kalshi's settlement list is the whole ACCOUNT, not the bot: anything
+   *      settled before the bot existed is in it. The line opened with a single
+   *      ~$180 drop - no bot bet has ever been larger than a few dollars.
    *
-   * Note what this does NOT cover: a position sold before settlement never
-   * appears in /portfolio/settlements. The bot's Statement (trade ledger) is
-   * the complete record; this chart is held-to-settlement trades only.
+   * The ledger is the complete record of what the bot actually did, so the
+   * chart now plots it: one point per closed trade, net of BOTH fees, in the
+   * order the trades closed. Its last point equals the Statement's net.
+   *
+   * ?source=kalshi still returns the raw account-settlement view (with the
+   * fee_cost unit fixed) for anyone who wants the account-level number.
    */
   app.get("/api/pnl-history", async (req, res) => {
     try {
+      if (req.query.source !== "kalshi") {
+        const series = ledgerSeries(getTradeLifecycles().completed);
+        return res.json({ series, source: "bot trade ledger", coverage: "every closed bot trade, net of fees" });
+      }
+
       const limit = req.query.limit || "200";
       const data = await kalshiGet(`${V2}/portfolio/settlements`, `?limit=${limit}`);
       const raw = data.settlements ?? [];
-
-      // Dollars when the *_dollars spelling is present, else integer cents.
-      const money = (o, base) => {
-        const d = o?.[`${base}_dollars`];
-        if (d != null && d !== "" && Number.isFinite(Number(d))) return Number(d);
-        const c = o?.[base];
-        if (c != null && c !== "" && Number.isFinite(Number(c))) return Number(c) / 100;
-        return null;
-      };
+      const num = (v) => (v != null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null);
 
       let unreadable = 0;
       const settlements = [];
       for (const s of raw) {
-        const revenue = money(s, "revenue");
-        const yesCost = money(s, "yes_total_cost");
-        const noCost = money(s, "no_total_cost");
-        if (revenue == null || (yesCost == null && noCost == null)) { unreadable++; continue; }
-        // fee_cost is a DOLLAR string ("0.0200") per Kalshi's schema, not cents.
-        // money() would read the bare name as cents and divide it by 100.
-        const feeRaw = s.fee_cost_dollars ?? s.fee_cost;
-        const fee = feeRaw != null && feeRaw !== "" && Number.isFinite(Number(feeRaw)) ? Number(feeRaw) : 0;
+        // Per Kalshi's schema: revenue is integer CENTS; *_total_cost_dollars and
+        // fee_cost are DOLLAR strings.
+        const revenueCents = num(s.revenue);
+        const yesCost = num(s.yes_total_cost_dollars) ?? (num(s.yes_total_cost) != null ? num(s.yes_total_cost) / 100 : null);
+        const noCost = num(s.no_total_cost_dollars) ?? (num(s.no_total_cost) != null ? num(s.no_total_cost) / 100 : null);
+        if (revenueCents == null || (yesCost == null && noCost == null)) { unreadable++; continue; }
         settlements.push({
-          ticker: s.ticker,
-          settledTime: s.settled_time,
-          revenueDollars: revenue,
-          costDollars: (yesCost ?? 0) + (noCost ?? 0),
-          feeDollars: fee,
+          ticker: s.ticker, settledTime: s.settled_time,
+          revenueDollars: revenueCents / 100, costDollars: (yesCost ?? 0) + (noCost ?? 0),
+          feeDollars: num(s.fee_cost) ?? 0,
         });
       }
-
-      if (req.query.debug === "1") {
-        return res.json({
-          count: raw.length, unreadable,
-          firstSettlementKeys: raw.length ? Object.keys(raw[0]) : [],
-          firstSettlementRaw: raw[0] ?? null,
-        });
-      }
-
       const sorted = settlements.sort((a, b) => new Date(a.settledTime) - new Date(b.settledTime));
       let cumulative = 0;
       const series = sorted.map((s) => {
-        // Kalshi books the settlement fee separately from cost; it is a real cost.
         const pnl = s.revenueDollars - s.costDollars - s.feeDollars;
         cumulative += pnl;
         return { date: s.settledTime, ticker: s.ticker, pnl, cumulativePnl: cumulative };
       });
-
-      res.json({ series, unreadable, coverage: "held-to-settlement trades only" });
+      res.json({ series, unreadable, source: "kalshi account settlements", coverage: "held-to-settlement only, whole account" });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
