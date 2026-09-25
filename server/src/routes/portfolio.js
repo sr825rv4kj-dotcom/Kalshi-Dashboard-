@@ -167,7 +167,10 @@ export function registerPortfolioRoutes(app) {
         const yesCost = money(s, "yes_total_cost");
         const noCost = money(s, "no_total_cost");
         if (revenue == null || (yesCost == null && noCost == null)) { unreadable++; continue; }
-        const fee = money(s, "fee_cost") ?? 0;
+        // fee_cost is a DOLLAR string ("0.0200") per Kalshi's schema, not cents.
+        // money() would read the bare name as cents and divide it by 100.
+        const feeRaw = s.fee_cost_dollars ?? s.fee_cost;
+        const fee = feeRaw != null && feeRaw !== "" && Number.isFinite(Number(feeRaw)) ? Number(feeRaw) : 0;
         settlements.push({
           ticker: s.ticker,
           settledTime: s.settled_time,
