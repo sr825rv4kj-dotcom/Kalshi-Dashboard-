@@ -326,6 +326,14 @@ export const DEFAULTS = {
   // KXUFCFIGHT-...AMAMAC-MAC priced at 68c against a 27.8% sharp line.
   disabledSports: ["mma_mixed_martial_arts"],
 
+  // LIVE GAMES ONLY (2026-09-23). The account's own record, 59 closed trades:
+  //   live      32 trades, 18 won, +$12.99
+  //   pre-game  27 trades,  7 won, -$10.03  (-$9.13 excluding the old flipping)
+  // Pre-game Kalshi prices sit at the sharp line; the edge is Kalshi lagging
+  // the sharp books DURING play. Pre-game buys and pre-game resting bids are
+  // off. Set to false to allow pre-game entries again.
+  liveOnly: true,
+
   // --- Account-level, never touched by the strategy migration ------------
   oddsProviderOrder: ["the-odds-api", "oddspapi"],
   oddsPapiTournamentIds: {},
@@ -417,5 +425,6 @@ export function describeStrategy() {
     clv: `kill switch ${c.clvKillSwitch === false ? "off" : "on"} (${c.clvMinSample ?? 15} marks, ${c.clvZ ?? 1}x SE); ` +
       `Kelly sizing ${c.clvGatedSizing === false ? "for every sport" : "only on sports with proven CLV"}`,
     disabledSports: (c.disabledSports || []).join(", ") || "none",
+    entries: c.liveOnly === false ? "live and pre-game" : "LIVE GAMES ONLY - no pre-game buys or resting bids",
   };
 }
