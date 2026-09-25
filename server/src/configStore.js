@@ -300,6 +300,32 @@ export const DEFAULTS = {
     { at: 10000, kellyFraction: 0.30, maxConcurrentPositions: 20, maxStakeDollars: 600, reservePct: 0.40 },
   ],
 
+  // --- 2026-09-24: fair-value exits, CLV kill switch, earned sizing --------
+  // Added WITHOUT a strategy-version bump on purpose: a bump would reset every
+  // strategy key to its default and wipe dashboard edits. New keys reach a
+  // running instance through the {...DEFAULTS, ...stored} merge on their own.
+  //
+  // "shadow" logs every sell it WOULD make, with real numbers, and sells
+  // nothing. Set to "live" once the shadow decisions check out in the Kalshi
+  // app. "off" disables it.
+  fairValueExit: "shadow",
+  fairValueExitMarginCents: 2,     // sell only when the bid beats fair by this much after fees
+  fairValueMaxAgeSeconds: 420,     // sharp reading older than this -> no exit decision
+
+  clvKillSwitch: true,             // false = measure and report, never block
+  clvMinSample: 15,                // marks a segment needs before it can be killed or proven
+  clvZ: 1.0,                       // standard errors of confidence for kill / proven
+  clvKillBelowCents: 0,            // kill when mean CLV + z*SE is below this
+  clvReviveAboveCents: 0,          // revive when shadow mean CLV since the kill reaches this
+  clvLiveHorizonMinutes: 5,        // in-play mark taken this long after the fill
+  clvMaxMarkSpreadCents: 10,       // wider book than this gives no mid - retried, never guessed
+  clvMarksPerCycle: 20,
+  clvGatedSizing: true,            // Kelly only on sports with proven CLV; flat stake elsewhere
+
+  // Sports never scanned. MMA is off until the UFC side inversion is fixed:
+  // KXUFCFIGHT-...AMAMAC-MAC priced at 68c against a 27.8% sharp line.
+  disabledSports: ["mma_mixed_martial_arts"],
+
   // --- Account-level, never touched by the strategy migration ------------
   oddsProviderOrder: ["the-odds-api", "oddspapi"],
   oddsPapiTournamentIds: {},
@@ -387,5 +413,9 @@ export function describeStrategy() {
     sizing: `${(c.kellyFraction * 100).toFixed(0)}% Kelly, max ${(c.maxRiskPctPerTrade * 100).toFixed(0)}% of bankroll per trade`,
     concurrency: `up to ${c.survivalMode?.maxConcurrentPositions ?? "tier"} positions at once ` +
       `(flat $${c.survivalMode?.flatBetDollars ?? "-"} while the balance is under $${c.survivalMode?.balanceThreshold ?? "-"})`,
+    fairValueExit: `${c.fairValueExit ?? "shadow"} - sell when the bid beats the sharp fair value by ${c.fairValueExitMarginCents ?? 2}c after fees`,
+    clv: `kill switch ${c.clvKillSwitch === false ? "off" : "on"} (${c.clvMinSample ?? 15} marks, ${c.clvZ ?? 1}x SE); ` +
+      `Kelly sizing ${c.clvGatedSizing === false ? "for every sport" : "only on sports with proven CLV"}`,
+    disabledSports: (c.disabledSports || []).join(", ") || "none",
   };
 }
