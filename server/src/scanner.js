@@ -88,7 +88,7 @@ import { clvVerdict, recordShadow } from "./clvTracker.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-24-clv-gated";
+export const SCANNER_VERSION = "2026-09-24-live-only";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -354,7 +354,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     return false;
   }
 
-  const drops = { live: 0, window: 0, unresolved: 0, closed: 0, error: 0, duplicate: 0 };
+  const drops = { live: 0, pregame: 0, window: 0, unresolved: 0, closed: 0, error: 0, duplicate: 0 };
   // "8 not-tradeable" told us nothing actionable. Counting the actual status
   // strings turns it into "status=finalized x8", which is a fixable fact.
   const statusCounts = {};
@@ -375,6 +375,9 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       if (!sampleReason) sampleReason = `${teamName}: live trading switched off in config`;
       return null;
     }
+    // LIVE ONLY: a game that has not started is not traded - no buy, no
+    // resting bid. Checked before the ticker lookup, so it costs no Kalshi call.
+    if (!timing.live && config.liveOnly !== false) { drops.pregame++; return null; }
     if (!timing.ok) { drops.window++; return null; }
 
     let ticker = tickerMap[teamName];
@@ -497,7 +500,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
 
   appendLog(
     `${sportKey}: ${teamEntries.length} lines -> ${viable.length} tradeable ` +
-    `(dropped: ${drops.live} live-disabled, ${drops.unresolved} unresolved, ${drops.window} out-of-window, ` +
+    `(dropped: ${drops.pregame} not started yet (live-only), ${drops.live} live-disabled, ${drops.unresolved} unresolved, ${drops.window} out-of-window, ` +
     `${drops.closed} not-tradeable, ${drops.duplicate} already held, ${drops.error} fetch error)` +
     (sampleReason ? ` | e.g. ${sampleReason}` : "")
   );
