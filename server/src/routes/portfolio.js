@@ -128,28 +128,73 @@ export function registerPortfolioRoutes(app) {
     }
   });
 
+  /**
+   * Cumulative P&L from Kalshi's own settlement records.
+   *
+   * 2026-09-24: THE CHART ONLY EVER WENT UP. Cost was read from yes_total_cost /
+   * no_total_cost only. Kalshi now sends the dollar-string spellings
+   * (yes_total_cost_dollars ...), so both read as 0, every settlement's cost
+   * was $0, and the "P&L" line was really the sum of winning payouts - $37.00
+   * on an account that Kalshi itself shows down $7.62.
+   *
+   * Every field is now read under both spellings. A settlement with NO readable
+   * cost field is left out and counted in `unreadable`, never scored as free.
+   * Add ?debug=1 to see the raw keys of the first settlement.
+   *
+   * Note what this does NOT cover: a position sold before settlement never
+   * appears in /portfolio/settlements. The bot's Statement (trade ledger) is
+   * the complete record; this chart is held-to-settlement trades only.
+   */
   app.get("/api/pnl-history", async (req, res) => {
     try {
       const limit = req.query.limit || "200";
       const data = await kalshiGet(`${V2}/portfolio/settlements`, `?limit=${limit}`);
-      const settlements = (data.settlements ?? []).map((s) => ({
-        ticker: s.ticker,
-        settledTime: s.settled_time,
-        revenueDollars: (s.revenue ?? 0) / 100,
-        yesTotalCostDollars: (s.yes_total_cost ?? 0) / 100,
-        noTotalCostDollars: (s.no_total_cost ?? 0) / 100,
-      }));
+      const raw = data.settlements ?? [];
 
-      const sorted = [...settlements].sort((a, b) => new Date(a.settledTime) - new Date(b.settledTime));
+      // Dollars when the *_dollars spelling is present, else integer cents.
+      const money = (o, base) => {
+        const d = o?.[`${base}_dollars`];
+        if (d != null && d !== "" && Number.isFinite(Number(d))) return Number(d);
+        const c = o?.[base];
+        if (c != null && c !== "" && Number.isFinite(Number(c))) return Number(c) / 100;
+        return null;
+      };
+
+      let unreadable = 0;
+      const settlements = [];
+      for (const s of raw) {
+        const revenue = money(s, "revenue");
+        const yesCost = money(s, "yes_total_cost");
+        const noCost = money(s, "no_total_cost");
+        if (revenue == null || (yesCost == null && noCost == null)) { unreadable++; continue; }
+        const fee = money(s, "fee_cost") ?? 0;
+        settlements.push({
+          ticker: s.ticker,
+          settledTime: s.settled_time,
+          revenueDollars: revenue,
+          costDollars: (yesCost ?? 0) + (noCost ?? 0),
+          feeDollars: fee,
+        });
+      }
+
+      if (req.query.debug === "1") {
+        return res.json({
+          count: raw.length, unreadable,
+          firstSettlementKeys: raw.length ? Object.keys(raw[0]) : [],
+          firstSettlementRaw: raw[0] ?? null,
+        });
+      }
+
+      const sorted = settlements.sort((a, b) => new Date(a.settledTime) - new Date(b.settledTime));
       let cumulative = 0;
       const series = sorted.map((s) => {
-        const cost = s.yesTotalCostDollars + s.noTotalCostDollars;
-        const pnl = s.revenueDollars - cost;
+        // Kalshi books the settlement fee separately from cost; it is a real cost.
+        const pnl = s.revenueDollars - s.costDollars - s.feeDollars;
         cumulative += pnl;
         return { date: s.settledTime, ticker: s.ticker, pnl, cumulativePnl: cumulative };
       });
 
-      res.json({ series });
+      res.json({ series, unreadable, coverage: "held-to-settlement trades only" });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
