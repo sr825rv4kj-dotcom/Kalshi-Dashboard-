@@ -47,7 +47,25 @@ import { loadState, saveState, appendLog } from "./stateStore.js";
 const ODDS_API_BASE = "https://api.the-odds-api.com/v4";
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h - season status barely moves
 
-export const SPORTS_DISCOVERY_VERSION = "2026-09-22-no-outrights";
+export const SPORTS_DISCOVERY_VERSION = "2026-09-24-one-strike-per-scan";
+
+/*
+ * 2026-09-24: THE QUARANTINE PARKED THE WHOLE BOARD ON ONE BLIP.
+ *
+ * Production state at 02:54Z: 34 sports parked - NFL (with a live Packers
+ * position), NHL, NBA, EPL, MLS - every one with 36-37 strikes and the SAME
+ * lastSeen timestamp. Two faults compounded:
+ *
+ *   1. A strike was added on EVERY discovery call while the sport's last scan
+ *      record was still "fresh" (15 min). A parked sport is never re-scanned,
+ *      so that one record kept striking every 20s cycle - 37 strikes from one
+ *      scan. It now strikes once per distinct scan record.
+ *
+ *   2. "odds-fetch-failed" and "unresolved:fetch-failed" counted as board
+ *      conditions. They are TRANSPORT errors - the odds API or Kalshi did not
+ *      answer - and say nothing about whether the sport has games. One feed
+ *      outage parked every sport for six hours. They no longer strike.
+ */
 
 /** Consecutive barren scans before a sport is parked. */
 const STRIKES_TO_PARK = 3;
@@ -72,9 +90,7 @@ const BOARD_CONDITIONS = new Set([
   "unresolved:series-empty",
   "unresolved:none-tradeable",
   "unresolved:no-series",
-  "unresolved:fetch-failed",
   "unresolved:draw-or-tie",
-  "odds-fetch-failed",
   "dropped:window",
 ]);
 
@@ -150,8 +166,19 @@ function applyQuarantine(candidates) {
   let dirty = false;
 
   for (const sportKey of candidates) {
-    const h = health[sportKey] || { strikes: 0, parkedUntil: 0 };
-    const verdict = barrenScan(scans[sportKey]);
+    let h = health[sportKey] || { strikes: 0, parkedUntil: 0 };
+    // A park written by the old over-striking code (strikes far past the
+    // threshold, no record stamp) is released once on this build's first pass.
+    if (h.parkedUntil > now && !h.lastRecordAt && (h.strikes || 0) > STRIKES_TO_PARK * 2) {
+      h = { strikes: 0, parkedUntil: 0, lastSeen: now };
+      health[sportKey] = h;
+      justReleased.push(sportKey);
+      dirty = true;
+    }
+    const record = scans[sportKey];
+    let verdict = barrenScan(record);
+    // One strike per scan record, never one per call.
+    if (verdict === true && record && h.lastRecordAt === record.at) verdict = null;
 
     if (verdict === false) {
       // Healthy scan. Clear everything - a sport that produced a real decision
@@ -167,6 +194,7 @@ function applyQuarantine(candidates) {
     if (verdict === true) {
       h.strikes = (h.strikes || 0) + 1;
       h.lastSeen = now;
+      h.lastRecordAt = record.at;
       if (h.strikes >= STRIKES_TO_PARK && !(h.parkedUntil > now)) {
         h.parkedUntil = now + PARK_MS;
         justParked.push(sportKey);
