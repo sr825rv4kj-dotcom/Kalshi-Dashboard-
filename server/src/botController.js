@@ -12,14 +12,41 @@ import { currentCadenceSeconds, describeCadence } from "./cadence.js";
 import { scanSport } from "./scanner.js";
 import { notifyMilestone, notifyDailyHalt, notifyDailySummary } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
-import { getRecentTrades, recordTrade, scheduleFeeCents } from "./tradeLedgerStore.js";
-import { syncResting, cancelAllResting } from "./makerEngine.js";
+import { getRecentTrades, recordTrade, scheduleFeeCents, loadLedger } from "./tradeLedgerStore.js";
+import { syncResting, cancelAllResting, restingCount } from "./makerEngine.js";
+import { getSharpProbabilities } from "./scraper.js";
+import {
+  fairValueExitDecision, fairValueMode, shouldLogShadow, recordDecision, recordFairFromProbabilities,
+} from "./fairValue.js";
+import { registerOpenPositions, markDue, needsBackfill, backfillFromLedger } from "./clvTracker.js";
 
 const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-09-23-settlement-verified";
+export const CONTROLLER_VERSION = "2026-09-24-fair-value-clv";
+
+/**
+ * 2026-09-24 - four changes in this file:
+ *
+ * 1. FAIR-VALUE EXIT (fairValue.js). Sells when the Kalshi bid, after the exit
+ *    fee and a 1c cross, is worth more than the sharp line says the contract
+ *    is worth held. Runs "shadow" by default: it logs WOULD SELL with the real
+ *    numbers and sells nothing until config.fairValueExit is set to "live".
+ *
+ * 2. CLV MARKING (clvTracker.js). Every open position is registered, and every
+ *    due mark is taken against the live book, once per cycle.
+ *
+ * 3. FAIR VALUES STAY FRESH FOR HELD GAMES. The cycle returns early at the
+ *    position cap and never scans - exactly when an exit is most useful. Held
+ *    sports that were not scanned this cycle now get their sharp line read
+ *    anyway, so the exit rule is never working from a stale number.
+ *
+ * 4. THE TAKER CAP COUNTS RESTING BIDS. The log showed "7 held + 3 bids, cap
+ *    10" followed by a taker fill to 8 held + 3 bids = 11. The taker path now
+ *    stops at positions + bids >= cap. The cycle-level check still counts
+ *    positions only, so bids keep being re-priced and synced at the cap.
+ */
 
 /**
  * 2026-09-23 - three fixes in this file:
@@ -172,6 +199,41 @@ function atConcurrentPositionCap(config, bankroll) {
   const cap = positionCapFor(config, bankroll);
   if (!cap) return false;
   return loadState().positions.length >= cap;
+}
+
+/** The taker path's cap: positions PLUS resting bids, so it can never overshoot. */
+function takerAtCap(config, bankroll) {
+  const cap = positionCapFor(config, bankroll);
+  if (!cap) return false;
+  let bids = 0;
+  try { bids = restingCount(); } catch { bids = 0; }
+  return loadState().positions.length + bids >= cap;
+}
+
+/** Sports switched off by hand (config.disabledSports). */
+function disabledSports(config) {
+  return new Set((config.disabledSports || []).map((k) => String(k)));
+}
+
+/**
+ * Reads the sharp line for every sport with an open position that was NOT
+ * scanned this cycle, so the fair-value exit always has a fresh number.
+ * One odds call per held sport; never throws.
+ */
+async function refreshHeldFairValues(config, alreadyScanned = new Set()) {
+  const held = [...new Set(loadState().positions.map((p) => p.sportKey).filter(Boolean))]
+    .filter((k) => !alreadyScanned.has(k));
+  for (const sportKey of held) {
+    try {
+      const r = await getSharpProbabilities(sportKey, {
+        oddsPapiTournamentId: (config.oddsPapiTournamentIds || {})[sportKey],
+        providerOrder: config.oddsProviderOrder,
+      });
+      recordFairFromProbabilities(sportKey, r.probabilities);
+    } catch {
+      // the exit refuses on a stale fair value - that is the safe failure
+    }
+  }
 }
 
 /** One position per game. Both sides of the same event is a guaranteed fee loss. */
@@ -764,6 +826,29 @@ async function checkOpenPositionsOnce(config) {
         continue;
       }
 
+      // FAIR-VALUE EXIT. Shadow by default - see fairValue.js.
+      const fv = fairValueExitDecision(position, quote, config);
+      if (fv.action === "sell") {
+        const mode = fairValueMode(config);
+        if (mode === "live") {
+          appendLog(`${position.ticker} - ${fv.line}`);
+          recordDecision({ mode, ticker: position.ticker, team: position.teamName, action: "SOLD", bid: fv.bid, fairCents: fv.fairCents, sellNetCents: fv.sellNetCents, entry: position.entryPriceCents });
+          await exitPosition(position, "fair-value-exit");
+          recordExit(position.ticker);
+          continue;
+        }
+        if (shouldLogShadow(position, quote.bid)) {
+          appendLog(`${position.ticker} - SHADOW, would sell: ${fv.line} (set fairValueExit to "live" to act)`);
+          recordDecision({ mode, ticker: position.ticker, team: position.teamName, action: "WOULD SELL", bid: fv.bid, fairCents: fv.fairCents, sellNetCents: fv.sellNetCents, entry: position.entryPriceCents });
+        }
+      } else if (fv.action === "refuse" && fv.code === "suspect-mapping" && !position.suspectLogged) {
+        appendLog(`${position.ticker} (${position.teamName}) - ${fv.why}. Check this position by hand in the Kalshi app.`, "warn");
+        recordDecision({ mode: fairValueMode(config), ticker: position.ticker, team: position.teamName, action: "SUSPECT MAPPING", bid: quote.bid, entry: position.entryPriceCents, why: fv.why });
+        const st = loadState();
+        const p = st.positions.find((x) => x.ticker === position.ticker && x.openedAt === position.openedAt);
+        if (p) { p.suspectLogged = true; saveState(st); }
+      }
+
       const decision = blowoutExitDecision(position, quote, config);
       if (decision) {
         appendLog(`${position.ticker} - ${decision}`, "warn");
@@ -847,6 +932,24 @@ export async function runCycle() {
     const { settled } = await reconcileSettledPositions();
     if (settled) appendLog(`${settled} position(s) settled and cleared from tracking.`);
 
+    // CLV: register new fills, take every mark that is due. Never blocks a cycle.
+    try {
+      registerOpenPositions(loadState().positions, config);
+      const m = await markDue(config);
+      if (m.marked || m.dropped) appendLog(`CLV: ${m.marked} mark(s) taken, ${m.dropped} dropped (see /api/clv).`);
+      // First run on this volume: mark the account's history from Kalshi's own
+      // one-minute candles so the kill switch starts from the real record.
+      if (needsBackfill()) {
+        const entries = loadLedger().filter((t) => t.action === "enter" && t.filled > 0);
+        const b = await backfillFromLedger(entries, config);
+        const skipped = Object.entries(b.skipped).map(([k, n]) => `${k} x${n}`).join(", ") || "none";
+        appendLog(`CLV backfill: ${b.marked} of ${b.considered} past trades marked from Kalshi candles. Skipped: ${skipped}.` +
+          (b.examples.length ? ` e.g. ${b.examples[0]}` : ""));
+      }
+    } catch (err) {
+      appendLog(`CLV marking skipped this cycle (${err.message}).`, "warn");
+    }
+
     const { halted, reason } = await checkDailyHalt(config);
     markExchangeReachable();   // checkDailyHalt reads the balance - the exchange answered
     if (halted) {
@@ -891,6 +994,8 @@ export async function runCycle() {
         lastCapLogAt = now;
         appendLog(`At the concurrent position cap with ${loadState().positions.length} open - waiting for games to settle.`);
       }
+      // Not scanning - but held games still need a fresh fair value for exits.
+      await refreshHeldFairValues(config);
       return;
     }
 
@@ -917,7 +1022,11 @@ export async function runCycle() {
     const cooling = cooledDownEventKeys(config);
     for (const k of cooling) skipEvents.add(k);
 
+    const off = disabledSports(config);
+    const scanned = new Set();
     for (const sportKey of activeSports) {
+      if (off.has(sportKey)) continue;
+      scanned.add(sportKey);
       const stop = await scanSport({
         sportKey,
         config: {
@@ -928,11 +1037,13 @@ export async function runCycle() {
         bankroll: tradable,
         tickerMap,
         skipEvents,
-        atCap: () => atConcurrentPositionCap(config, bankroll),
+        atCap: () => takerAtCap(config, bankroll),
         positionCap: positionCapFor(config, bankroll),
       });
       if (stop) break;
     }
+
+    await refreshHeldFairValues(config, scanned);
 
     markExchangeReachable();
   } catch (err) {
@@ -1058,7 +1169,8 @@ export function startBot() {
   const { seconds, phase } = describeCadence();
   appendLog(
     `Bot started (${config.environment}). Scanning every ${seconds}s (${phase}). ` +
-    `Live and pre-game entries, ${config.minEntryPriceCents}-${config.maxEntryPriceCents}c band, held to settlement.`
+    `Live and pre-game entries, ${config.minEntryPriceCents}-${config.maxEntryPriceCents}c band, ` +
+    `fair-value exit ${fairValueMode(config)}, CLV kill switch ${config.clvKillSwitch === false ? "off" : "on"}.`
   );
 
   const state = loadState();
