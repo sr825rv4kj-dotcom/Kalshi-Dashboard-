@@ -83,10 +83,12 @@ import { resolveTicker } from "./tickerResolver.js";
 import { getLiveScores, findLiveGameForTeam } from "./scoresFetcher.js";
 import { corroboratedProbability, fractionRemaining, paramsFor } from "./liveModel.js";
 import { workCandidate, cancelResting, getRestingOrders, cancelPendingOnEvent } from "./makerEngine.js";
+import { recordFairFromProbabilities } from "./fairValue.js";
+import { clvVerdict, recordShadow } from "./clvTracker.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-23-live-80c-cap";
+export const SCANNER_VERSION = "2026-09-24-clv-gated";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -341,6 +343,11 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     return false;
   }
 
+  // Every line read is also the fair value of any position on that team. The
+  // fair-value exit (botController) reads it from here - held games included,
+  // which are dropped as duplicates below before they are ever priced.
+  recordFairFromProbabilities(sportKey, probResult.probabilities);
+
   const teamEntries = Object.entries(probResult.probabilities || {});
   if (!teamEntries.length) {
     recordScanTally(sportKey, { "no-lines-from-provider": 1 }, 0, 0);
@@ -549,11 +556,6 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   }
 
   for (const c of viable) {
-    if (atCap()) {
-      appendLog("Max concurrent positions reached - stopping scan this cycle.", "warn");
-      stopScanning = true;
-      break;
-    }
     if (openEvents.has(eventKeyOf(c.ticker))) continue;
 
     const askCents = c.pricing.askCents;
@@ -573,6 +575,29 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       await dropResting(c.ticker, "book too wide to trust");
       continue;
     }
+
+    // --- CLV kill switch + earned sizing (clvTracker.js) -------------------
+    // A segment whose closing line value is confidently negative does not
+    // trade. The candidate is recorded as a SHADOW at the real ask and marked
+    // against the real book later, which is how the segment earns its way back.
+    const verdict = clvVerdict({ sportKey, live: c.timing.live, priceCents: askCents }, config);
+    if (verdict.killed) {
+      const line = `${c.ticker} ${askCents}c: ${verdict.killedBy} is killed on negative CLV - shadow-tracked, not traded`;
+      bump("clv-killed", line);
+      rejected.push(line);
+      recordShadow({
+        ticker: c.ticker, sportKey, teamName: c.teamName, askCents,
+        trueProbability: c.trueProbability, commenceTime: c.commenceTime, live: c.timing.live,
+      }, config);
+      await dropResting(c.ticker, `${verdict.killedBy} killed on negative CLV`);
+      continue;
+    }
+    // Kelly sizing is EARNED per sport. Until a sport's CLV is confidently
+    // positive, it trades the flat survival stake whatever the balance is.
+    const earnedKelly = config.clvGatedSizing === false || verdict.proven;
+    const sizingSurvival = earnedKelly
+      ? config.survivalMode
+      : { ...(config.survivalMode || {}), balanceThreshold: Infinity, flatBetDollars: config.survivalMode?.flatBetDollars ?? 1.75 };
 
     const assessment = assessOpportunity({
       bankroll,
@@ -601,7 +626,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       lineAgeSeconds: c.lineAgeSeconds,
       maxLineAgeSecondsLive: config.maxLineAgeSecondsLive ?? 900,
       maxLineAgeSecondsPregame: config.maxLineAgeSecondsPregame ?? 7200,
-      survivalMode: config.survivalMode,
+      survivalMode: sizingSurvival,
     });
 
     if (assessment.action === "skip") {
@@ -615,6 +640,17 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       } else {
         await dropResting(c.ticker, assessment.reason);
       }
+      continue;
+    }
+
+    // THE CAP COUNTS RESTING BIDS (2026-09-24). Checked here, at the moment of
+    // a taker entry, not at the top of the loop: the scan must keep running at
+    // the cap so resting bids keep being re-confirmed and re-priced, or the
+    // maker sync would cancel them all as unconfirmed.
+    if (atCap()) {
+      const line = `${c.ticker}: taker entry refused - positions plus resting bids are at the cap`;
+      bump("at-cap", line);
+      rejected.push(line);
       continue;
     }
 
@@ -646,7 +682,8 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       `Candidate ${c.ticker} (${c.teamName}): sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ` +
       `[${c.pricing.source}]${walk}, edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}% at the limit, ` +
       `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract (${assessment.edgeCheck.evTradeCents.toFixed(1)}c the trade), ` +
-      `${assessment.sizing.contracts} contracts (max $${assessment.sizing.dollarsAtRisk.toFixed(2)}), ${startsIn}${liveNote}`
+      `${assessment.sizing.contracts} contracts (max $${assessment.sizing.dollarsAtRisk.toFixed(2)}, ` +
+      `${earnedKelly ? "Kelly" : `flat - ${sportKey} CLV not proven yet (${verdict.sportStats.n} marks)`}), ${startsIn}${liveNote}`
     );
 
     let result = null;
@@ -661,7 +698,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         reason:
           `${c.timing.live ? "In-play" : "Pre-game"} edge via ${probResult.provider} on "${c.teamName}" ` +
           `(sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ask / ${assessment.limitCents}c limit, ` +
-          `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract, held to settlement)`,
+          `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract)`,
         edgePct: assessment.edgeCheck.observedEdge * 100,
         teamName: c.teamName,
         sportKey,
