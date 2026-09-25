@@ -210,6 +210,8 @@ const REASON_LABELS = {
   "unmodellable": "could not model the game state",
   "no-fill": "order placed but nothing filled",
   "skip-other": "other",
+  "clv-killed": "segment killed on negative closing line value (shadow-tracked)",
+  "at-cap": "positions plus resting bids at the cap",
 
   // A funding-routing miss, NOT an illiquid book. The edge was real and the
   // size was there; Kalshi refused the order because the account's collateral
