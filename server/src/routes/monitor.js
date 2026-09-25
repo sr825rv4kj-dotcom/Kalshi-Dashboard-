@@ -27,6 +27,7 @@
  */
 
 import crypto from "crypto";
+import { kalshiGet } from "../kalshiClient.js";
 import { loadState, getRecentLog } from "../stateStore.js";
 import { loadConfig } from "../configStore.js";
 import { getTradeStats, getTradeLifecycles } from "../tradeLedgerStore.js";
@@ -129,7 +130,7 @@ export function registerMonitorRoutes(app) {
   // failure to start them must never stop the server from booting.
   try { startHealthAlerts(); } catch (err) { console.warn("[health] alerts not started:", err.message); }
 
-  app.get("/api/monitor/:token", (req, res) => {
+  app.get("/api/monitor/:token", async (req, res) => {
     if (!tokenMatches(req.params.token)) {
       // DISTINCT STATUS CODES, so a failed check says WHY without a login.
       // Every attempt so far came back a bare 404, and a 404 could mean the
@@ -236,6 +237,22 @@ export function registerMonitorRoutes(app) {
 
     section("config", () => safeConfig(loadConfig()));
     section("log", () => getRecentLog(120));
+
+    // KALSHI'S OWN SETTLEMENT RECORDS, raw fields, oldest first. The dashboard
+    // chart is built from these and shows -$199.85 while the bot's ledger shows
+    // +$2.96; this is the evidence needed to see which record causes the cliff.
+    try {
+      const data = await kalshiGet("/trade-api/v2/portfolio/settlements", "?limit=200");
+      const rows = (data.settlements || []).map((s) => ({
+        ticker: s.ticker, settled: s.settled_time, result: s.market_result,
+        revenue: s.revenue, yesCount: s.yes_count_fp ?? s.yes_count, noCount: s.no_count_fp ?? s.no_count,
+        yesCost: s.yes_total_cost_dollars ?? s.yes_total_cost, noCost: s.no_total_cost_dollars ?? s.no_total_cost,
+        fee: s.fee_cost,
+      })).sort((a, b) => Date.parse(a.settled) - Date.parse(b.settled));
+      out.settlements = { count: rows.length, fieldNames: data.settlements?.[0] ? Object.keys(data.settlements[0]) : [], rows };
+    } catch (err) {
+      out.settlements = { error: err.message };
+    }
 
     res.json(out);
   });
