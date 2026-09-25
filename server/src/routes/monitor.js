@@ -118,6 +118,8 @@ function safeConfig(cfg) {
     maxLineAgeSecondsPregame: cfg.maxLineAgeSecondsPregame,
     dailyLossHaltPct: cfg.dailyLossHaltPct,
     survivalMode: cfg.survivalMode,
+    liveOnly: cfg.liveOnly !== false,
+    disabledSports: cfg.disabledSports ?? [],
   };
 }
 
