@@ -52,12 +52,37 @@
  * ---------------------------------------------------------------------------
  */
 
+/*
+ * ---------------------------------------------------------------------------
+ * 2026-09-24: MONEYLINE COVERAGE
+ * ---------------------------------------------------------------------------
+ * The last discovery left 27 feed sports unmapped and refused 5 as ambiguous.
+ * Two additions, both restricted to MONEYLINE series - a ticker ending GAME,
+ * MATCH or FIGHT - because that is the only market type the bot prices:
+ *
+ *   4. TITLE PHRASES. A curated phrase per league ("efl championship",
+ *      "primeira liga", "scottish premiership") matched on whole words against
+ *      Kalshi's series TITLE. The series must still pass every gate above
+ *      (sport tag, women's, market type, NEVER_BIND) and exactly one moneyline
+ *      series may match - two is a refusal, as always. Nothing is bound to a
+ *      guessed ticker: if Kalshi has no such series today, the sport stays
+ *      unmapped and costs nothing.
+ *
+ *   5. MONEYLINE TIE-BREAK. A tie where exactly ONE survivor is a moneyline
+ *      series resolves to it. The other side of those ties is a futures /
+ *      championship series (KXBOXING, KXNHL, KXCONMEBOLSUD), which the scanner
+ *      cannot trade anyway. Ties between two moneyline series stay refused -
+ *      conference league vs KXUELGAME / KXUEFAGAME is exactly that, and both
+ *      are the wrong competition.
+ * ---------------------------------------------------------------------------
+ */
+
 import { appendLog } from "./stateStore.js";
 
 const V2 = "/trade-api/v2";
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;   // series lists barely move
 
-export const DISCOVERY_VERSION = "2026-09-23-pinned-tag-gated";
+export const DISCOVERY_VERSION = "2026-09-24-moneyline-titles";
 
 let cache = null;
 
@@ -126,7 +151,69 @@ export const NEVER_BIND = {
   soccer_switzerland_superleague: ["KXSUPERLIG", "KXSUPERLIGGAME"],
   soccer_sweden_superettan: ["KXSUPERLIG", "KXSUPERLIGGAME"],
   soccer_finland_veikkausliiga: ["KXFINYLGAME"],
+  // FCS is not FBS. KXNCAAFGAME would win the new moneyline tie-break.
+  americanfootball_ncaaf_fcs: ["KXNCAAFGAME"],
 };
+
+/** A series that settles on who wins a single game, match or fight. */
+export function isMoneylineSeries(ticker) {
+  return /(GAME|MATCH|FIGHT)$/.test(String(ticker || "").toUpperCase());
+}
+
+/**
+ * League -> phrases Kalshi's series TITLE would carry. Whole-word, case-
+ * insensitive. Only moneyline series are considered, after every gate.
+ */
+export const MONEYLINE_TITLES = {
+  soccer_efl_champ: ["efl championship", "english championship"],
+  soccer_england_league1: ["efl league one", "english league one"],
+  soccer_england_league2: ["efl league two", "english league two"],
+  soccer_england_efl_cup: ["efl cup", "carabao cup"],
+  soccer_portugal_primeira_liga: ["primeira liga", "liga portugal"],
+  soccer_spl: ["scottish premiership"],
+  soccer_austria_bundesliga: ["austrian bundesliga"],
+  soccer_switzerland_superleague: ["swiss super league"],
+  soccer_greece_super_league: ["greek super league"],
+  soccer_germany_dfb_pokal: ["dfb pokal"],
+  soccer_brazil_serie_b: ["brasileiro serie b", "brazil serie b"],
+  soccer_chile_campeonato: ["chilean primera", "chile primera"],
+  soccer_spain_segunda_division: ["segunda division", "la liga 2", "laliga 2"],
+  soccer_finland_veikkausliiga: ["veikkausliiga"],
+  soccer_league_of_ireland: ["league of ireland"],
+  soccer_sweden_superettan: ["superettan"],
+  soccer_uefa_europa_conference_league: ["conference league"],
+  soccer_conmebol_copa_sudamericana: ["sudamericana"],
+  icehockey_sweden_hockey_league: ["swedish hockey league", "shl"],
+  icehockey_sweden_allsvenskan: ["hockeyallsvenskan"],
+  icehockey_mestis: ["mestis"],
+  icehockey_nhl_preseason: ["nhl"],
+  handball_germany_bundesliga: ["handball bundesliga"],
+  aussierules_aflw: ["aflw", "afl women"],
+  rugbyleague_nrlw: ["nrlw", "nrl women"],
+  boxing_boxing: ["boxing"],
+};
+
+function titleHas(title, phrase) {
+  const t = ` ${String(title || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()} `;
+  const p = ` ${String(phrase || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()} `;
+  return p.trim().length > 0 && t.includes(p);
+}
+
+/** Step 4. Returns { ticker } on a unique match, { ambiguous: [...] }, or null. */
+export function titleMoneylineMatch(series, sportKey) {
+  const phrases = MONEYLINE_TITLES[sportKey];
+  if (!phrases) return null;
+  const hits = new Set();
+  for (const s of series) {
+    if (!isMoneylineSeries(s.ticker)) continue;
+    if (!phrases.some((ph) => titleHas(s.title, ph))) continue;
+    if (ineligibleReason(s, sportKey)) continue;
+    hits.add(s.ticker);
+  }
+  if (hits.size === 1) return { ticker: [...hits][0] };
+  if (hits.size > 1) return { ambiguous: [...hits] };
+  return null;
+}
 
 /**
  * Pins by prefix, for feeds that publish one key per tournament
@@ -407,7 +494,20 @@ export function buildSeriesMap(series, sportKeys = []) {
       }
     }
 
-    // --- 2. Discovery ----------------------------------------------------
+    // --- 2. Moneyline title phrases (2026-09-24) --------------------------
+    const byTitle = titleMoneylineMatch(series, sportKey);
+    if (byTitle?.ticker) {
+      map[sportKey] = byTitle.ticker;
+      found.push(`${sportKey} -> ${byTitle.ticker} (title)`);
+      continue;
+    }
+    if (byTitle?.ambiguous) {
+      ambiguous.push(`${sportKey} -> ${byTitle.ambiguous.join(" / ")} (title)`);
+      missed.push(sportKey);
+      continue;
+    }
+
+    // --- 3. Discovery ----------------------------------------------------
     const tokens = distinctiveTokens(sportKey);
     if (!tokens.length) { missed.push(sportKey); continue; }
 
@@ -427,7 +527,12 @@ export function buildSeriesMap(series, sportKeys = []) {
 
     if (!winners.length || bestScore < 20) { missed.push(sportKey); continue; }
 
-    const distinct = [...new Set(winners.map((w) => w.ticker))];
+    let distinct = [...new Set(winners.map((w) => w.ticker))];
+    // Moneyline tie-break: exactly one game/match/fight series among the tied.
+    if (distinct.length > 1) {
+      const ml = distinct.filter(isMoneylineSeries);
+      if (ml.length === 1) distinct = ml;
+    }
     if (distinct.length > 1) {
       ambiguous.push(`${sportKey} -> ${distinct.join(" / ")}`);
       missed.push(sportKey);
