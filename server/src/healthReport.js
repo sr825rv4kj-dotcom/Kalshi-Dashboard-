@@ -169,6 +169,8 @@ const CODE_GUIDE = {
   "ev-too-thin": { severity: "info", healthy: true, title: "Expected value below the floor", fix: "Healthy refusal." },
   "no-lines-from-provider": { severity: "info", healthy: true, title: "No games on the board", fix: "Not a fault." },
   "dropped:duplicate": { severity: "info", healthy: true, title: "Already holding that game", fix: "Healthy." },
+  "dropped:pregame": { severity: "info", healthy: true, title: "Game not started yet - the bot trades live games only", fix: "Healthy. It becomes eligible at first pitch / kickoff." },
+  "clv-killed": { severity: "info", healthy: true, title: "Paused by the CLV kill switch - shadow-tracked, revives on its own", fix: "Healthy. The segment restarts automatically once its tracked prices recover." },
   "dropped:window": { severity: "info", healthy: true, title: "Game starts outside the entry window", fix: "Healthy - it becomes eligible closer to start." },
   "dropped:closed": { severity: "info", healthy: true, title: "Market not tradeable (closed or settled)", fix: "Not a fault." },
   "dropped:error": {
