@@ -313,6 +313,7 @@ export const DEFAULTS = {
   fairValueMaxAgeSeconds: 420,     // sharp reading older than this -> no exit decision
 
   clvKillSwitch: true,             // false = measure and report, never block
+  clvKillMode: "report",           // "report" = measure only (settled results decide cuts); "block" = old gate
   clvMinSample: 15,                // marks a segment needs before it can be killed or proven
   clvZ: 1.0,                       // standard errors of confidence for kill / proven
   clvKillBelowCents: 0,            // kill when mean CLV + z*SE is below this
