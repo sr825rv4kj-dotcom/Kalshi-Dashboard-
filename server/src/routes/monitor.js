@@ -224,6 +224,7 @@ export function registerMonitorRoutes(app) {
       in: t.entryPriceCents, out: t.exitPriceCents, exit: t.exitReason,
       net: Math.round(t.netDollars * 100) / 100, opened: t.entryTimestamp, closed: t.exitTimestamp,
       live: /In-play/i.test(String(t.entryReason || "")),
+      evAtEntry: (() => { const m = /EV (-?[0-9.]+)c\/contract/.exec(String(t.entryReason || "")); return m ? Number(m[1]) : null; })(),
     })));
     section("review", () => {
       const r = buildStrategyReview();
