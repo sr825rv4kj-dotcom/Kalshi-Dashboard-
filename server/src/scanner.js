@@ -85,10 +85,11 @@ import { corroboratedProbability, fractionRemaining, paramsFor } from "./liveMod
 import { workCandidate, cancelResting, getRestingOrders, cancelPendingOnEvent } from "./makerEngine.js";
 import { recordFairFromProbabilities } from "./fairValue.js";
 import { clvVerdict, recordShadow } from "./clvTracker.js";
+import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-25-5-dollar-10pct-return";
+export const SCANNER_VERSION = "2026-09-25-learner-35-70-band";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -595,6 +596,16 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       await dropResting(c.ticker, `${verdict.killedBy} killed on negative CLV`);
       continue;
     }
+    // LEARNED FROM RESULTS (outcomeLearner.js): a sport or price band that has
+    // won clearly less often than its prices implied, and lost money, is skipped.
+    const learned = learnedBlock({ sportKey, priceCents: askCents }, config);
+    if (learned.blocked) {
+      const line = `${c.ticker} ${askCents}c: ${learned.reason}`;
+      bump("learned-block", line);
+      rejected.push(line);
+      continue;
+    }
+
     // Kelly sizing is EARNED per sport. Until a sport's CLV is confidently
     // positive, it trades the flat survival stake whatever the balance is.
     const earnedKelly = config.clvGatedSizing === false || verdict.proven;
@@ -602,7 +613,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // is set, every entry is sized to that stake regardless of balance or
     // sport - it overrides both survival mode and Kelly. Contracts are still
     // capped by the cash actually available.
-    const flatStake = Number(config.flatStakeDollars);
+    // LOSING-STREAK BRAKE: after config.streakBrakeLosses straight losses the
+    // flat stake is halved until the next win. Protects the balance only.
+    const brake = streakStakeFactor(config);
+    const flatStake = Number(config.flatStakeDollars) * brake.factor;
     const sizingSurvival = Number.isFinite(flatStake) && flatStake > 0
       ? { ...(config.survivalMode || {}), balanceThreshold: Infinity, flatBetDollars: flatStake }
       : earnedKelly
@@ -625,14 +639,16 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       // prices the whole-cent fee is 20-40% of the stake. Live 25-55c is the
       // core of the strategy: 35 trades, +$19.00.
       minEntryPriceCents: c.timing.live
-        ? Math.max(config.minEntryPriceCents ?? 25, config.minLiveEntryPriceCents ?? 20)
+        // LIVE BAND 35-70c (2026-09-25): live buys at 35-70c won 65% of the
+        // time against 47% implied (+$14.66 over 26); 20-35c won 40%.
+        ? Math.max(config.minEntryPriceCents ?? 25, config.liveBandMinCents ?? config.minLiveEntryPriceCents ?? 20)
         : (config.minEntryPriceCents ?? 25),
       // LIVE GAMES CAP AT 80c (2026-09-23). In play, a buy at 85c risks 85c to
       // win 15c, and the in-game model is a few points coarse - the Angels
       // position (85c -> 4c) erased several small wins in one move. Pre-game
       // keeps the full band.
       maxEntryPriceCents: c.timing.live
-        ? Math.min(config.maxEntryPriceCents ?? 88, config.maxLiveEntryPriceCents ?? 80)
+        ? Math.min(config.maxEntryPriceCents ?? 88, config.liveBandMaxCents ?? config.maxLiveEntryPriceCents ?? 80)
         : (config.maxEntryPriceCents ?? 88),
       minEvCentsPerContract: config.minEvCentsPerContract ?? 0,
       minEvCentsPerTrade: config.minEvCentsPerTrade ?? 1,
@@ -754,8 +770,12 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         contracts: assessment.sizing.contracts,
         reason:
           `${c.timing.live ? "In-play" : "Pre-game"} edge via ${probResult.provider} on "${c.teamName}" ` +
-          `(sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ask / ${assessment.limitCents}c limit, ` +
-          `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract)`,
+          // In DOLLARS (2026-09-25): price per contract, money in, and the
+          // expected profit on the whole trade - the numbers that matter.
+          `(sharp ${(c.trueProbability * 100).toFixed(1)}% vs $${(askCents / 100).toFixed(2)} ask, limit $${(assessment.limitCents / 100).toFixed(2)}, ` +
+          `${assessment.sizing.contracts} contracts, $${assessment.sizing.dollarsAtRisk.toFixed(2)} in, ` +
+          `expected +$${(assessment.edgeCheck.evTradeCents / 100).toFixed(2)} ` +
+          `(${((assessment.edgeCheck.evCents / assessment.limitCents) * 100).toFixed(1)}%))`,
         edgePct: assessment.edgeCheck.observedEdge * 100,
         teamName: c.teamName,
         sportKey,
