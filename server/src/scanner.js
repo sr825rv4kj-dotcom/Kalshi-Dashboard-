@@ -76,7 +76,7 @@
 
 import { kalshiGet } from "./kalshiClient.js";
 import { getSharpProbabilities } from "./scraper.js";
-import { assessOpportunity } from "./riskManager.js";
+import { assessOpportunity, feePerContractCents, flatBetContracts } from "./riskManager.js";
 import { enterPosition, readShardBalances } from "./executor.js";
 import { appendLog, loadState, saveState } from "./stateStore.js";
 import { resolveTicker } from "./tickerResolver.js";
@@ -88,7 +88,7 @@ import { clvVerdict, recordShadow } from "./clvTracker.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-24-live-only";
+export const SCANNER_VERSION = "2026-09-25-5-dollar-10pct-return";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -598,9 +598,16 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // Kelly sizing is EARNED per sport. Until a sport's CLV is confidently
     // positive, it trades the flat survival stake whatever the balance is.
     const earnedKelly = config.clvGatedSizing === false || verdict.proven;
-    const sizingSurvival = earnedKelly
-      ? config.survivalMode
-      : { ...(config.survivalMode || {}), balanceThreshold: Infinity, flatBetDollars: config.survivalMode?.flatBetDollars ?? 1.75 };
+    // FLAT $5 STAKE (2026-09-25, account holder's call). When flatStakeDollars
+    // is set, every entry is sized to that stake regardless of balance or
+    // sport - it overrides both survival mode and Kelly. Contracts are still
+    // capped by the cash actually available.
+    const flatStake = Number(config.flatStakeDollars);
+    const sizingSurvival = Number.isFinite(flatStake) && flatStake > 0
+      ? { ...(config.survivalMode || {}), balanceThreshold: Infinity, flatBetDollars: flatStake }
+      : earnedKelly
+        ? config.survivalMode
+        : { ...(config.survivalMode || {}), balanceThreshold: Infinity, flatBetDollars: config.survivalMode?.flatBetDollars ?? 1.75 };
 
     const assessment = assessOpportunity({
       bankroll,
@@ -613,7 +620,13 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       maxRiskPctPerTrade: config.maxRiskPctPerTrade ?? 0.20,
       maxStakeDollars: config.maxStakeDollars ?? null,
       maxPlausibleEdge: config.maxPlausibleEdge ?? 0.18,
-      minEntryPriceCents: config.minEntryPriceCents ?? 25,
+      // LIVE FLOOR 20c (2026-09-25). Every live buy under 20c has lost: Londrina
+      // 16c, Sao Bernardo 13c, Virtus Bologna 13c, -$4.99 together. At those
+      // prices the whole-cent fee is 20-40% of the stake. Live 25-55c is the
+      // core of the strategy: 35 trades, +$19.00.
+      minEntryPriceCents: c.timing.live
+        ? Math.max(config.minEntryPriceCents ?? 25, config.minLiveEntryPriceCents ?? 20)
+        : (config.minEntryPriceCents ?? 25),
       // LIVE GAMES CAP AT 80c (2026-09-23). In play, a buy at 85c risks 85c to
       // win 15c, and the in-game model is a few points coarse - the Angels
       // position (85c -> 4c) erased several small wins in one move. Pre-game
@@ -644,6 +657,47 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         await dropResting(c.ticker, assessment.reason);
       }
       continue;
+    }
+
+    // MINIMUM EXPECTED RETURN (2026-09-25). A trade whose expected profit is a
+    // sliver of what it risks is not taken: at +1.5% expected (the Islanders
+    // entry: 0.5c expected on a 31c limit) the result is luck, not edge.
+    //
+    // The order limit is pulled DOWN to the highest price that still returns
+    // the minimum. The walk-up limit alone would pay up until the edge was
+    // nearly gone, so the check is applied to the price the order can actually
+    // fill at, not just to the ask. If even the ask does not return the
+    // minimum, the trade is skipped.
+    const minReturnPct = Number(config.minExpectedReturnPct ?? 10);
+    if (minReturnPct > 0) {
+      const flat = Number.isFinite(flatStake) && flatStake > 0 ? flatStake : null;
+      const countAt = (px) => (flat ? flatBetContracts(flat, px, config.feeMultiplier ?? 0.07) : assessment.sizing.contracts);
+      const returnAt = (px) => {
+        const ev = c.trueProbability * 100 - px - feePerContractCents(px, countAt(px), config.feeMultiplier ?? 0.07);
+        return { ev, pct: (ev / px) * 100 };
+      };
+      let limit = null;
+      for (let px = assessment.limitCents; px >= askCents; px--) {
+        if (returnAt(px).pct >= minReturnPct) { limit = px; break; }
+      }
+      if (limit == null) {
+        const r = returnAt(askCents);
+        const line = `${c.ticker} ${askCents}c (sharp ${(c.trueProbability * 100).toFixed(1)}%): expected return ` +
+          `${r.pct.toFixed(1)}% at the ask (EV ${r.ev.toFixed(1)}c) is under the ${minReturnPct}% minimum`;
+        bump("return-too-small", line);
+        rejected.push(line);
+        continue;
+      }
+      if (limit !== assessment.limitCents) {
+        const r = returnAt(limit);
+        assessment.limitCents = limit;
+        assessment.walkupCents = limit - askCents;
+        assessment.edgeCheck.evCents = r.ev;
+        assessment.edgeCheck.observedEdge = c.trueProbability - limit / 100;
+        if (flat) assessment.sizing.contracts = countAt(limit);
+        assessment.edgeCheck.evTradeCents = r.ev * assessment.sizing.contracts;
+        assessment.sizing.dollarsAtRisk = assessment.sizing.contracts * (limit + feePerContractCents(limit, assessment.sizing.contracts, config.feeMultiplier ?? 0.07)) / 100;
+      }
     }
 
     // THE CAP COUNTS RESTING BIDS (2026-09-24). Checked here, at the moment of
