@@ -1,6 +1,12 @@
 import React, { useEffect, useState } from "react";
 import { teamIdentity, sportLabel, sportEmoji } from "../teamIdentity.js";
 
+/** A contract price in cents shown as dollars: 42 -> "$0.42". */
+function px(cents) {
+  const n = Number(cents);
+  return Number.isFinite(n) ? `$${(n / 100).toFixed(2)}` : "—";
+}
+
 function money(n) {
   if (n == null) return "—";
   return `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
@@ -50,7 +56,7 @@ function SideRow({ name, sportKey, score, isHeld, priceCents }) {
         {isHeld && <span className="kx-held-tag"> held</span>}
       </span>
       {score != null && <span className="kx-side-score">{score}</span>}
-      {isHeld && priceCents != null && <span className="kx-pill">{priceCents}¢</span>}
+      {isHeld && priceCents != null && <span className="kx-pill">{px(priceCents)}</span>}
     </div>
   );
 }
@@ -105,7 +111,7 @@ function ClosedCard({ t }) {
       <div className="kx-meta">
         <span>{t.contracts} contracts</span>
         <span className="kx-sep">·</span>
-        <span>In {t.entryPriceCents}¢ → Out {t.exitPriceCents}¢</span>
+        <span>In {px(t.entryPriceCents)} → Out {px(t.exitPriceCents)}</span>
         <span className="kx-sep">·</span>
         <span>{when(t.entryTimestamp)} → {when(t.exitTimestamp)}</span>
         {t.edgePct != null && (
@@ -145,7 +151,7 @@ function OpenCard({ t }) {
       <div className="kx-stats">
         <div><span>Entered</span><strong>{money(t.costDollars)}</strong></div>
         <div><span>Contracts</span><strong>{t.filled}</strong></div>
-        <div><span>Entry</span><strong>{t.priceCents}¢</strong></div>
+        <div><span>Entry</span><strong>{px(t.priceCents)}</strong></div>
         <div><span>Opened</span><strong>{when(t.timestamp)}</strong></div>
       </div>
 
