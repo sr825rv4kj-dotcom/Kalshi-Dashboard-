@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import ScrubChart from "./ScrubChart.jsx";
 import { teamIdentity, sportEmoji, sportLabel } from "../teamIdentity.js";
 
 /**
@@ -26,48 +27,11 @@ function when(iso) {
 function opponentFrom(ticker) {
   const parts = String(ticker || "").split("-");
   const side = parts[2] || "";
-  const middle = (parts[1] || "").replace(/^\d{2}[A-Z]{3}\d{2}/, "");
+  const middle = (parts[1] || "").replace(/^\d{2}[A-Z]{3}\d{2}(\d{4})?/, "");
   if (!side || !middle) return null;
   if (middle.startsWith(side)) return middle.slice(side.length) || null;
   if (middle.endsWith(side)) return middle.slice(0, -side.length) || null;
   return null;
-}
-
-/** Cumulative P&L sparkline - green when the run is up, red when it is down. */
-function Sparkline({ values }) {
-  if (!values || values.length < 2) return null;
-
-  const w = 120;
-  const h = 34;
-  const min = Math.min(...values, 0);
-  const max = Math.max(...values, 0);
-  const span = max - min || 1;
-
-  const points = values.map((v, i) => {
-    const x = (i / (values.length - 1)) * w;
-    const y = h - ((v - min) / span) * h;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  });
-
-  const last = values[values.length - 1];
-  const up = last >= 0;
-  const stroke = up ? "#21c17a" : "#ff4d4f";
-  const zeroY = h - ((0 - min) / span) * h;
-
-  return (
-    <svg width={w} height={h} className="kx-spark" role="img" aria-label="Cumulative profit and loss">
-      <line x1="0" y1={zeroY} x2={w} y2={zeroY} stroke="currentColor" strokeOpacity="0.25" strokeDasharray="3 3" />
-      <polyline
-        points={points.join(" ")}
-        fill="none"
-        stroke={stroke}
-        strokeWidth="2"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
-      <circle cx={w} cy={points[points.length - 1].split(",")[1]} r="3" fill={stroke} />
-    </svg>
-  );
 }
 
 function StatementRow({ t, runningBalance }) {
@@ -120,6 +84,16 @@ export default function OrdersTable() {
   const [data, setData] = useState({ completed: [], open: [], stats: null });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Collapsed by default, remembered on this device. Storage can be blocked
+  // (private browsing), so every access is guarded.
+  const [open, setOpen] = useState(() => {
+    try { return localStorage.getItem("kx-statement-open") === "1"; } catch { return false; }
+  });
+  const toggle = () => setOpen((v) => {
+    const next = !v;
+    try { localStorage.setItem("kx-statement-open", next ? "1" : "0"); } catch { /* ignore */ }
+    return next;
+  });
 
   async function load() {
     try {
@@ -151,7 +125,16 @@ export default function OrdersTable() {
     running += t.netDollars ?? 0;
     return { t, balance: running };
   });
-  const curve = withBalance.map((r) => r.balance);
+  const scrubPoints = withBalance.map(({ t, balance: b }) => {
+    const opp = opponentFrom(t.ticker);
+    return {
+      value: b,
+      change: t.netDollars ?? 0,
+      label: `${teamIdentity(t.teamName, t.sportKey).name}${opp ? ` vs ${opp}` : ""}`,
+      sub: `${sportLabel(t.sportKey)} · ${t.contracts} @ ${t.entryPriceCents}¢ → ${t.exitPriceCents}¢ · ${t.exitReason}`,
+      date: t.exitTimestamp,
+    };
+  });
   const newestFirst = [...withBalance].reverse();
 
   const s = data.stats;
@@ -173,8 +156,9 @@ export default function OrdersTable() {
             {s?.overallRoiPct != null ? ` · ${s.overallRoiPct > 0 ? "+" : ""}${s.overallRoiPct.toFixed(1)}% ROI` : ""}
           </div>
         </div>
-        <Sparkline values={curve} />
       </div>
+
+      <ScrubChart points={scrubPoints} height={120} compact />
 
       {data.open.length > 0 && (
         <div className="kx-stmt-open">
@@ -183,13 +167,28 @@ export default function OrdersTable() {
         </div>
       )}
 
-      {newestFirst.length === 0 ? (
+      <button
+        type="button"
+        onClick={toggle}
+        aria-expanded={open}
+        style={{
+          width: "100%", marginTop: 12, padding: "12px 14px", borderRadius: 12,
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)",
+          color: "inherit", font: "inherit", cursor: "pointer",
+        }}
+      >
+        <span>{open ? "Hide" : "Show"} {newestFirst.length} closed trade{newestFirst.length === 1 ? "" : "s"}</span>
+        <span aria-hidden="true" style={{ transform: open ? "rotate(180deg)" : "none", transition: "transform .2s" }}>▾</span>
+      </button>
+
+      {open && (newestFirst.length === 0 ? (
         <div className="empty-state">No completed trades yet.</div>
       ) : (
         newestFirst.map(({ t, balance }, i) => (
           <StatementRow key={`${t.ticker}-${t.entryTimestamp}-${i}`} t={t} runningBalance={balance} />
         ))
-      )}
+      ))}
     </div>
   );
 }
