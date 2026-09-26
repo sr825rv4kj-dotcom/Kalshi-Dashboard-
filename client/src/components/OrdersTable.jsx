@@ -11,6 +11,12 @@ import { teamIdentity, sportEmoji, sportLabel } from "../teamIdentity.js";
  * actual contract count, the reason, and the matching exit, so every figure
  * here is real money rather than a reconstruction.
  */
+/** A contract price in cents shown as dollars: 42 -> "$0.42". */
+function px(cents) {
+  const n = Number(cents);
+  return Number.isFinite(n) ? `$${(n / 100).toFixed(2)}` : "—";
+}
+
 function money(n) {
   if (n == null) return "—";
   return `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
@@ -50,7 +56,7 @@ function StatementRow({ t, runningBalance }) {
             {id.name}{opponent ? ` vs ${opponent}` : ""}
           </div>
           <div className="kx-stmt-sub">
-            {sportLabel(t.sportKey)} · {t.contracts} @ {t.entryPriceCents}¢ → {t.exitPriceCents}¢ · {t.exitReason}
+            {sportLabel(t.sportKey)} · {t.contracts} @ {px(t.entryPriceCents)} → {px(t.exitPriceCents)} · {t.exitReason}
           </div>
           <div className="kx-stmt-sub">{when(t.entryTimestamp)} → {when(t.exitTimestamp)}</div>
         </div>
@@ -131,7 +137,7 @@ export default function OrdersTable() {
       value: b,
       change: t.netDollars ?? 0,
       label: `${teamIdentity(t.teamName, t.sportKey).name}${opp ? ` vs ${opp}` : ""}`,
-      sub: `${sportLabel(t.sportKey)} · ${t.contracts} @ ${t.entryPriceCents}¢ → ${t.exitPriceCents}¢ · ${t.exitReason}`,
+      sub: `${sportLabel(t.sportKey)} · ${t.contracts} @ ${px(t.entryPriceCents)} → ${px(t.exitPriceCents)} · ${t.exitReason}`,
       date: t.exitTimestamp,
     };
   });
