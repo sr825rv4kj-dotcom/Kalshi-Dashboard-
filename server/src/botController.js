@@ -14,6 +14,7 @@ import { notifyMilestone, notifyDailyHalt, notifyDailySummary } from "./notifier
 import { getTelegramCredentials } from "./telegramStore.js";
 import { getRecentTrades, recordTrade, scheduleFeeCents, loadLedger } from "./tradeLedgerStore.js";
 import { syncResting, cancelAllResting, restingCount } from "./makerEngine.js";
+import { earnedPositionCap } from "./outcomeLearner.js";
 import { getSharpProbabilities } from "./scraper.js";
 import {
   fairValueExitDecision, fairValueMode, shouldLogShadow, recordDecision, recordFairFromProbabilities,
@@ -190,8 +191,10 @@ function positionCapFor(config, bankroll) {
   const sm = config.survivalMode;
   const inSurvival = sm && bankroll < sm.balanceThreshold;
   const tier = tierFor(bankroll, config);
+  // In survival mode, open slots are EARNED: 3 until the last 20 closed trades
+  // are net profitable, then 5, then the full cap once the last 40 are.
   return inSurvival
-    ? sm.maxConcurrentPositions
+    ? earnedPositionCap(sm.maxConcurrentPositions, config)
     : (config.maxConcurrentPositions ?? tier.maxConcurrentPositions);
 }
 
