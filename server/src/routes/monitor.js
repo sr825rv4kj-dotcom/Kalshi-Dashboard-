@@ -39,6 +39,7 @@ import { EXECUTOR_VERSION } from "../executor.js";
 import { describeCadence } from "../cadence.js";
 import { diagnose, startHealthAlerts, HEALTH_VERSION } from "../healthReport.js";
 import { getRestingOrders, MAKER_VERSION } from "../makerEngine.js";
+import { learnerReport } from "../outcomeLearner.js";
 
 /**
  * Read MONITOR_TOKEN the way a phone-edited Railway variable actually arrives.
@@ -216,6 +217,7 @@ export function registerMonitorRoutes(app) {
       discovery: lastDiscovery(),
     }));
 
+    section("learner", () => learnerReport(loadConfig()));
     section("trades", () => getTradeStats());
     // Every closed trade, compact, so strategy changes can be tested against
     // the account's real history rather than argued about.
@@ -224,7 +226,13 @@ export function registerMonitorRoutes(app) {
       in: t.entryPriceCents, out: t.exitPriceCents, exit: t.exitReason,
       net: Math.round(t.netDollars * 100) / 100, opened: t.entryTimestamp, closed: t.exitTimestamp,
       live: /In-play/i.test(String(t.entryReason || "")),
-      evAtEntry: (() => { const m = /EV (-?[0-9.]+)c\/contract/.exec(String(t.entryReason || "")); return m ? Number(m[1]) : null; })(),
+      expectedAtEntry: (() => {
+        const r = String(t.entryReason || "");
+        const d = /expected \+?\$(-?[0-9.]+) \(([-0-9.]+)%\)/.exec(r);
+        if (d) return { dollars: Number(d[1]), pct: Number(d[2]) };
+        const c = /EV (-?[0-9.]+)c\/contract/.exec(r);
+        return c ? { centsPerContract: Number(c[1]) } : null;
+      })(),
     })));
     section("review", () => {
       const r = buildStrategyReview();
