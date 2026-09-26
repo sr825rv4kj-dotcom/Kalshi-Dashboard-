@@ -150,7 +150,7 @@ export default function BotControlPanel({ apiBase }) {
           <table>
             <thead><tr><th>Ticker</th><th>Side</th><th>Entry</th><th>Contracts</th></tr></thead>
             <tbody>{status.openPositions.map((p, i) => (
-              <tr key={i}><td>{p.ticker}</td><td className={p.side === "yes" ? "pos" : "neg"}>{p.side.toUpperCase()}</td><td>{p.entryPriceCents}c</td><td>{p.contracts}</td></tr>
+              <tr key={i}><td>{p.ticker}</td><td className={p.side === "yes" ? "pos" : "neg"}>{p.side.toUpperCase()}</td><td>${(Number(p.entryPriceCents) / 100).toFixed(2)}</td><td>{p.contracts}</td></tr>
             ))}</tbody>
           </table>
         )}
