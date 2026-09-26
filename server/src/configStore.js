@@ -334,6 +334,17 @@ export const DEFAULTS = {
   // off. Set to false to allow pre-game entries again.
   liveOnly: true,
 
+  // Live buys under this price are refused - see scanner.js (all three live
+  // buys at 13-16c lost; the fee is 20-40% of the stake down there).
+  minLiveEntryPriceCents: 20,
+
+  // STAKE AND RETURN FLOOR (2026-09-25, account holder's call).
+  //   flatStakeDollars: every entry sized to this stake (null = old sizing)
+  //   minExpectedReturnPct: skip any trade expected to return less than this
+  //     percent of what it risks, after fees (30% - account holder's call)
+  flatStakeDollars: 5,
+  minExpectedReturnPct: 30,
+
   // --- Account-level, never touched by the strategy migration ------------
   oddsProviderOrder: ["the-odds-api", "oddspapi"],
   oddsPapiTournamentIds: {},
