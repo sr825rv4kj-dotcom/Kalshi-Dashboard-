@@ -169,6 +169,7 @@ const CODE_GUIDE = {
   "ev-too-thin": { severity: "info", healthy: true, title: "Expected value below the floor", fix: "Healthy refusal." },
   "no-lines-from-provider": { severity: "info", healthy: true, title: "No games on the board", fix: "Not a fault." },
   "dropped:duplicate": { severity: "info", healthy: true, title: "Already holding that game", fix: "Healthy." },
+  "learned-block": { severity: "info", healthy: true, title: "Skipped - this sport or price band has lost more than its prices implied", fix: "Healthy. The learner re-checks every minute and restores it if results recover." },
   "return-too-small": { severity: "info", healthy: true, title: "Expected return under the minimum (minExpectedReturnPct) - skipped", fix: "Healthy. Thin-edge trades are refused by design." },
   "dropped:pregame": { severity: "info", healthy: true, title: "Game not started yet - the bot trades live games only", fix: "Healthy. It becomes eligible at first pitch / kickoff." },
   "clv-killed": { severity: "info", healthy: true, title: "Paused by the CLV kill switch - shadow-tracked, revives on its own", fix: "Healthy. The segment restarts automatically once its tracked prices recover." },
