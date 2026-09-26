@@ -89,7 +89,7 @@ import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-25-learner-35-70-band";
+export const SCANNER_VERSION = "2026-09-26-clv-report-only";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -585,7 +585,14 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // trade. The candidate is recorded as a SHADOW at the real ask and marked
     // against the real book later, which is how the segment earns its way back.
     const verdict = clvVerdict({ sportKey, live: c.timing.live, priceCents: askCents }, config);
-    if (verdict.killed) {
+    // CLV IS REPORTED, NOT OBEYED (2026-09-26). The kill switch shut off ALL
+    // live trading ("timing:live is killed on negative CLV") while live trades
+    // had SETTLED 29 wins of 53 against 23 their prices implied, +$31.46 after
+    // fees. The 5-minute mark is taken at the mid, so every live buy that
+    // crosses the spread scores negative even when it goes on to win. Actual
+    // settled results decide what is cut now (outcomeLearner.js); CLV keeps
+    // being measured and shown. clvKillMode: "block" restores the old gate.
+    if (verdict.killed && String(config.clvKillMode ?? "report") === "block") {
       const line = `${c.ticker} ${askCents}c: ${verdict.killedBy} is killed on negative CLV - shadow-tracked, not traded`;
       bump("clv-killed", line);
       rejected.push(line);
