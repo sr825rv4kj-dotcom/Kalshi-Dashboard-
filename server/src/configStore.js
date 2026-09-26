@@ -343,6 +343,13 @@ export const DEFAULTS = {
   //   minExpectedReturnPct: skip any trade expected to return less than this
   //     percent of what it risks, after fees (30% - account holder's call)
   flatStakeDollars: 5,
+
+  // LEARNING + WIN-RATE FOCUS (2026-09-25) - see outcomeLearner.js
+  liveBandMinCents: 35,          // live buys only between these prices
+  liveBandMaxCents: 70,
+  streakBrakeLosses: 4,          // halve the stake after this many straight losses
+  survivalStartingSlots: 3,      // positions at once in survival mode until earned
+  learnerMinTrades: 8,           // trades a sport/band needs before it can be cut
   minExpectedReturnPct: 30,
 
   // --- Account-level, never touched by the strategy migration ------------
