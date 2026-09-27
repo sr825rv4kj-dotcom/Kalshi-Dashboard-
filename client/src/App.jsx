@@ -19,6 +19,7 @@ import DiagnosticPanel from "./components/DiagnosticPanel.jsx";
 import SelfCheckPanel from "./components/SelfCheckPanel.jsx";
 import StrategyReviewPanel from "./components/StrategyReviewPanel.jsx";
 import CoveragePanel from "./components/CoveragePanel.jsx";
+import PolymarketPanel from "./components/PolymarketPanel.jsx";
 import { applyWallpaper, readLocal, defaultSettings } from "./wallpapers.js";
 
 const RAW_BASE = import.meta.env.VITE_API_BASE;
@@ -155,6 +156,7 @@ function DashboardApp() {
       </div>
 
       <BotControlPanel apiBase={API_BASE} />
+      <PolymarketPanel apiBase={API_BASE} />
       <CoveragePanel apiBase={API_BASE} />
       <StrategyReviewPanel apiBase={API_BASE} />
       <SelfCheckPanel apiBase={API_BASE} />
