@@ -87,10 +87,29 @@ import { recordFairFromProbabilities } from "./fairValue.js";
 import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
+import { heldOnPolymarket } from "./polymarket/pmState.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-27-pregame-prior";
+export const SCANNER_VERSION = "2026-09-27-polymarket-shared-lines";
+
+/**
+ * SHARED LINES (2026-09-27). Every sharp line this scan reads is kept for the
+ * Polymarket engine, which runs right after and prices the same games - so
+ * the odds API is paid once per sport per cycle, not once per exchange.
+ */
+const lastLines = new Map();   // sportKey -> { at, probabilities, provider }
+
+export function rememberLines(sportKey, probResult) {
+  if (!probResult || !probResult.probabilities) return;
+  lastLines.set(sportKey, { at: Date.now(), probabilities: probResult.probabilities, provider: probResult.provider });
+}
+
+export function getRecentLines(maxAgeMs = 120_000) {
+  const out = new Map();
+  for (const [k, v] of lastLines) if (Date.now() - v.at <= maxAgeMs) out.set(k, v);
+  return out;
+}
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -349,6 +368,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   // fair-value exit (botController) reads it from here - held games included,
   // which are dropped as duplicates below before they are ever priced.
   recordFairFromProbabilities(sportKey, probResult.probabilities);
+  rememberLines(sportKey, probResult);
 
   const teamEntries = Object.entries(probResult.probabilities || {});
   if (!teamEntries.length) {
@@ -363,6 +383,14 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   let sampleReason = null;
   const openEvents = skipEvents instanceof Set ? skipEvents : new Set();
   const allowLive = config.allowLiveGames !== false;   // live trading is ON unless switched off
+
+  // Both teams of each game, so a game held on Polymarket is skipped here.
+  const gameTeams = new Map();
+  for (const [name, info] of teamEntries) {
+    const k = info.eventId || info.commenceTime;
+    if (!gameTeams.has(k)) gameTeams.set(k, []);
+    gameTeams.get(k).push(name);
+  }
 
   const prepared = await Promise.all(teamEntries.map(async ([teamName, info]) => {
     const { trueProbability, commenceTime } = info;
@@ -384,6 +412,12 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // resting bid. Checked before the ticker lookup, so it costs no Kalshi call.
     if (!timing.live && config.liveOnly !== false) { drops.pregame++; return null; }
     if (!timing.ok) { drops.window++; return null; }
+
+    // ONE BET PER GAME ACROSS BOTH EXCHANGES: already held on Polymarket.
+    if (heldOnPolymarket({ sportKey, commenceTime, teamNames: gameTeams.get(info.eventId || commenceTime) || [teamName] })) {
+      drops.duplicate++;
+      return null;
+    }
 
     let ticker = tickerMap[teamName];
     if (!ticker) {
