@@ -86,10 +86,11 @@ import { workCandidate, cancelResting, getRestingOrders, cancelPendingOnEvent } 
 import { recordFairFromProbabilities } from "./fairValue.js";
 import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
+import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-26-clv-report-only";
+export const SCANNER_VERSION = "2026-09-26-stake-tiers-double-down";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -396,7 +397,16 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       ticker = resolved.ticker;
     }
 
-    if (openEvents.has(eventKeyOf(ticker))) { drops.duplicate++; return null; }
+    // DOUBLE-DOWN (scaling.js): a game already held is normally skipped. The
+    // exact team the bot holds - never the opponent - passes through as an
+    // ADD-ON candidate while the game is live and has not been doubled, so its
+    // lead can be watched scan by scan. Everything below still has to pass.
+    let addOn = null;
+    if (openEvents.has(eventKeyOf(ticker))) {
+      const elig = timing.live ? addOnEligible(ticker, config) : { ok: false };
+      if (!elig.ok) { drops.duplicate++; return null; }
+      addOn = elig.held;
+    }
 
     try {
       const res = await kalshiGet(`${V2}/markets/${ticker}`);
@@ -414,6 +424,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       return {
         teamName, trueProbability, commenceTime, ticker, market, timing, pricing, sportKey,
         lineAgeSeconds: info.lineAgeSeconds ?? null,
+        addOn: !!addOn, held: addOn,
       };
     } catch (err) {
       drops.error++;
@@ -434,7 +445,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         `${sportKey}: ${livePending.length} in-play market(s) skipped - no in-game model exists for this sport, ` +
         `so a stale line could not be detected.`, "warn"
       );
-      for (const c of viable) if (c.timing.live) bump("no-model-for-sport");
+      for (const c of viable) if (c.timing.live && !c.addOn) bump("no-model-for-sport");
       viable = viable.filter((c) => !c.timing.live);
     } else {
       let events = [];
@@ -449,7 +460,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
 
       if (scoresError && !events.length) {
         appendLog(`${sportKey}: live scores unavailable (${scoresError}) - in-play markets skipped this cycle.`, "warn");
-        for (const c of viable) if (c.timing.live) bump("live-scores-unavailable");
+        for (const c of viable) if (c.timing.live && !c.addOn) bump("live-scores-unavailable");
         viable = viable.filter((c) => !c.timing.live);
       } else {
         const vetoed = [];
@@ -457,6 +468,9 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           if (!c.timing.live) return true;
 
           const game = findLiveGameForTeam(events, c.teamName);
+          if (!game && c.addOn) { forgetLead(c.ticker); bump("double-down:no-live-score"); return false; }
+          // The held team's lead, from its own side: +1 means ahead by one.
+          const lead = game && c.addOn ? observeLead(c.ticker, game.lead, config) : null;
           if (!game) {
             vetoed.push(`${c.teamName}: in play but no live score found - cannot check the line against the game`);
             bump("no-live-score-match", `${c.teamName}: in play, no live score row matched this team`);
@@ -467,6 +481,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           const corr = corroboratedProbability({
             sportKey, sharpProbability: c.trueProbability, lead: game.lead, fracRemaining: frac,
           });
+          if (!corr.usable && c.addOn) { bump("double-down:unmodellable"); return false; }
           if (!corr.usable) {
             vetoed.push(`${c.teamName}: in play, could not model the game state`);
             bump("unmodellable", `${c.teamName}: in play, the game state could not be modelled`);
@@ -474,6 +489,21 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           }
 
           const maxDisagree = config.maxModelDisagreementPoints ?? 12;
+          if (c.addOn && corr.disagreementPoints > maxDisagree) {
+            bump("double-down:model-disagrees", `${c.teamName}: sharp and in-game model ${corr.disagreementPoints.toFixed(0)}pt apart - no add-on`);
+            return false;
+          }
+          // A held game is only doubled once its lead has HELD, not the moment it appears.
+          if (c.addOn && !lead.held) {
+            const dd = doubleDownConfig(config);
+            bump(
+              lead.lead > 0 ? "double-down:lead-not-held-yet" : "double-down:not-ahead",
+              `${c.teamName}: ${lead.lead > 0
+                ? `ahead by ${lead.lead} on ${lead.scans} scan(s) over ${lead.minutes.toFixed(0)}m - needs ${dd.leadScans} scans and ${dd.leadMinutes}m`
+                : `not ahead (${game.homeScore}-${game.awayScore})`}`
+            );
+            return false;
+          }
           if (corr.disagreementPoints > maxDisagree) {
             vetoed.push(
               `${c.teamName}: sharp line ${(c.trueProbability * 100).toFixed(0)}% vs in-game model ` +
@@ -489,6 +519,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           c.liveContext =
             `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ` +
             `${(frac * 100).toFixed(0)}% left, model ${(corr.modelProbability * 100).toFixed(0)}%`;
+          if (c.addOn) c.leadNote = `ahead by ${lead.lead} for ${lead.scans} scans / ${lead.minutes.toFixed(0)}m`;
           return true;
         });
 
@@ -559,12 +590,23 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     }
   }
 
+  // STAKE TIERS (scaling.js): the stake follows the account's equity - cash
+  // plus open positions at market - up AND down through each threshold.
+  const equity = Number.isFinite(Number(config.equityDollars)) ? Number(config.equityDollars) : bankroll;
+  const stakeDecision = tieredStake(config, equity);
+  const tierLine = noteStake(stakeDecision, equity);
+  if (tierLine) appendLog(tierLine);
+  const ddConfig = doubleDownConfig(config);
+
   for (const c of viable) {
-    if (openEvents.has(eventKeyOf(c.ticker))) continue;
+    // An add-on is re-checked here: a fill earlier in this scan may have
+    // doubled the game already.
+    if (c.addOn ? !addOnEligible(c.ticker, config).ok : openEvents.has(eventKeyOf(c.ticker))) continue;
+    const ddBump = (code, example) => bump(c.addOn ? `double-down:${code}` : code, example);
 
     const askCents = c.pricing.askCents;
     if (askCents <= 0 || askCents >= 100) {
-      bump("no-price", `${c.ticker}: ${c.pricing.source}`);
+      ddBump("no-price", `${c.ticker}: ${c.pricing.source}`);
       rejected.push(`${c.ticker}: ${c.pricing.source}`);
       await dropResting(c.ticker, "no usable price in the book");
       continue;
@@ -574,7 +616,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // and any edge measured against it is measurement error.
     if (maxSpread && c.pricing.spreadCents != null && c.pricing.spreadCents > maxSpread) {
       const wide = `${c.ticker}: ${c.pricing.spreadCents}c spread exceeds the ${maxSpread}c limit`;
-      bump("spread-too-wide", wide);
+      ddBump("spread-too-wide", wide);
       rejected.push(wide);
       await dropResting(c.ticker, "book too wide to trust");
       continue;
@@ -594,7 +636,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // being measured and shown. clvKillMode: "block" restores the old gate.
     if (verdict.killed && String(config.clvKillMode ?? "report") === "block") {
       const line = `${c.ticker} ${askCents}c: ${verdict.killedBy} is killed on negative CLV - shadow-tracked, not traded`;
-      bump("clv-killed", line);
+      ddBump("clv-killed", line);
       rejected.push(line);
       recordShadow({
         ticker: c.ticker, sportKey, teamName: c.teamName, askCents,
@@ -608,7 +650,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     const learned = learnedBlock({ sportKey, priceCents: askCents }, config);
     if (learned.blocked) {
       const line = `${c.ticker} ${askCents}c: ${learned.reason}`;
-      bump("learned-block", line);
+      ddBump("learned-block", line);
       rejected.push(line);
       continue;
     }
@@ -616,14 +658,15 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // Kelly sizing is EARNED per sport. Until a sport's CLV is confidently
     // positive, it trades the flat survival stake whatever the balance is.
     const earnedKelly = config.clvGatedSizing === false || verdict.proven;
-    // FLAT $5 STAKE (2026-09-25, account holder's call). When flatStakeDollars
-    // is set, every entry is sized to that stake regardless of balance or
-    // sport - it overrides both survival mode and Kelly. Contracts are still
-    // capped by the cash actually available.
+    // TIERED STAKE (2026-09-26, account holder's call). flatStakeDollars ($5)
+    // is the base; the equity tier multiplies it (scaling.js). Every entry is
+    // sized to that stake regardless of sport - it overrides both survival
+    // mode and Kelly. Contracts are still capped by the cash actually available.
+    // An add-on is sized the same: one more stake at today's tier.
     // LOSING-STREAK BRAKE: after config.streakBrakeLosses straight losses the
     // flat stake is halved until the next win. Protects the balance only.
     const brake = streakStakeFactor(config);
-    const flatStake = Number(config.flatStakeDollars) * brake.factor;
+    const flatStake = Number(stakeDecision.stake) * brake.factor;
     const sizingSurvival = Number.isFinite(flatStake) && flatStake > 0
       ? { ...(config.survivalMode || {}), balanceThreshold: Infinity, flatBetDollars: flatStake }
       : earnedKelly
@@ -670,9 +713,11 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
 
     if (assessment.action === "skip") {
       const line = `${c.ticker} ${askCents}c [${c.pricing.source}] (sharp ${(c.trueProbability * 100).toFixed(1)}%): ${assessment.reason}`;
-      bump(assessment.code || "skip-other", line);
+      ddBump(assessment.code || "skip-other", line);
       rejected.push(line);
-      if (assessment.code === "edge-too-small") {
+      if (c.addOn) {
+        // An add-on never becomes a resting bid - it is taken now or not at all.
+      } else if (assessment.code === "edge-too-small") {
         const m = await workCandidate({ c, config, bankroll, cap: positionCap, heldEvents });
         maker[m.action] = (maker[m.action] || 0) + 1;
         if (!makerExample || (m.action !== "none" && m.action !== "kept")) makerExample = m.line;
@@ -691,7 +736,9 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // nearly gone, so the check is applied to the price the order can actually
     // fill at, not just to the ask. If even the ask does not return the
     // minimum, the trade is skipped.
-    const minReturnPct = Number(config.minExpectedReturnPct ?? 10);
+    const minReturnPct = c.addOn
+      ? Math.max(Number(config.minExpectedReturnPct ?? 10), Number(ddConfig.minReturnPct ?? 35))
+      : Number(config.minExpectedReturnPct ?? 10);
     if (minReturnPct > 0) {
       const flat = Number.isFinite(flatStake) && flatStake > 0 ? flatStake : null;
       const countAt = (px) => (flat ? flatBetContracts(flat, px, config.feeMultiplier ?? 0.07) : assessment.sizing.contracts);
@@ -707,7 +754,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         const r = returnAt(askCents);
         const line = `${c.ticker} ${askCents}c (sharp ${(c.trueProbability * 100).toFixed(1)}%): expected return ` +
           `${r.pct.toFixed(1)}% at the ask (EV ${r.ev.toFixed(1)}c) is under the ${minReturnPct}% minimum`;
-        bump("return-too-small", line);
+        ddBump("return-too-small", line);
         rejected.push(line);
         continue;
       }
@@ -729,7 +776,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // maker sync would cancel them all as unconfirmed.
     if (atCap()) {
       const line = `${c.ticker}: taker entry refused - positions plus resting bids are at the cap`;
-      bump("at-cap", line);
+      ddBump("at-cap", line);
       rejected.push(line);
       continue;
     }
@@ -759,6 +806,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       ? `, limit ${assessment.limitCents}c (+${assessment.walkupCents}c walk-up)`
       : `, limit ${assessment.limitCents}c`;
     appendLog(
+      (c.addOn ? "DOUBLE-DOWN " : "") +
       `Candidate ${c.ticker} (${c.teamName}): sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ` +
       `[${c.pricing.source}]${walk}, edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}% at the limit, ` +
       `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract (${assessment.edgeCheck.evTradeCents.toFixed(1)}c the trade), ` +
@@ -776,6 +824,9 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         exchangeIndex: c.market?.exchange_index ?? null,
         contracts: assessment.sizing.contracts,
         reason:
+          (c.addOn
+            ? `DOUBLE-DOWN add-on to ${c.held?.contracts ?? "?"} held @ $${((c.held?.entryPriceCents ?? 0) / 100).toFixed(2)}, ${c.leadNote || "lead held"}: `
+            : "") +
           `${c.timing.live ? "In-play" : "Pre-game"} edge via ${probResult.provider} on "${c.teamName}" ` +
           // In DOLLARS (2026-09-25): price per contract, money in, and the
           // expected profit on the whole trade - the numbers that matter.
@@ -790,7 +841,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       });
     } catch (err) {
       // One rejected order must not cost the remaining candidates their turn.
-      bump("order-error");
+      bump("order-error");   // a real failure - never hidden under the double-down label
       rejected.push(`${c.ticker}: order failed - ${err.message}`);
       continue;
     }
@@ -799,6 +850,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       openEvents.add(eventKeyOf(c.ticker));
       heldEvents.add(eventKeyOf(c.ticker));
       entered += 1;
+      if (c.addOn) {
+        markDoubledDown(c.ticker);
+        appendLog(`DOUBLE-DOWN filled on ${c.ticker} (${c.teamName}): ${result.filled} more contracts - this game is now held twice and will not be doubled again.`);
+      }
     } else if (result && result.skipped) {
       // NOT the same thing as an order that expired. The executor reports
       // `skipped: "shard-unfunded"` when Kalshi rejected the order because the
@@ -807,10 +862,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       // trade was lost to plumbing. Counting that as "order placed but nothing
       // filled" made a funding problem look like an illiquid book, which is
       // the opposite of what it is and points at the wrong fix.
-      bump(`skipped:${result.skipped}`, `${c.ticker}: ${result.skipped}`);
+      ddBump(`skipped:${result.skipped}`, `${c.ticker}: ${result.skipped}`);
       rejected.push(`${c.ticker}: order not placed - ${result.skipped}`);
     } else {
-      bump("no-fill", `${c.ticker}: limit ${assessment.limitCents}c, nothing crossed before the order expired`);
+      ddBump("no-fill", `${c.ticker}: limit ${assessment.limitCents}c, nothing crossed before the order expired`);
     }
   }
 
