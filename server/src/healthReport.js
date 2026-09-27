@@ -31,7 +31,7 @@ import { loadState } from "./stateStore.js";
 import { loadConfig } from "./configStore.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 
-export const HEALTH_VERSION = "2026-09-26-double-down-codes";
+export const HEALTH_VERSION = "2026-09-27-pregame-prior";
 
 /** A scan older than this means the bot is not scanning, not being choosy. */
 const SCAN_STALE_MS = 5 * 60 * 1000;
@@ -102,7 +102,7 @@ const CODE_GUIDE = {
   },
   "model-disagrees": {
     severity: "high", title: "In-play model vetoed live lines as stale",
-    fix: "Known issue: the model counts the live score twice. Send the example to Claude - fix is designed, pending validation on live lines.",
+    fix: "Fixed 2026-09-27: the model now starts from the pre-game closing line. Games that kicked off BEFORE this build was deployed have no pre-game line on record and still use the strict old check until they end - every game after that uses the fix. If vetoes persist on NEW games, send the example to Claude.",
   },
   "stale-quote": {
     severity: "medium", title: "Sharp quote too old to trust",
