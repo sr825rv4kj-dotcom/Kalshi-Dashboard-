@@ -41,6 +41,7 @@ import { diagnose, startHealthAlerts, HEALTH_VERSION } from "../healthReport.js"
 import { getRestingOrders, MAKER_VERSION } from "../makerEngine.js";
 import { learnerReport } from "../outcomeLearner.js";
 import { stakeReport, SCALING_VERSION } from "../scaling.js";
+import { LIVE_MODEL_VERSION, pregamePriorCount } from "../liveModel.js";
 
 /**
  * Read MONITOR_TOKEN the way a phone-edited Railway variable actually arrives.
@@ -179,6 +180,8 @@ export function registerMonitorRoutes(app) {
       executor: EXECUTOR_VERSION,
       maker: MAKER_VERSION,
       scaling: SCALING_VERSION,
+      liveModel: LIVE_MODEL_VERSION,
+      pregamePriorsRemembered: pregamePriorCount(),
       cadence: describeCadence(),
     }));
 
