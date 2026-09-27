@@ -40,6 +40,7 @@ import { describeCadence } from "../cadence.js";
 import { diagnose, startHealthAlerts, HEALTH_VERSION } from "../healthReport.js";
 import { getRestingOrders, MAKER_VERSION } from "../makerEngine.js";
 import { learnerReport } from "../outcomeLearner.js";
+import { stakeReport, SCALING_VERSION } from "../scaling.js";
 
 /**
  * Read MONITOR_TOKEN the way a phone-edited Railway variable actually arrives.
@@ -121,6 +122,13 @@ function safeConfig(cfg) {
     dailyLossHaltPct: cfg.dailyLossHaltPct,
     survivalMode: cfg.survivalMode,
     liveOnly: cfg.liveOnly !== false,
+    flatStakeDollars: cfg.flatStakeDollars,
+    minExpectedReturnPct: cfg.minExpectedReturnPct,
+    liveBandMinCents: cfg.liveBandMinCents,
+    liveBandMaxCents: cfg.liveBandMaxCents,
+    stakeTiers: cfg.stakeTiers,
+    stakeMaxDollars: cfg.stakeMaxDollars,
+    doubleDown: cfg.doubleDown,
     disabledSports: cfg.disabledSports ?? [],
   };
 }
@@ -170,6 +178,7 @@ export function registerMonitorRoutes(app) {
       scanner: SCANNER_VERSION,
       executor: EXECUTOR_VERSION,
       maker: MAKER_VERSION,
+      scaling: SCALING_VERSION,
       cadence: describeCadence(),
     }));
 
@@ -218,6 +227,8 @@ export function registerMonitorRoutes(app) {
     }));
 
     section("learner", () => learnerReport(loadConfig()));
+    // Current stake, the tier it came from, the next step, and any double-downs.
+    section("stake", () => stakeReport(loadConfig()));
     section("trades", () => getTradeStats());
     // Every closed trade, compact, so strategy changes can be tested against
     // the account's real history rather than argued about.
@@ -226,6 +237,7 @@ export function registerMonitorRoutes(app) {
       in: t.entryPriceCents, out: t.exitPriceCents, exit: t.exitReason,
       net: Math.round(t.netDollars * 100) / 100, opened: t.entryTimestamp, closed: t.exitTimestamp,
       live: /In-play/i.test(String(t.entryReason || "")),
+      doubleDown: /DOUBLE-DOWN/.test(String(t.entryReason || "")),
       expectedAtEntry: (() => {
         const r = String(t.entryReason || "");
         const d = /expected \+?\$(-?[0-9.]+) \(([-0-9.]+)%\)/.exec(r);
