@@ -42,6 +42,7 @@ import { getRestingOrders, MAKER_VERSION } from "../makerEngine.js";
 import { learnerReport } from "../outcomeLearner.js";
 import { stakeReport, SCALING_VERSION } from "../scaling.js";
 import { LIVE_MODEL_VERSION, pregamePriorCount } from "../liveModel.js";
+import { pmMonitorReport, PM_ENGINE_VERSION } from "../polymarket/pmEngine.js";
 
 /**
  * Read MONITOR_TOKEN the way a phone-edited Railway variable actually arrives.
@@ -130,6 +131,7 @@ function safeConfig(cfg) {
     stakeTiers: cfg.stakeTiers,
     stakeMaxDollars: cfg.stakeMaxDollars,
     doubleDown: cfg.doubleDown,
+    polymarket: cfg.polymarket,
     disabledSports: cfg.disabledSports ?? [],
   };
 }
@@ -181,6 +183,7 @@ export function registerMonitorRoutes(app) {
       maker: MAKER_VERSION,
       scaling: SCALING_VERSION,
       liveModel: LIVE_MODEL_VERSION,
+      polymarket: PM_ENGINE_VERSION,
       pregamePriorsRemembered: pregamePriorCount(),
       cadence: describeCadence(),
     }));
@@ -232,6 +235,8 @@ export function registerMonitorRoutes(app) {
     section("learner", () => learnerReport(loadConfig()));
     // Current stake, the tier it came from, the next step, and any double-downs.
     section("stake", () => stakeReport(loadConfig()));
+    // Polymarket US: keys, self-check with REAL response shapes, positions, last scan.
+    section("polymarket", () => pmMonitorReport(loadConfig()));
     section("trades", () => getTradeStats());
     // Every closed trade, compact, so strategy changes can be tested against
     // the account's real history rather than argued about.
@@ -241,6 +246,7 @@ export function registerMonitorRoutes(app) {
       net: Math.round(t.netDollars * 100) / 100, opened: t.entryTimestamp, closed: t.exitTimestamp,
       live: /In-play/i.test(String(t.entryReason || "")),
       doubleDown: /DOUBLE-DOWN/.test(String(t.entryReason || "")),
+      venue: String(t.ticker || "").startsWith("PM:") ? "polymarket" : "kalshi",
       expectedAtEntry: (() => {
         const r = String(t.entryReason || "");
         const d = /expected \+?\$(-?[0-9.]+) \(([-0-9.]+)%\)/.exec(r);
