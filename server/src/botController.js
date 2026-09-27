@@ -20,6 +20,7 @@ import {
   fairValueExitDecision, fairValueMode, shouldLogShadow, recordDecision, recordFairFromProbabilities,
 } from "./fairValue.js";
 import { registerOpenPositions, markDue, needsBackfill, backfillFromLedger } from "./clvTracker.js";
+import { runPolymarketCycle } from "./polymarket/pmEngine.js";
 
 const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
@@ -1147,11 +1148,26 @@ export function resetCircuitBreaker() {
  * Now the re-arm is in a finally block, so nothing that happens inside a cycle
  * can stop the next one being scheduled.
  */
+/**
+ * POLYMARKET RUNS AFTER EVERY KALSHI CYCLE (2026-09-27), whatever that cycle
+ * did - including the early returns (at the Kalshi position cap, no active
+ * sports). It has its own caps, balance and self-check, it can never throw
+ * into the Kalshi loop, and it is skipped while the Kalshi side is halted.
+ */
+async function runPolymarketSafely() {
+  try {
+    await runPolymarketCycle(loadConfig());
+  } catch (err) {
+    try { appendLog(`Polymarket cycle contained: ${err && err.message}`, "warn"); } catch { /* never break the loop */ }
+  }
+}
+
 function scheduleNextCycle() {
   if (intervalHandle) clearTimeout(intervalHandle);
   intervalHandle = setTimeout(async () => {
     try {
       await runCycle();
+      await runPolymarketSafely();
     } catch (err) {
       // runCycle is supposed to swallow its own errors. If one still reaches
       // here, its error handler broke - so this must not depend on appendLog.
@@ -1185,7 +1201,9 @@ export function startBot() {
   state.botStartedAt = new Date().toISOString();
   saveState(state);
 
-  runCycle().catch((err) => appendLog(`Cycle error: ${err.message}`, "error"));
+  runCycle()
+    .then(() => runPolymarketSafely())
+    .catch((err) => appendLog(`Cycle error: ${err.message}`, "error"));
   scheduleNextCycle();
 
   positionMonitorHandle = setInterval(() => {
