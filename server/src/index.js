@@ -121,6 +121,14 @@ async function registerOptionalModules() {
   }
 
   try {
+    const { registerPolymarketRoutes } = await import("./polymarket/pmRoutes.js");
+    registerPolymarketRoutes(app);
+    console.log("Polymarket routes enabled at /api/polymarket/*");
+  } catch (err) {
+    console.warn("[optional] polymarket routes not loaded:", err.message);
+  }
+
+  try {
     const { registerSelfCheckRoutes } = await import("./selfCheck.js");
     registerSelfCheckRoutes(app);
     console.log("Self-check enabled at /api/selfcheck");
