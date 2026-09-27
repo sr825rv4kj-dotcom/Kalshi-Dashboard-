@@ -31,6 +31,7 @@ function when(iso) {
 
 /** Opponent code from the ticker: KX...-26SEP19MONTORST-MONT -> ORST */
 function opponentFrom(ticker) {
+  if (String(ticker || "").startsWith("PM:")) return null;
   const parts = String(ticker || "").split("-");
   const side = parts[2] || "";
   const middle = (parts[1] || "").replace(/^\d{2}[A-Z]{3}\d{2}(\d{4})?/, "");
@@ -56,7 +57,7 @@ function StatementRow({ t, runningBalance }) {
             {id.name}{opponent ? ` vs ${opponent}` : ""}
           </div>
           <div className="kx-stmt-sub">
-            {sportLabel(t.sportKey)} · {t.contracts} @ {px(t.entryPriceCents)} → {px(t.exitPriceCents)} · {t.exitReason}
+            {String(t.ticker || "").startsWith("PM:") ? "Polymarket · " : ""}{sportLabel(t.sportKey)} · {t.contracts} @ {px(t.entryPriceCents)} → {px(t.exitPriceCents)} · {t.exitReason}
           </div>
           <div className="kx-stmt-sub">{when(t.entryTimestamp)} → {when(t.exitTimestamp)}</div>
         </div>
