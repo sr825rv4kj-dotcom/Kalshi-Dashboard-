@@ -353,6 +353,25 @@ export const DEFAULTS = {
   learnerMinTrades: 8,           // trades a sport/band needs before it can be cut
   minExpectedReturnPct: 30,
 
+  // STAKE TIERS + DOUBLE-DOWN (2026-09-26, account holder's call) - scaling.js
+  //   stakeTiers: equity thresholds. x = multiple of flatStakeDollars,
+  //     pct = share of equity (keeps climbing). Steps back down if equity falls.
+  //     [] = no tiers, flat stake only.
+  //   stakeMaxDollars: hard ceiling on any single stake.
+  //   doubleDown: one more stake on a held live game whose team has stayed
+  //     ahead for leadScans scans / leadMinutes, only at minReturnPct+ expected.
+  //     false switches it off.
+  stakeTiers: [
+    { at: 0, x: 1 },        // under $75: $5
+    { at: 75, x: 1.5 },     // $7.50
+    { at: 150, x: 2 },      // $10
+    { at: 300, x: 3 },      // $15
+    { at: 500, x: 5 },      // $25
+    { at: 1000, pct: 0.03 },// 3% of equity: $30 at $1,000, $60 at $2,000
+  ],
+  stakeMaxDollars: 500,
+  doubleDown: { enabled: true, minReturnPct: 35, leadScans: 3, leadMinutes: 5 },
+
   // --- Account-level, never touched by the strategy migration ------------
   oddsProviderOrder: ["the-odds-api", "oddspapi"],
   oddsPapiTournamentIds: {},
