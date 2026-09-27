@@ -1036,6 +1036,10 @@ export async function runCycle() {
           ...config,
           kellyFraction: config.kellyFraction ?? tier.kellyFraction,
           maxStakeDollars: tier.maxStakeDollars,
+          // STAKE TIERS read EQUITY - cash plus open positions at market, the
+          // portfolio total the Kalshi app shows - so the stake does not drop
+          // just because money is tied up in games (scaling.js).
+          equityDollars: ((balanceData.balance ?? 0) + (balanceData.portfolio_value ?? 0)) / 100,
         },
         bankroll: tradable,
         tickerMap,
