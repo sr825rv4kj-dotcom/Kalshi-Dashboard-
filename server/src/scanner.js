@@ -81,7 +81,7 @@ import { enterPosition, readShardBalances } from "./executor.js";
 import { appendLog, loadState, saveState } from "./stateStore.js";
 import { resolveTicker } from "./tickerResolver.js";
 import { getLiveScores, findLiveGameForTeam } from "./scoresFetcher.js";
-import { corroboratedProbability, fractionRemaining, paramsFor } from "./liveModel.js";
+import { corroboratedProbability, fractionRemaining, paramsFor, rememberPregame, pregamePrior, flushPregamePriors } from "./liveModel.js";
 import { workCandidate, cancelResting, getRestingOrders, cancelPendingOnEvent } from "./makerEngine.js";
 import { recordFairFromProbabilities } from "./fairValue.js";
 import { clvVerdict, recordShadow } from "./clvTracker.js";
@@ -90,7 +90,7 @@ import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, f
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-26-stake-tiers-double-down";
+export const SCANNER_VERSION = "2026-09-27-pregame-prior";
 
 // Kalshi reports a tradeable market as "active", not "open".
 const TRADEABLE = new Set(["open", "active"]);
@@ -377,6 +377,9 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       if (!sampleReason) sampleReason = `${teamName}: live trading switched off in config`;
       return null;
     }
+    // The last line seen before kickoff is the in-game model's prior - kept
+    // even though live-only mode does not trade the game yet (liveModel.js).
+    if (!timing.live) rememberPregame({ sportKey, teamName, commenceTime, probability: trueProbability });
     // LIVE ONLY: a game that has not started is not traded - no buy, no
     // resting bid. Checked before the ticker lookup, so it costs no Kalshi call.
     if (!timing.live && config.liveOnly !== false) { drops.pregame++; return null; }
@@ -434,6 +437,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   }));
 
   let viable = prepared.filter(Boolean);
+  flushPregamePriors();
 
   // --- In-play corroboration -------------------------------------------
   // One /scores call per sport per scan, and only when something in play
@@ -480,6 +484,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           const frac = fractionRemaining(sportKey, c.commenceTime);
           const corr = corroboratedProbability({
             sportKey, sharpProbability: c.trueProbability, lead: game.lead, fracRemaining: frac,
+            pregameProbability: pregamePrior({ sportKey, teamName: c.teamName, commenceTime: c.commenceTime }),
           });
           if (!corr.usable && c.addOn) { bump("double-down:unmodellable"); return false; }
           if (!corr.usable) {
@@ -508,7 +513,8 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
             vetoed.push(
               `${c.teamName}: sharp line ${(c.trueProbability * 100).toFixed(0)}% vs in-game model ` +
               `${(corr.modelProbability * 100).toFixed(0)}% (${game.homeScore}-${game.awayScore}, ` +
-              `${(frac * 100).toFixed(0)}% left) - ${corr.disagreementPoints.toFixed(0)}pt gap exceeds ${maxDisagree}, line is stale`
+              `${(frac * 100).toFixed(0)}% left, pre-game ${(corr.prior * 100).toFixed(0)}% from ${corr.priorSource}) - ` +
+              `${corr.disagreementPoints.toFixed(0)}pt gap exceeds ${maxDisagree}, line is stale`
             );
             bump("model-disagrees", vetoed[vetoed.length - 1]);
             return false;
@@ -518,7 +524,8 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           c.trueProbability = corr.probability;
           c.liveContext =
             `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ` +
-            `${(frac * 100).toFixed(0)}% left, model ${(corr.modelProbability * 100).toFixed(0)}%`;
+            `${(frac * 100).toFixed(0)}% left, model ${(corr.modelProbability * 100).toFixed(0)}% ` +
+            `(pre-game ${(corr.prior * 100).toFixed(0)}%${corr.priorSource === "pre-game close" ? "" : ", no pre-game line - strict"})`;
           if (c.addOn) c.leadNote = `ahead by ${lead.lead} for ${lead.scans} scans / ${lead.minutes.toFixed(0)}m`;
           return true;
         });
