@@ -372,6 +372,13 @@ export const DEFAULTS = {
   stakeMaxDollars: 500,
   doubleDown: { enabled: true, minReturnPct: 35, leadScans: 3, leadMinutes: 5 },
 
+  // POLYMARKET US (2026-09-27) - polymarket/pmEngine.js. Same strategy as
+  // Kalshi on a second exchange, one bet per game across both.
+  //   enabled: connect and self-check whenever keys are present
+  //   trading: "auto" = trade once the live self-check passes; "on"; "off"
+  //   maxOpenPositions: Polymarket positions open at once (its own slots)
+  polymarket: { enabled: true, trading: "auto", shortSide: "auto", maxOpenPositions: 3 },
+
   // --- Account-level, never touched by the strategy migration ------------
   oddsProviderOrder: ["the-odds-api", "oddspapi"],
   oddsPapiTournamentIds: {},
