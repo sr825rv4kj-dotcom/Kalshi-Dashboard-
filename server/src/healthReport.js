@@ -31,7 +31,7 @@ import { loadState } from "./stateStore.js";
 import { loadConfig } from "./configStore.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 
-export const HEALTH_VERSION = "2026-09-22-self-diagnosis";
+export const HEALTH_VERSION = "2026-09-26-double-down-codes";
 
 /** A scan older than this means the bot is not scanning, not being choosy. */
 const SCAN_STALE_MS = 5 * 60 * 1000;
@@ -201,6 +201,13 @@ const CODE_GUIDE = {
 /** Market status tallies ("status:finalized" etc.) are board conditions, never faults. */
 function guideFor(code) {
   if (CODE_GUIDE[code]) return CODE_GUIDE[code];
+  if (code.startsWith("double-down:")) {
+    return {
+      severity: "info", healthy: true,
+      title: `Double-down not taken: ${code.slice(12).replace(/-/g, " ")}`,
+      fix: "Healthy. A held game is doubled only when its lead has held and the add-on returns 35%+.",
+    };
+  }
   if (code.startsWith("status:")) {
     return { severity: "info", healthy: true, title: `Market ${code.slice(7)}`, fix: "Not a fault." };
   }
