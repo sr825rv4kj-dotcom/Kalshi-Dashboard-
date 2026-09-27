@@ -41,6 +41,8 @@
  * So it is used as a second opinion, never as the price.
  */
 
+import { loadState, saveState } from "./stateStore.js";
+
 /** Abramowitz-Stegun error function; accurate to ~1e-7, no dependencies. */
 function erf(x) {
   const sign = x < 0 ? -1 : 1;
@@ -140,6 +142,98 @@ export function liveWinProbability({ sportKey, pregameProbability, lead, fracRem
 }
 
 /**
+ * THE SCORE WAS COUNTED TWICE (fixed 2026-09-27).
+ *
+ * The model needs a PRE-GAME prior - how strong each team was before kickoff -
+ * and then adds the live score on top. It was being handed the LIVE sharp
+ * line as that prior. A live line already contains the score, so the lead was
+ * applied twice and every game with a lead looked "stale". Production 18:05Z:
+ * 10 of 10 in-play NFL markets vetoed, 0 traded.
+ *
+ * Checked against those real games (pre-game moneylines from the books, live
+ * prices from Kalshi at 11:05am PT, 68% of the game left):
+ *
+ *   game         pre-game  lead  live line   old model      new model
+ *   CIN v PIT      62%      -7     39%        19%  VETO      35%  agrees
+ *   LAC v BUF      24%      +7     57%        78%  VETO      52%  agrees
+ *   HOU v IND      54%     -10     27%         8%  VETO      21%  agrees
+ *   NE  v JAC      41%      -4     22%        16%            29%  agrees
+ *   KC  v MIA      84%      +7     89%        95%            93%  agrees
+ *
+ * And it still does its real job - catching a PRE-GAME price quoted in play:
+ * CIN's 62% quoted at 7 down -> model 35%, 27pt gap, vetoed; the HOU and PHI
+ * cases in the header above are still vetoed (24 and 15 points).
+ *
+ * The prior is the last line the scanner saw BEFORE kickoff (the closing
+ * line), remembered per game and kept in state so a restart does not lose it.
+ * A game first seen after kickoff has no prior; it falls back to the old
+ * behaviour, which is stricter, never looser.
+ */
+
+export const LIVE_MODEL_VERSION = "2026-09-27-pregame-prior";
+
+const priors = new Map();     // key -> { p, commenceTime, at }
+let priorsLoaded = false;
+let priorsDirty = false;
+const PRIOR_KEEP_MS = 36 * 60 * 60 * 1000;
+
+function priorKey(sportKey, teamName, commenceTime) {
+  return `${sportKey}|${String(teamName || "").toLowerCase()}|${commenceTime}`;
+}
+
+function loadPriors() {
+  if (priorsLoaded) return;
+  priorsLoaded = true;
+  try {
+    const saved = loadState().pregamePriors || {};
+    for (const [k, v] of Object.entries(saved)) if (v && Number.isFinite(Number(v.p))) priors.set(k, v);
+  } catch { /* start empty */ }
+}
+
+/** Record the latest pre-game line for a team. Called for every line seen before kickoff. */
+export function rememberPregame({ sportKey, teamName, commenceTime, probability }) {
+  const p = Number(probability);
+  if (!sportKey || !teamName || !commenceTime || !(p > 0 && p < 1)) return;
+  const start = Date.parse(commenceTime);
+  if (!Number.isFinite(start) || start <= Date.now()) return;   // only genuinely pre-game lines
+  loadPriors();
+  const k = priorKey(sportKey, teamName, commenceTime);
+  const prev = priors.get(k);
+  // Persist only when it is new or has moved a full point - lines drift slowly.
+  if (!prev || Math.abs(prev.p - p) >= 0.01) priorsDirty = true;
+  priors.set(k, { p, commenceTime, at: new Date().toISOString() });
+}
+
+/** The closing pre-game probability for this team, or null if it was never seen before kickoff. */
+export function pregamePrior({ sportKey, teamName, commenceTime }) {
+  loadPriors();
+  const v = priors.get(priorKey(sportKey, teamName, commenceTime));
+  return v ? Number(v.p) : null;
+}
+
+/** Write remembered priors to state (at most once per scan, only when something moved). */
+export function flushPregamePriors() {
+  if (!priorsDirty) return;
+  priorsDirty = false;
+  const cutoff = Date.now() - PRIOR_KEEP_MS;
+  const out = {};
+  for (const [k, v] of priors) {
+    if (Date.parse(v.commenceTime) < cutoff) { priors.delete(k); continue; }
+    out[k] = v;
+  }
+  try {
+    const st = loadState();
+    st.pregamePriors = out;
+    saveState(st);
+  } catch { /* kept in memory; retried on the next change */ priorsDirty = true; }
+}
+
+export function pregamePriorCount() {
+  loadPriors();
+  return priors.size;
+}
+
+/**
  * The probability the entry gate should actually use for an in-play market.
  *
  * It takes the MORE CONSERVATIVE of the sharp line and the live model, so a
@@ -147,19 +241,27 @@ export function liveWinProbability({ sportKey, pregameProbability, lead, fracRem
  * be right - only to be a second witness. When the line is stale the model
  * vetoes it; when the model is off, the line vetoes the model.
  *
- * Returns { probability, modelProbability, disagreementPoints, usable }.
+ * pregameProbability: the closing pre-game line. When it is missing the live
+ * line stands in (the old behaviour - it double-counts the score, so it only
+ * ever vetoes MORE, never less).
+ *
+ * Returns { probability, modelProbability, disagreementPoints, usable, priorSource, prior }.
  */
-export function corroboratedProbability({ sportKey, sharpProbability, lead, fracRemaining }) {
+export function corroboratedProbability({ sportKey, sharpProbability, lead, fracRemaining, pregameProbability = null }) {
+  const havePrior = Number(pregameProbability) > 0 && Number(pregameProbability) < 1;
+  const prior = havePrior ? Number(pregameProbability) : sharpProbability;
   const model = liveWinProbability({
-    sportKey, pregameProbability: sharpProbability, lead, fracRemaining,
+    sportKey, pregameProbability: prior, lead, fracRemaining,
   });
   if (model == null) {
-    return { probability: null, modelProbability: null, disagreementPoints: null, usable: false };
+    return { probability: null, modelProbability: null, disagreementPoints: null, usable: false, priorSource: null, prior: null };
   }
   return {
     probability: Math.min(sharpProbability, model),
     modelProbability: model,
     disagreementPoints: Math.abs(sharpProbability - model) * 100,
     usable: true,
+    priorSource: havePrior ? "pre-game close" : "live line (no pre-game line seen)",
+    prior,
   };
 }
