@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import BalanceBlock from "./components/BalanceBlock.jsx";
 import PositionsTable from "./components/PositionsTable.jsx";
 import OrdersTable from "./components/OrdersTable.jsx";
@@ -20,6 +20,7 @@ import SelfCheckPanel from "./components/SelfCheckPanel.jsx";
 import StrategyReviewPanel from "./components/StrategyReviewPanel.jsx";
 import CoveragePanel from "./components/CoveragePanel.jsx";
 import PolymarketPanel from "./components/PolymarketPanel.jsx";
+import VenueTabs, { readVenue, saveVenue, venueLabel } from "./components/VenueTabs.jsx";
 import { applyWallpaper, readLocal, defaultSettings } from "./wallpapers.js";
 
 const RAW_BASE = import.meta.env.VITE_API_BASE;
@@ -44,7 +45,14 @@ function DashboardApp() {
   // contains "credential"/"401", which used to re-arm setNeedsSetup below.
   const [skippedSetup, setSkippedSetup] = useState(false);
 
-  const [balance, setBalance] = useState(null);
+  // KALSHI / POLYMARKET / COMBINED (2026-09-27). One switch drives the
+  // balance, the P&L chart, open positions, the Statement and the Trade Log.
+  const [venue, setVenueState] = useState(readVenue);
+  // The account on screen right now. A slow response for the account you
+  // just switched away from is dropped instead of overwriting the new one.
+  const venueRef = useRef(venue);
+  const setVenue = (v) => { saveVenue(v); venueRef.current = v; setVenueState(v); };
+  const [accounts, setAccounts] = useState(null);
   const [positions, setPositions] = useState([]);
   const [pnlSeries, setPnlSeries] = useState([]);
   const [error, setError] = useState(null);
@@ -64,22 +72,36 @@ function DashboardApp() {
     }
   }
 
-  async function loadAll() {
+  async function loadAll(which = venue) {
     try {
       setError(null);
-      const [balanceRes, positionsRes, pnlRes] = await Promise.all([
-        fetch(`${API_BASE}/api/balance`).then((r) => r.json()),
+      const [accountsRes, positionsRes, pnlRes] = await Promise.all([
+        fetch(`${API_BASE}/api/accounts`).then((r) => r.json()),
         fetch(`${API_BASE}/api/positions`).then((r) => r.json()),
-        fetch(`${API_BASE}/api/pnl-history`).then((r) => r.json()),
+        fetch(`${API_BASE}/api/pnl-history?venue=${which}`).then((r) => r.json()),
       ]);
-      if (balanceRes.error) throw new Error(balanceRes.error);
-      if (positionsRes.error) throw new Error(positionsRes.error);
+      if (which !== venueRef.current) return;
+      if (accountsRes.error) throw new Error(accountsRes.error);
       if (pnlRes.error) throw new Error(pnlRes.error);
-
-      setBalance(balanceRes.balanceDollars);
-      setPositions(positionsRes.positions ?? []);
+      setAccounts(accountsRes);
       setPnlSeries(pnlRes.series ?? []);
+
+      // One row shape for both exchanges.
+      const kalshiRows = (positionsRes.positions ?? []).map((p) => ({
+        venue: "kalshi", ticker: p.ticker, label: p.ticker,
+        side: p.position >= 0 ? "YES" : "NO", contracts: Math.abs(p.position),
+        exposureDollars: p.marketExposureDollars,
+      }));
+      const pmRows = (accountsRes.polymarket?.positions ?? []).map((p) => ({
+        venue: "polymarket", ticker: p.ticker, label: p.label, side: p.side,
+        contracts: p.contracts, exposureDollars: p.valueDollars ?? p.costDollars,
+      }));
+      setPositions(which === "kalshi" ? kalshiRows : which === "polymarket" ? pmRows : [...kalshiRows, ...pmRows]);
+
+      // Kalshi errors still reach the banner (and the credentials prompt).
+      if (positionsRes.error && which !== "polymarket") throw new Error(positionsRes.error);
       setLastUpdated(new Date());
+      if (accountsRes.kalshi && !accountsRes.kalshi.ok && which !== "polymarket") throw new Error(accountsRes.kalshi.error);
     } catch (err) {
       setError(err.message);
       if (!skippedSetup && /key|credential|401|403/i.test(err.message)) {
@@ -92,10 +114,10 @@ function DashboardApp() {
 
   useEffect(() => {
     if (checkingConfig || needsSetup) return;
-    loadAll();
-    const interval = setInterval(loadAll, 60000);
+    loadAll(venue);
+    const interval = setInterval(() => loadAll(venue), 60000);
     return () => clearInterval(interval);
-  }, [checkingConfig, needsSetup]);
+  }, [checkingConfig, needsSetup, venue]);
 
   if (checkingConfig) return <div className="app"><p className="muted">Checking configuration...</p></div>;
 
@@ -143,16 +165,18 @@ function DashboardApp() {
         </div>
       )}
 
-      <BalanceBlock balance={balance} />
+      <VenueTabs venue={venue} onChange={setVenue} />
+
+      <BalanceBlock accounts={accounts} venue={venue} />
 
       <div className="chart-panel panel">
-        <h2>Cumulative P&amp;L</h2>
+        <h2>Cumulative P&amp;L · {venueLabel(venue)}</h2>
         <PnlChart series={pnlSeries} />
       </div>
 
       <div className="grid">
-        <div className="panel"><h2>Open Positions</h2><PositionsTable positions={positions} /></div>
-        <div className="panel"><h2>Statement</h2><OrdersTable /></div>
+        <div className="panel"><h2>Open Positions · {venueLabel(venue)}</h2><PositionsTable positions={positions} showVenue={venue === "all"} /></div>
+        <div className="panel"><h2>Statement · {venueLabel(venue)}</h2><OrdersTable venue={venue} /></div>
       </div>
 
       <BotControlPanel apiBase={API_BASE} />
@@ -164,7 +188,7 @@ function DashboardApp() {
       <BotConfigPanel apiBase={API_BASE} />
       <GamesBoard apiBase={API_BASE} />
       <MilestonesPanel apiBase={API_BASE} />
-      <TradeLedgerPanel apiBase={API_BASE} />
+      <TradeLedgerPanel apiBase={API_BASE} venue={venue} />
       <NotificationsPanel apiBase={API_BASE} />
       <CostTrackingPanel apiBase={API_BASE} />
       <ApiKeysPanel apiBase={API_BASE} />
