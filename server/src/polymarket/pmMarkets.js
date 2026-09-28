@@ -25,7 +25,7 @@
 import { pmGet, centsOf, numberOf } from "./pmClient.js";
 import { normName } from "./pmState.js";
 
-export const PM_MARKETS_VERSION = "2026-09-28-full-odds-api-map";
+export const PM_MARKETS_VERSION = "2026-09-28-docs-market-type";
 
 /**
  * Odds-feed sport -> Polymarket league slug(s). VERIFIED 2026-09-28 against the
@@ -296,8 +296,35 @@ export function matchEvent(events, teamNames, commenceTime) {
 
 // --- The winner market and which side our team is on ---------------------------------------
 
+/*
+ * WHICH MARKET IS THE FULL-GAME WINNER - PER POLYMARKET'S SPORTS SCHEMA
+ * (docs.polymarket.us/trader-guide/sports-schema): "Map on market_sport_type
+ * alone. It is guaranteed on every instrument ... and fully identifies the
+ * market", and "Never parse the symbol or slug". The full-game moneyline is
+ * `<sport>_team_full_game_winner`. SOCCER, as Polymarket actually lists it
+ * (live MLS event mls-clb-mia-2026-09-27, read 2026-09-28 01:11Z): type
+ * `soccer_team_full_time_winner`, V2 SPORTS_MARKET_TYPE_DRAWABLE_OUTCOME, one
+ * market per team ("Columbus Crew (Reg. Time)", YES and NO both tied to that
+ * team) plus a "Tie (Reg. Time)" market with no team. Quarter / half /
+ * inning / period winners are separate types. So when the type is present:
+ *   - a TEAM market must be exactly `..._team_full_game_winner` or
+ *     `..._team_full_time_winner` (regulation time - the same 3-way result
+ *     the odds feed prices)
+ *   - any other winner type (match / fight winners in tennis, boxing...) must
+ *     end in `_winner` and name no period, half, quarter, inning, set or map
+ * Only when the type is missing does the older title check below decide.
+ */
+const PERIOD_IN_TYPE = /(half|quarter|inning|period|_set|set_|_map|map_|first|second|third|fourth|1st|2nd|3rd|4th|_q[1-4]|_h[12]|_p[1-3]|_f5|five|round_|_leg)/;
+
 function isWinnerMarket(m) {
   if (!m || m.closed || m.active === false || m.hidden) return false;
+  const smt = String(m.sportsMarketType || "").toLowerCase().trim();
+  if (smt) {
+    if (!/_winner$/.test(smt)) return false;
+    if (/_team_/.test(smt)) return /_team_full_(game|time)_winner$/.test(smt);
+    if (PERIOD_IN_TYPE.test(smt) || /(spread|total|player_|prop)/.test(smt)) return false;
+    return true;
+  }
   const type = JSON.stringify([m.sportsMarketType, m.sportsMarketTypeV2, m.marketType]).toUpperCase();
   if (!/MONEYLINE|DRAWABLE|WINNER/.test(type)) return false;
   if (/SPREAD|TOTAL|PROP|FUTURE/.test(type)) return false;
