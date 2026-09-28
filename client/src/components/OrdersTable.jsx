@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import ScrubChart from "./ScrubChart.jsx";
 import { teamIdentity, sportEmoji, sportLabel } from "../teamIdentity.js";
 
@@ -87,8 +87,11 @@ function StatementRow({ t, runningBalance }) {
   );
 }
 
-export default function OrdersTable() {
+export default function OrdersTable({ venue = "all" }) {
   const [data, setData] = useState({ completed: [], open: [], stats: null });
+  // Drops a late response for the account you just switched away from.
+  const venueRef = useRef(venue);
+  venueRef.current = venue;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   // Collapsed by default, remembered on this device. Storage can be blocked
@@ -105,12 +108,14 @@ export default function OrdersTable() {
   async function load() {
     try {
       setError(null);
-      const res = await fetch(`/api/trade-lifecycles`);
+      const asked = venue;
+      const res = await fetch(`/api/trade-lifecycles?venue=${asked}`);
       const text = await res.text();
       let json;
       try { json = JSON.parse(text); }
       catch { throw new Error(`Server returned ${res.status}. Close the tab and reopen to clear a stale build.`); }
       if (json.error) throw new Error(json.error);
+      if ((json.venue ?? asked) !== venueRef.current) return;
       setData({ completed: json.completed ?? [], open: json.open ?? [], stats: json.stats ?? null });
     } catch (err) {
       setError(err.message);
@@ -120,10 +125,11 @@ export default function OrdersTable() {
   }
 
   useEffect(() => {
+    setLoading(true);
     load();
     const i = setInterval(load, 60000);
     return () => clearInterval(i);
-  }, []);
+  }, [venue]);
 
   // Oldest first for the running balance, then show newest at the top.
   const chronological = [...data.completed].reverse();
