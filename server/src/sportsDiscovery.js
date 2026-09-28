@@ -47,7 +47,22 @@ import { loadState, saveState, appendLog } from "./stateStore.js";
 const ODDS_API_BASE = "https://api.the-odds-api.com/v4";
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h - season status barely moves
 
-export const SPORTS_DISCOVERY_VERSION = "2026-09-24-one-strike-per-scan";
+export const SPORTS_DISCOVERY_VERSION = "2026-09-28-park-needs-30-minutes";
+
+/*
+ * 2026-09-28: A MINUTE OF EMPTY SCANS PARKED THE NFL FOR SIX HOURS.
+ *
+ * Production 23:43Z: three scan records in about a minute found no NFL lines
+ * (the calendar-day filter in scraper.js hid tonight's game - fixed there),
+ * and the sport was parked until 05:43Z, straight through Sunday Night
+ * Football. MLS was parked the same way at 00:01Z with its game in play.
+ *
+ * Now a sport must have been empty for at least 30 minutes of scanning, not
+ * just three scans, before it is parked. And every park written by an earlier
+ * build is released once, so nothing parked under the old rule stays parked.
+ */
+const PARK_RULE = "2026-09-28-window";
+const MIN_BARREN_SPAN_MS = 30 * 60 * 1000;
 
 /*
  * 2026-09-24: THE QUARANTINE PARKED THE WHOLE BOARD ON ONE BLIP.
@@ -167,6 +182,13 @@ function applyQuarantine(candidates) {
 
   for (const sportKey of candidates) {
     let h = health[sportKey] || { strikes: 0, parkedUntil: 0 };
+    // Parked under an earlier rule: release it now, once.
+    if (h.parkedUntil > now && h.rule !== PARK_RULE) {
+      h = { strikes: 0, parkedUntil: 0, lastSeen: now };
+      health[sportKey] = h;
+      justReleased.push(sportKey);
+      dirty = true;
+    }
     // A park written by the old over-striking code (strikes far past the
     // threshold, no record stamp) is released once on this build's first pass.
     if (h.parkedUntil > now && !h.lastRecordAt && (h.strikes || 0) > STRIKES_TO_PARK * 2) {
@@ -193,10 +215,13 @@ function applyQuarantine(candidates) {
 
     if (verdict === true) {
       h.strikes = (h.strikes || 0) + 1;
+      if (h.strikes === 1 || !h.firstBarrenAt) h.firstBarrenAt = now;
       h.lastSeen = now;
       h.lastRecordAt = record.at;
-      if (h.strikes >= STRIKES_TO_PARK && !(h.parkedUntil > now)) {
+      const barrenFor = now - (h.firstBarrenAt || now);
+      if (h.strikes >= STRIKES_TO_PARK && barrenFor >= MIN_BARREN_SPAN_MS && !(h.parkedUntil > now)) {
         h.parkedUntil = now + PARK_MS;
+        h.rule = PARK_RULE;
         justParked.push(sportKey);
       }
       health[sportKey] = h;
@@ -231,7 +256,7 @@ function applyQuarantine(candidates) {
 
   if (justParked.length) {
     appendLog(
-      `Parked ${justParked.length} sport(s) for 6h after ${STRIKES_TO_PARK} scans with nothing on the board: ` +
+      `Parked ${justParked.length} sport(s) for 6h after 30+ minutes of scans with nothing in the in-play / next-24h window: ` +
       `${justParked.join(", ")}. They are re-probed automatically - no action needed.`
     );
   }
