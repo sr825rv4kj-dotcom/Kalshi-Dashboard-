@@ -25,36 +25,88 @@
 import { pmGet, centsOf, numberOf } from "./pmClient.js";
 import { normName } from "./pmState.js";
 
-export const PM_MARKETS_VERSION = "2026-09-27-polymarket-markets";
+export const PM_MARKETS_VERSION = "2026-09-28-verified-league-map";
 
-/** Odds-feed sport -> the Polymarket league slugs it may be listed under. */
-const LEAGUE_CANDIDATES = {
+/**
+ * Odds-feed sport -> Polymarket league slug(s). VERIFIED 2026-09-28 against the
+ * 312 leagues Polymarket US returned to this account (GET /v2/leagues), by the
+ * league's own name - not guessed. Only sports the odds feed actually lists
+ * are included. Traps this avoids:
+ *   - Polymarket "spl" is the SAUDI Pro League; the odds feed's soccer_spl is
+ *     the SCOTTISH Premiership -> "scp" ("Scottish Prem").
+ *   - "brb" is Brazil's Serie B ("Série B"); "srb" is Italy's ("Serie B").
+ *   - "rl" is Rocket League (esports), not rugby league - NRL is not listed.
+ *   - Danish Superliga: Polymarket has "sld" (Superliga) and "slr"
+ *     (SuperLiga) and the names alone do not say which is Denmark. Both are
+ *     searched; a game only matches when BOTH teams and the start time agree,
+ *     so the wrong league simply finds nothing.
+ * Not on Polymarket US (so never traded there): CFL, NRL, Liiga, A-League,
+ * 3. Liga. Cricket is left out until its market format is checked.
+ */
+const LEAGUE_SLUGS = {
   americanfootball_nfl: ["nfl"],
-  americanfootball_ncaaf: ["cfb", "ncaaf", "college-football", "ncaa-football", "ncaafb"],
+  americanfootball_nfl_preseason: ["nfl"],
+  americanfootball_ncaaf: ["cfb"],
   basketball_nba: ["nba"],
   basketball_nba_preseason: ["nba"],
   basketball_wnba: ["wnba"],
-  basketball_ncaab: ["cbb", "ncaab", "college-basketball", "ncaa-basketball", "ncaamb"],
+  basketball_ncaab: ["cbb"],
+  basketball_euroleague: ["eurolg"],
   baseball_mlb: ["mlb"],
+  baseball_npb: ["npb"],
+  baseball_kbo: ["kbo"],
   icehockey_nhl: ["nhl"],
   icehockey_nhl_preseason: ["nhl"],
-  soccer_epl: ["epl", "premier-league", "english-premier-league"],
+  icehockey_sweden_hockey_league: ["shl"],
+  soccer_epl: ["epl"],
   soccer_usa_mls: ["mls"],
-  soccer_uefa_champs_league: ["ucl", "champions-league", "uefa-champions-league"],
-  soccer_uefa_europa_league: ["uel", "europa-league", "uefa-europa-league"],
-  soccer_spain_la_liga: ["laliga", "la-liga"],
-  soccer_germany_bundesliga: ["bundesliga"],
-  soccer_italy_serie_a: ["serie-a", "seriea"],
-  soccer_france_ligue_one: ["ligue-1", "ligue1"],
-  soccer_mexico_ligamx: ["liga-mx", "ligamx"],
-  mma_mixed_martial_arts: ["ufc", "mma"],
-  cricket_ipl: ["ipl"],
+  soccer_uefa_champs_league: ["ucl"],
+  soccer_uefa_europa_league: ["uel"],
+  soccer_uefa_europa_conference_league: ["uecl"],
+  soccer_uefa_nations_league: ["unl"],
+  soccer_uefa_champs_league_women: ["uwcl"],
+  soccer_spain_la_liga: ["lal"],
+  soccer_spain_segunda_division: ["lal2"],
+  soccer_germany_bundesliga: ["bun"],
+  soccer_germany_bundesliga2: ["bun2"],
+  soccer_germany_dfb_pokal: ["dfb"],
+  soccer_italy_serie_a: ["sea"],
+  soccer_italy_serie_b: ["srb"],
+  soccer_france_ligue_one: ["lg1"],
+  soccer_france_ligue_two: ["lig2"],
+  soccer_mexico_ligamx: ["lmx"],
+  soccer_netherlands_eredivisie: ["ere"],
+  soccer_portugal_primeira_liga: ["ligpor"],
+  soccer_brazil_campeonato: ["bra"],
+  soccer_brazil_serie_b: ["brb"],
+  soccer_argentina_primera_division: ["lpa"],
+  soccer_conmebol_copa_libertadores: ["lib"],
+  soccer_conmebol_copa_sudamericana: ["sud"],
+  soccer_efl_champ: ["eflch"],
+  soccer_england_league1: ["efl1"],
+  soccer_england_league2: ["efl2"],
+  soccer_england_efl_cup: ["eflc"],
+  soccer_spl: ["scp"],
+  soccer_switzerland_superleague: ["swsl"],
+  soccer_turkey_super_league: ["tsl"],
+  soccer_belgium_first_div: ["bel1"],
+  soccer_denmark_superliga: ["sld", "slr"],
+  soccer_norway_eliteserien: ["els"],
+  soccer_sweden_allsvenskan: ["alsv"],
+  soccer_sweden_superettan: ["swe2"],
+  soccer_austria_bundesliga: ["atbl"],
+  soccer_greece_super_league: ["grsl"],
+  soccer_finland_veikkausliiga: ["vkl"],
+  soccer_league_of_ireland: ["irlp"],
+  soccer_chile_campeonato: ["pdc"],
+  mma_mixed_martial_arts: ["ufc"],
+  boxing_boxing: ["boxing"],
 };
 
 function candidatesFor(sportKey) {
-  if (LEAGUE_CANDIDATES[sportKey]) return LEAGUE_CANDIDATES[sportKey];
-  if (/^tennis_atp/.test(sportKey)) return ["atp", "tennis-atp"];
-  if (/^tennis_wta/.test(sportKey)) return ["wta", "tennis-wta"];
+  if (LEAGUE_SLUGS[sportKey]) return LEAGUE_SLUGS[sportKey];
+  if (/^tennis_atp/.test(sportKey)) return ["atp"];
+  if (/^tennis_wta/.test(sportKey)) return ["wta"];
   return [];
 }
 
@@ -78,17 +130,31 @@ export async function getLeagues() {
   return all;
 }
 
-/** The Polymarket league slug for an odds-feed sport, or null. */
-export async function leagueSlugFor(sportKey) {
-  const cands = candidatesFor(sportKey).map(alnum);
-  if (!cands.length) return null;
+/**
+ * The Polymarket league slugs for an odds-feed sport that Polymarket actually
+ * lists and has open right now (exact slug match against GET /v2/leagues).
+ */
+export async function leagueSlugsFor(sportKey) {
+  const wanted = candidatesFor(sportKey);
+  if (!wanted.length) return [];
   const leagues = await getLeagues();
-  for (const c of cands) {
-    const hit = leagues.find((l) => l.isOperational !== false &&
-      [l.slug, l.abbreviation, l.name].some((v) => alnum(v) === c));
-    if (hit) return hit.slug;
-  }
-  return null;
+  return wanted.filter((slug) => leagues.some((l) => l.slug === slug && l.isOperational !== false));
+}
+
+/** First listed slug, or null - kept for the self-check's summary line. */
+export async function leagueSlugFor(sportKey) {
+  return (await leagueSlugsFor(sportKey))[0] ?? null;
+}
+
+/** Every game in all of this sport's Polymarket leagues. */
+export async function getSportEvents(sportKey) {
+  const slugs = await leagueSlugsFor(sportKey);
+  const lists = await Promise.all(slugs.map((s) => getLeagueEvents(s)));
+  return lists.flat();
+}
+
+export function mappedSports() {
+  return { ...LEAGUE_SLUGS };
 }
 
 // --- Events ----------------------------------------------------------------------
