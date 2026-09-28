@@ -376,8 +376,9 @@ export const DEFAULTS = {
   // Kalshi on a second exchange, one bet per game across both.
   //   enabled: connect and self-check whenever keys are present
   //   trading: "auto" = trade once the live self-check passes; "on"; "off"
-  //   maxOpenPositions: Polymarket positions open at once (its own slots)
-  polymarket: { enabled: true, trading: "auto", shortSide: "auto", maxOpenPositions: 3 },
+  //   no limit on open Polymarket bets (removed 2026-09-28, account holder's
+  //   call) - cash on the account is the only limit, as on Kalshi
+  polymarket: { enabled: true, trading: "auto", shortSide: "auto" },
 
   // --- Account-level, never touched by the strategy migration ------------
   oddsProviderOrder: ["the-odds-api", "oddspapi"],
