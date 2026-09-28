@@ -50,7 +50,7 @@ import { tieredStake } from "../scaling.js";
 import { getRestingOrders } from "../makerEngine.js";
 import { notifyEntry } from "../notifier.js";
 import { getTelegramCredentials } from "../telegramStore.js";
-import { pmGet, pmPost, pmConfigured, pmClientStats, dollarsOf, centsOf, numberOf, PM_CLIENT_VERSION } from "./pmClient.js";
+import { pmGet, pmPost, pmConfigured, pmClientStats, pmCredentialReport, dollarsOf, centsOf, numberOf, PM_CLIENT_VERSION } from "./pmClient.js";
 import { leagueSlugFor, getLeagues, getLeagueEvents, matchEvent, winnerSideFor, sidePrice, pmMarketsReport } from "./pmMarkets.js";
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, heldOnKalshi, normName } from "./pmState.js";
 
@@ -145,12 +145,17 @@ export async function runSelfCheck(config = {}) {
   const out = { at: new Date().toISOString(), version: PM_ENGINE_VERSION, steps: [], passed: false };
   const step = (name, ok, detail) => out.steps.push({ name, ok, detail });
 
+  const cred = pmCredentialReport();
+  out.credentials = cred;
   if (!pmConfigured()) {
-    step("keys", false, "No Polymarket keys yet - add them on the dashboard (Polymarket panel) or as Railway variables POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY.");
+    const seen = cred.variablesSeen.length
+      ? ` Found: ${cred.variablesSeen.map((v) => `${v.name} (${v.looksLike})`).join(", ")}.`
+      : " No POLYMARKET variables found.";
+    step("keys", false, `${cred.keyIdFrom ? "Key ID found" : "Key ID missing"}, ${cred.secretFrom ? "Secret Key found" : "Secret Key missing"}.${seen} Add them in the Polymarket panel, or as Railway variables POLYMARKET_KEY_ID and POLYMARKET_SECRET_KEY.`);
     updatePmMeta({ selfCheck: out });
     return out;
   }
-  step("keys", true, "Key ID and Secret Key present");
+  step("keys", true, `Key ID from ${cred.keyIdFrom}, Secret Key from ${cred.secretFrom}`);
 
   // 1. Signed request: the balance.
   try {
@@ -669,6 +674,7 @@ export function pmStatus(config = {}) {
     version: PM_ENGINE_VERSION,
     clientVersion: PM_CLIENT_VERSION,
     configured: pmConfigured(),
+    credentials: pmCredentialReport(),
     settings,
     tradingActive: tradingActive(settings, meta),
     noSideActive: shortSideActive(settings, meta),
