@@ -3,7 +3,10 @@
  */
 import { kalshiGet } from "../kalshiClient.js";
 import { assessOpportunity } from "../riskManager.js";
-import { getTradeLifecycles } from "../tradeLedgerStore.js";
+import { getTradeLifecycles, filterByVenue } from "../tradeLedgerStore.js";
+import { pmConfigured, dollarsOf, numberOf } from "../polymarket/pmClient.js";
+import { readPmAccount, readPmPositions } from "../polymarket/pmEngine.js";
+import { pmPositions, pmMeta } from "../polymarket/pmState.js";
 
 /**
  * Pure: completed lifecycles -> chart series, oldest close first, running
@@ -78,7 +81,82 @@ function normalizeOrder(o) {
   };
 }
 
+/**
+ * BOTH ACCOUNTS AT ONCE (2026-09-27) for the dashboard's Kalshi / Polymarket /
+ * Combined switcher. Each side is read live and independently: one exchange
+ * being unreachable shows as an error on that side only.
+ *
+ * Polymarket is read at most every 15 seconds - the dashboard polls, and the
+ * trading engine needs the rate limit more than a balance display does.
+ */
+let pmAccountCache = { at: 0, value: null };
+
+async function readPolymarketAccount() {
+  if (!pmConfigured()) return { configured: false, ok: false };
+  if (Date.now() - pmAccountCache.at < 15_000 && pmAccountCache.value) return pmAccountCache.value;
+  try {
+    const [acct, held] = await Promise.all([readPmAccount(), readPmPositions()]);
+    const bot = new Map(pmPositions().map((p) => [p.slug, p]));
+    const positions = [];
+    let positionsValue = 0;
+    for (const [slug, p] of Object.entries(held || {})) {
+      const net = numberOf(p.netPositionDecimal, p.netPosition) ?? 0;
+      if (!net || p.expired) continue;
+      const value = dollarsOf(p.cashValue) ?? 0;
+      positionsValue += value;
+      const mine = bot.get(slug);
+      positions.push({
+        venue: "polymarket", ticker: `PM:${slug}`,
+        label: mine?.teamName ? `${mine.teamName}${mine.opponent ? ` vs ${mine.opponent}` : ""}` : (p.marketMetadata?.title || slug),
+        side: net > 0 ? "YES" : "NO", contracts: Math.abs(net),
+        costDollars: dollarsOf(p.cost), valueDollars: value,
+      });
+    }
+    const value = {
+      configured: true, ok: true, cash: acct.cash, buyingPower: acct.buyingPower,
+      positionsValue, equity: acct.cash + positionsValue, positions, at: new Date().toISOString(),
+    };
+    pmAccountCache = { at: Date.now(), value };
+    return value;
+  } catch (err) {
+    const last = pmMeta().lastAccount;
+    return {
+      configured: true, ok: false, error: err.message,
+      cash: last?.cash ?? null, positionsValue: null, equity: last?.equity ?? null, positions: [], at: last?.at ?? null,
+    };
+  }
+}
+
+async function readKalshiAccount() {
+  try {
+    const data = await kalshiGet(`${V2}/portfolio/balance`);
+    const cash = (data.balance ?? 0) / 100;
+    const positionsValue = (data.portfolio_value ?? 0) / 100;
+    return { ok: true, cash, positionsValue, equity: cash + positionsValue };
+  } catch (err) {
+    return { ok: false, error: err.message, cash: null, positionsValue: null, equity: null };
+  }
+}
+
 export function registerPortfolioRoutes(app) {
+  app.get("/api/accounts", async (_req, res) => {
+    try {
+      const [kalshi, polymarket] = await Promise.all([readKalshiAccount(), readPolymarketAccount()]);
+      const add = (a, b) => (a == null && b == null ? null : (a ?? 0) + (b ?? 0));
+      res.json({
+        kalshi,
+        polymarket,
+        combined: {
+          cash: add(kalshi.cash, polymarket.configured ? polymarket.cash : null),
+          positionsValue: add(kalshi.positionsValue, polymarket.configured ? polymarket.positionsValue : null),
+          equity: add(kalshi.equity, polymarket.configured ? polymarket.equity : null),
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.get("/api/balance", async (_req, res) => {
     try {
       const data = await kalshiGet(`${V2}/portfolio/balance`);
@@ -171,8 +249,10 @@ export function registerPortfolioRoutes(app) {
   app.get("/api/pnl-history", async (req, res) => {
     try {
       if (req.query.source !== "kalshi") {
-        const series = ledgerSeries(getTradeLifecycles().completed);
-        return res.json({ series, source: "bot trade ledger", coverage: "every closed bot trade, net of fees" });
+        // ?venue=kalshi | polymarket | all - the dashboard's account switcher.
+        const venue = String(req.query.venue || "all");
+        const series = ledgerSeries(filterByVenue(getTradeLifecycles().completed, venue));
+        return res.json({ series, venue, source: "bot trade ledger", coverage: "every closed bot trade, net of fees" });
       }
 
       const limit = req.query.limit || "200";
