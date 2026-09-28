@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { teamIdentity, sportLabel, sportEmoji } from "../teamIdentity.js";
 
 /** A contract price in cents shown as dollars: 42 -> "$0.42". */
@@ -124,7 +124,7 @@ function ClosedCard({ t }) {
 
       <div className="kx-reason"><b>Why it entered:</b> {t.entryReason || "—"}</div>
       <div className="kx-reason"><b>Why it exited:</b> {t.exitReason || "—"}</div>
-      <div className="kx-ticker">{t.ticker}</div>
+      <div className="kx-ticker">{String(t.ticker || "").startsWith("PM:") ? `Polymarket · ${String(t.ticker).slice(3)}` : t.ticker}</div>
     </div>
   );
 }
@@ -156,7 +156,7 @@ function OpenCard({ t }) {
       </div>
 
       <div className="kx-reason"><b>Why it entered:</b> {t.reason || "—"}</div>
-      <div className="kx-ticker">{t.ticker}</div>
+      <div className="kx-ticker">{String(t.ticker || "").startsWith("PM:") ? `Polymarket · ${String(t.ticker).slice(3)}` : t.ticker}</div>
     </div>
   );
 }
@@ -175,18 +175,23 @@ function Section({ title, count, children, defaultOpen }) {
   );
 }
 
-export default function TradeLedgerPanel({ apiBase }) {
+export default function TradeLedgerPanel({ apiBase, venue = "all" }) {
   const base = typeof apiBase === "string" && apiBase !== "undefined" ? apiBase : "";
   const [data, setData] = useState({ completed: [], open: [], stats: null });
+  // Drops a late response for the account you just switched away from.
+  const venueRef = useRef(venue);
+  venueRef.current = venue;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
   async function load() {
     try {
       setError(null);
-      const res = await fetch(`${base}/api/trade-lifecycles?withScores=true`);
+      const asked = venue;
+      const res = await fetch(`${base}/api/trade-lifecycles?withScores=true&venue=${asked}`);
       const json = await res.json();
       if (json.error) throw new Error(json.error);
+      if ((json.venue ?? asked) !== venueRef.current) return;
       setData({ completed: json.completed ?? [], open: json.open ?? [], stats: json.stats ?? null });
     } catch (err) {
       setError(err.message);
@@ -196,16 +201,17 @@ export default function TradeLedgerPanel({ apiBase }) {
   }
 
   useEffect(() => {
+    setLoading(true);
     load();
     const i = setInterval(load, 60000);
     return () => clearInterval(i);
-  }, []);
+  }, [venue]);
 
   const s = data.stats;
 
   return (
     <div className="panel">
-      <h2>Trade Log</h2>
+      <h2>Trade Log · {venue === "kalshi" ? "Kalshi" : venue === "polymarket" ? "Polymarket" : "Combined"}</h2>
 
       {s && (
         <div className="kx-stats kx-summary">
