@@ -145,8 +145,31 @@ function median(values) {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
-function startsToday(iso) {
-  return new Date(iso).toDateString() === new Date().toDateString();
+/**
+ * THE TRADING WINDOW IS ROLLING, NOT A CALENDAR DAY (2026-09-28).
+ *
+ * This used to keep only games whose start fell on the server's calendar day -
+ * and the server runs on UTC. Every evening at 5pm Pacific (midnight UTC):
+ *
+ *   - every game already in play from before 5pm vanished as "not today"
+ *     (production 00:43Z: the live Columbus-Inter Miami and Washington-Atlanta
+ *     games were both gone from the feed the bot read), and
+ *   - before 5pm, every game starting after 5pm was "tomorrow", so a sport
+ *     between its afternoon and evening slates read as EMPTY - three empty
+ *     scans in a minute parked the NFL for six hours at 4:43pm, straight
+ *     through Sunday Night Football.
+ *
+ * A game is in the window from 12 hours before now (covers the longest games
+ * still in play - the feed drops finished games by itself) to 24 hours ahead
+ * (so tonight's slate is always visible and its pre-game lines are recorded).
+ */
+const WINDOW_BACK_MS = 12 * 60 * 60 * 1000;
+const WINDOW_AHEAD_MS = 24 * 60 * 60 * 1000;
+
+export function inTradingWindow(iso, now = Date.now()) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return false;
+  return t >= now - WINDOW_BACK_MS && t <= now + WINDOW_AHEAD_MS;
 }
 
 /**
@@ -185,10 +208,10 @@ async function fromTheOddsApi(sportKey) {
   const quota = { remaining: res.headers.get("x-requests-remaining"), used: res.headers.get("x-requests-used") };
 
   const probabilities = {};
-  const rejected = { noSharpBook: 0, badOverround: 0, notToday: 0 };
+  const rejected = { noSharpBook: 0, badOverround: 0, outsideWindow: 0 };
 
   for (const event of events) {
-    if (!startsToday(event.commence_time)) { rejected.notToday++; continue; }
+    if (!inTradingWindow(event.commence_time)) { rejected.outsideWindow++; continue; }
 
     const sharpBooks = (event.bookmakers || []).filter((b) => SHARP_BOOKS.includes(b.key));
     if (!sharpBooks.length) { rejected.noSharpBook++; continue; }
@@ -286,11 +309,11 @@ async function fromOddsPapi(sportKey, tournamentId) {
 
   const fixtures = await res.json();
   const probabilities = {};
-  const rejected = { noOdds: 0, badOverround: 0, notToday: 0 };
+  const rejected = { noOdds: 0, badOverround: 0, outsideWindow: 0 };
 
   for (const fixture of fixtures) {
     if (!fixture.hasOdds) { rejected.noOdds++; continue; }
-    if (!startsToday(fixture.startTime)) { rejected.notToday++; continue; }
+    if (!inTradingWindow(fixture.startTime)) { rejected.outsideWindow++; continue; }
 
     const pinnacle = fixture.bookmakerOdds?.pinnacle;
     if (!pinnacle || !pinnacle.bookmakerIsActive) { rejected.noOdds++; continue; }
@@ -332,7 +355,7 @@ async function fromOddsPapi(sportKey, tournamentId) {
 
 function describeRejected(providerName, r = {}) {
   const parts = [];
-  if (r.notToday) parts.push(`${r.notToday} not today`);
+  if (r.outsideWindow) parts.push(`${r.outsideWindow} outside the in-play / next-24h window`);
   if (r.noSharpBook) parts.push(`${r.noSharpBook} with no sharp book`);
   if (r.badOverround) parts.push(`${r.badOverround} with an implausible overround`);
   if (r.noOdds) parts.push(`${r.noOdds} with no odds posted`);
