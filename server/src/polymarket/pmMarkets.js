@@ -25,7 +25,7 @@
 import { pmGet, centsOf, numberOf } from "./pmClient.js";
 import { normName } from "./pmState.js";
 
-export const PM_MARKETS_VERSION = "2026-09-28-verified-league-map";
+export const PM_MARKETS_VERSION = "2026-09-28-full-odds-api-map";
 
 /**
  * Odds-feed sport -> Polymarket league slug(s). VERIFIED 2026-09-28 against the
@@ -40,8 +40,22 @@ export const PM_MARKETS_VERSION = "2026-09-28-verified-league-map";
  *     (SuperLiga) and the names alone do not say which is Denmark. Both are
  *     searched; a game only matches when BOTH teams and the start time agree,
  *     so the wrong league simply finds nothing.
- * Not on Polymarket US (so never traded there): CFL, NRL, Liiga, A-League,
- * 3. Liga. Cricket is left out until its market format is checked.
+ * 2026-09-28 (evening): extended to EVERY game sport on The Odds API's list
+ * (the-odds-api.com/sports-odds-data/sports-apis.html) that Polymarket US
+ * lists, again matched by the league's own name. Traps added:
+ *   - Polymarket "alsv" is SOCCER Allsvenskan - the odds feed's
+ *     icehockey_sweden_allsvenskan is hockey and is NOT mapped to it.
+ *   - Polymarket "bbl" is BASKETBALL Bundesliga, not handball.
+ *   - Polymarket "afcq" is Africa Cup of Nations QUALIFYING, not the finals.
+ *   - Cricket: Polymarket lists most competitions twice (e.g. "ipl" and
+ *     "iplcr"). Both are searched; if both carry the same game the match is
+ *     ambiguous and skipped, never guessed.
+ * Odds-feed sports Polymarket US does not list (never traded there): CFL,
+ * UFL, AFL, AFLW, MiLB, handball, Liiga, Mestis, HockeyAllsvenskan, NCAA
+ * lacrosse, NRL, NRLW, State of Origin, Six Nations, A-League, 3. Liga, FA Cup,
+ * Coupe de France, Copa del Rey, Copa America, Gold Cup, AFCON finals, World
+ * Cup qualifiers, Women's World Cup, Club World Cup, Euro qualifiers, cricket
+ * Asia Cup / Big Bash / ICC trophies / PSL / men's T20 World Cup.
  */
 const LEAGUE_SLUGS = {
   americanfootball_nfl: ["nfl"],
@@ -101,6 +115,35 @@ const LEAGUE_SLUGS = {
   soccer_chile_campeonato: ["pdc"],
   mma_mixed_martial_arts: ["ufc"],
   boxing_boxing: ["boxing"],
+  // --- added 2026-09-28 (evening), each checked against Polymarket's names ---
+  americanfootball_ncaaf_fcs: ["cfb"],              // CFB
+  baseball_mlb_preseason: ["mlb"],                  // MLB
+  baseball_ncaa: ["cws"],                           // CWS (College World Series)
+  basketball_nba_summer_league: ["nbasl"],          // NBA Summer League
+  basketball_wncaab: ["wcbb"],                      // WCBB
+  basketball_nbl: ["nbl"],                          // Australia NBL
+  icehockey_ahl: ["ahl"],                           // AHL
+  lacrosse_pll: ["pll"],                            // Premier Lacrosse League
+  soccer_china_superleague: ["csl"],                // CSL
+  soccer_fifa_world_cup: ["fwc"],                   // World Cup
+  soccer_germany_bundesliga_women: ["fbl"],         // Frauen-Bundesliga
+  soccer_italy_coppa_italia: ["cop"],               // Coppa Italia
+  soccer_japan_j_league: ["j1"],                    // J1 League
+  soccer_korea_kleague1: ["kl1"],                   // K League 1
+  soccer_poland_ekstraklasa: ["ekst"],              // Ekstraklasa
+  soccer_russia_premier_league: ["rpl"],            // RPL
+  soccer_saudi_arabia_pro_league: ["spl"],          // Saudi Pro League
+  soccer_uefa_champs_league_qualification: ["ucl"], // UCL
+  soccer_concacaf_leagues_cup: ["lgscup"],          // Leagues Cup
+  cricket_ipl: ["ipl", "iplcr"],                    // IPL / IPL CR
+  cricket_t20_blast: ["t20blast", "t20blastcr"],    // T20 Blast (M) / CR
+  cricket_the_hundred: ["hundred"],                 // The Hundred
+  cricket_the_hundred_womens: ["hundredw"],         // The Hundred Women
+  cricket_caribbean_premier_league: ["cpl", "cplcr"], // Caribbean Premier League / CR
+  cricket_international_t20: ["t20i", "t20icr"],   // T20 International (M) / T20 Intl (M)
+  cricket_odi: ["odicr"],                           // ODI (M)
+  cricket_test_match: ["test", "testcr"],           // Test International / Test Intl
+  cricket_t20_world_cup_womens: ["t20worldcupw", "t20worldcupwcr"], // Women's T20 World Cup / CR
 };
 
 function candidatesFor(sportKey) {
