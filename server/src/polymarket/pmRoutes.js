@@ -6,7 +6,7 @@
  *
  *   GET  /api/polymarket/status     balance, positions, switch, self-check, last scan
  *   POST /api/polymarket/keys       save Key ID + Secret Key (secret is never returned)
- *   POST /api/polymarket/settings   { trading: "auto"|"on"|"off", maxOpenPositions }
+ *   POST /api/polymarket/settings   { trading: "auto"|"on"|"off" }
  *   POST /api/polymarket/selfcheck  run the live self-check now
  */
 
@@ -45,11 +45,9 @@ export function registerPolymarketRoutes(app) {
         if (!["auto", "on", "off"].includes(body.trading)) throw new Error('trading must be "auto", "on" or "off"');
         next.trading = body.trading;
       }
-      if (body.maxOpenPositions != null) {
-        const n = Math.floor(Number(body.maxOpenPositions));
-        if (!(n >= 0 && n <= 50)) throw new Error("maxOpenPositions must be 0-50");
-        next.maxOpenPositions = n;
-      }
+      // No open-bet limit on Polymarket (removed 2026-09-28) - any old stored
+      // value is dropped here so it can never come back.
+      delete next.maxOpenPositions;
       if (body.enabled != null) next.enabled = body.enabled !== false;
       saveConfig({ polymarket: next });
       res.json(pmStatus(loadConfig()));
