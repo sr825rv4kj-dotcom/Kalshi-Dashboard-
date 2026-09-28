@@ -34,7 +34,6 @@ const REASON_LABEL = {
   "pm-no-live-score": "No live score for the game",
   "pm-no-side-not-confirmed": "Needs the NO side (turns on after the check)",
   "pm-would-trade": "Would trade (trading not on yet)",
-  "pm-at-cap": "At the Polymarket position limit",
   "pm-no-fill": "Order sent, nothing filled",
   "pm-order-error": "Order error",
   "pm-learned-block": "Skipped - sport/band has been losing",
@@ -75,6 +74,7 @@ export default function PolymarketPanel({ apiBase }) {
   const [busy, setBusy] = useState(null);
   const [message, setMessage] = useState(null);
   const [showKeys, setShowKeys] = useState(false);
+  const [showCoverage, setShowCoverage] = useState(false);
 
   async function refresh() {
     try {
@@ -171,7 +171,7 @@ export default function PolymarketPanel({ apiBase }) {
         <div className="bot-subsection">
           <div className="cost-row"><span>Cash</span><strong>{money(acct?.cash)}</strong></div>
           <div className="cost-row"><span>Account value</span><strong>{money(acct?.equity)}</strong></div>
-          <div className="cost-row"><span>Open bets</span><strong>{positions.length} / {status.settings?.maxOpenPositions ?? 3}</strong></div>
+          <div className="cost-row"><span>Open bets</span><strong>{positions.length}</strong></div>
           {scan?.stake != null && <div className="cost-row"><span>Stake per trade</span><strong>{money(scan.stake)}</strong></div>}
           {status.haltedForDay && <div className="error-banner" style={{ marginTop: 10 }}>Paused for today - loss limit reached.</div>}
           {status.pausedUntil && <div className="error-banner" style={{ marginTop: 10 }}>Paused after 3 failed orders until {new Date(status.pausedUntil).toLocaleTimeString()}.</div>}
@@ -240,6 +240,26 @@ export default function PolymarketPanel({ apiBase }) {
           {scan.samples?.["pm-would-trade"] && (
             <p className="muted" style={{ fontSize: 12.5, marginTop: 6, wordBreak: "break-word" }}>{scan.samples["pm-would-trade"]}</p>
           )}
+        </div>
+      )}
+
+      {status.coverage && (
+        <div className="bot-subsection" style={{ marginTop: 14 }}>
+          <button type="button" onClick={() => setShowCoverage((v) => !v)}
+            style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>Coverage · {status.coverage.either} of {status.coverage.activeSports} live-season sports</span>
+            <span aria-hidden="true">{showCoverage ? "▴" : "▾"}</span>
+          </button>
+          <p className="muted" style={{ fontSize: 12.5, marginTop: 6 }}>
+            Kalshi scanning {status.coverage.kalshiScanning} · Polymarket scanning {status.coverage.polymarketScanning} · updated {ago(status.coverage.at)}
+          </p>
+          {showCoverage && status.coverage.rows.map((r) => (
+            <div key={r.sportKey} style={{ fontSize: 12.5, lineHeight: 1.45, padding: "6px 0", borderBottom: "1px solid var(--hairline)" }}>
+              <strong style={{ wordBreak: "break-word" }}>{r.sportKey.replace(/_/g, " ")}</strong>
+              <div className={r.kalshi.startsWith("scanning") ? "pos" : "muted"}>Kalshi: {r.kalshi}</div>
+              <div className={r.polymarket.startsWith("scanning") ? "pos" : "muted"}>Polymarket: {r.polymarket}</div>
+            </div>
+          ))}
         </div>
       )}
 
