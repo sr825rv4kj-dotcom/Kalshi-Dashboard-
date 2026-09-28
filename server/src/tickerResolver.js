@@ -92,7 +92,7 @@ const CACHE_TTL_MS = 3 * 60 * 1000;
 /** How many days either side of kickoff a ticker's date may sit. */
 const DATE_SLACK_DAYS = 1;
 
-export const RESOLVER_VERSION = "2026-09-23-yes-side-name-fallback";
+export const RESOLVER_VERSION = "2026-09-27-opponent-elimination";
 
 /**
  * Accent folding. kärpät -> karpat, ässät -> assat, Malmö -> malmo.
@@ -251,6 +251,20 @@ function subsequenceOf(code, word) {
  * word-initials of "Toronto Blue Jays" - outscored TOR, and the Blue Jays
  * would have resolved to the Rays.
  */
+/**
+ * Loose spelling test used ONLY by opponent elimination: can this code be
+ * spelled from the team's name, place words included, in order? MIA <- miami,
+ * CLB <- columbus. It establishes nothing on its own; it only stops a code
+ * that has no letters in common with the name being assigned to it.
+ */
+export function spelledFromName(code, teamName) {
+  const c = String(code || "").toLowerCase().replace(/[^a-z]/g, "");
+  const words = fold(teamName).toLowerCase().replace(/[^a-z ]/g, " ").split(/\s+/).filter(Boolean);
+  if (!c || !words.length) return false;
+  if (segmentCode(c, words) > 0) return true;
+  return words.some((w) => w[0] === c[0] && subsequenceOf(c, w));
+}
+
 export function codeAffinity(code, teamName) {
   const c = String(code || "").toLowerCase().replace(/[^a-z]/g, "");
   const words = fold(teamName).toLowerCase().replace(/[^a-z ]/g, " ").split(/\s+/).filter(Boolean);
@@ -449,7 +463,7 @@ function usableWords(teamName) {
   return long.length ? long : all.filter((w) => w.length >= 2);
 }
 
-export async function resolveTicker({ sportKey, teamName, commenceTime }) {
+export async function resolveTicker({ sportKey, teamName, commenceTime, opponentName = null }) {
   if (NON_TEAM_OUTCOMES.has((teamName || "").toLowerCase().trim())) {
     return { ticker: null, code: "draw-or-tie", reason: "draw/tie is not a two-sided market" };
   }
@@ -691,6 +705,71 @@ export async function resolveTicker({ sportKey, teamName, commenceTime }) {
         reason: `"${teamName}" is named on the YES side of ${codesN.length} different ${series} team codes ` +
           `(${codesN.join(", ")}) - refused rather than guessing which side pays out`,
       };
+    }
+
+    // OPPONENT ELIMINATION (2026-09-27). Production 23:48Z refused every
+    // Inter Miami line all afternoon:
+    //
+    //   inter miami cf: no KXMLSGAME ticker on this date carries a team code
+    //   matching "inter miami cf" (codes on the board: TIE, MIA, CLB)
+    //
+    // Inter Miami WAS on the board, as MIA. The only word MIA can come from is
+    // "miami", a place name, and place names never establish identity here -
+    // that rule is what keeps the Yankees/Mets bug dead, and it stays.
+    //
+    // But a game has exactly two sides. When the OPPONENT's code is certain
+    // (Columbus Crew -> CLB), the one other team code in that same game can
+    // only be this team. So, inside ONE Kalshi event:
+    //   - exactly two team codes (TIE / DRAW excluded),
+    //   - the opponent fits exactly one of them strongly (affinity >= 60,
+    //     the first-word rules; place-name-only fits score below 60),
+    //   - the opponent does not fit the other code at all,
+    //   - and this team fits neither code (it cannot - that is why we are here),
+    //   - the event is dated the fixture's own day (no +/-1 day slack here),
+    //   - and the leftover code is still spelled from this team's own name,
+    //     place words included (MIA from "miami"). NYM can never be left over
+    //     for "new york yankees": no M in that name.
+    // Then the other code is this team. It can never pick the opponent: the
+    // opponent's code is exactly the one it excludes. Anything less certain
+    // falls through to the refusal below, unchanged.
+    if (opponentName && !NON_TEAM_OUTCOMES.has(String(opponentName).toLowerCase().trim())) {
+      const NON_TEAM_CODES = new Set(["TIE", "DRAW", "DRW", "TIED"]);
+      const byEvent = new Map();
+      for (const m of dated) {
+        const tcode = tickerTeamCode(m.ticker);
+        if (!tcode || NON_TEAM_CODES.has(tcode.toUpperCase())) continue;
+        const ev = m.event_ticker || String(m.ticker).slice(0, String(m.ticker).lastIndexOf("-"));
+        if (!byEvent.has(ev)) byEvent.set(ev, []);
+        byEvent.get(ev).push({ m, tcode });
+      }
+      const hits = [];
+      for (const [ev, rows] of byEvent) {
+        const codes = [...new Set(rows.map((r) => r.tcode))];
+        if (codes.length !== 2) continue;
+        const opp = codes.map((c) => codeAffinity(c, opponentName));
+        const ours = codes.map((c) => codeAffinity(c, teamName));
+        const strong = [0, 1].filter((i) => opp[i] >= 60);
+        if (strong.length !== 1) continue;
+        const oi = strong[0];
+        if (opp[1 - oi] > 0 || ours.some((a) => a > 0)) continue;
+        const leftover = codes[1 - oi];
+        if (!spelledFromName(leftover, teamName)) continue;
+        const mine = rows.filter((r) => r.tcode === leftover && (wantDay == null || tickerDayNumber(r.m.ticker) === wantDay));
+        if (!mine.length) continue;
+        hits.push({ ev, row: mine.reduce((a, b) => (startGap(b.m) < startGap(a.m) ? b : a)), oppCode: codes[oi], oppAff: opp[oi] });
+      }
+      if (hits.length) {
+        const minGap = Math.min(...hits.map((h) => startGap(h.row.m)));
+        const nearest = hits.filter((h) => startGap(h.row.m) === minGap);
+        if (nearest.length === 1) {
+          const h = nearest[0];
+          return {
+            ticker: h.row.m.ticker, code: "ok",
+            reason: `opponent "${opponentName}" is ${h.oppCode} (affinity ${h.oppAff}) in ${h.ev}, so "${teamName}" is the ` +
+              `other side, ${h.row.tcode} (${h.row.m.status}, opponent elimination)`,
+          };
+        }
+      }
     }
 
     const seen = [...new Set(dated.map((m) => tickerTeamCode(m.ticker)).filter(Boolean))];
