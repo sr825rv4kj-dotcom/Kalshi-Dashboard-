@@ -48,6 +48,10 @@ const REASON_LABEL = {
   "pm-price-failed": "Couldn't read the price",
   "pm-events-failed": "Couldn't read the games list",
   "pm-order-rejected": "Order rejected by Polymarket",
+  "pm-edge-implausible": "Gap to the betting line over 18% - treated as a stale line, skipped",
+  "pm-window": "Outside the entry window",
+  "pm-market-not-open": "Market paused or closed",
+  "pm-leagues-failed": "Couldn't read Polymarket's league list",
 };
 
 function money(n) {
