@@ -29,11 +29,16 @@
  * PREVIEW order (validated by Polymarket, never executed) comes back in the
  * expected form. trading: "auto" trades only once all of that passes.
  *
- * BACKING THE NO SIDE. Polymarket's docs describe the NO-side order price two
- * different ways. Until a live preview shows which one the exchange uses,
- * the engine only buys a team when it is the market's YES side (every soccer
- * team, and one side of every other game). The self-check reads the answer
- * from the preview and turns the NO side on by itself.
+ * BACKING THE NO SIDE - PER POLYMARKET'S OWN DOCS (2026-09-28).
+ * docs.polymarket.us/api-reference/orders/overview: "The price.value field
+ * always represents the long side's price, regardless of which order intent
+ * you use." Their worked example: market aec-cbb-usc-iowa, YES = USC, NO =
+ * Iowa - "Buy Iowa at 0.83" is ORDER_INTENT_BUY_SHORT with price.value 0.17.
+ * The partner data model says the same: "BUY q NO @ p = SELL q YES @ (1 - p)".
+ * So a NO order is sent as BUY_SHORT at (1 - our NO limit). The self-check
+ * sends one PREVIEW in exactly that form (validated, never executed - "Preview
+ * an order before submission to validate parameters") and the NO side turns
+ * on once Polymarket accepts it as a BUY_SHORT.
  *
  * Every failure is contained: nothing here can stop or slow the Kalshi bot.
  */
@@ -56,7 +61,7 @@ import { pmGet, pmPost, pmConfigured, pmClientStats, pmCredentialReport, dollars
 import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues, getLeagueEvents, matchEvent, winnerSideFor, sidePrice, pmMarketsReport } from "./pmMarkets.js";
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, heldOnKalshi, normName } from "./pmState.js";
 
-export const PM_ENGINE_VERSION = "2026-09-28-every-odds-api-sport";
+export const PM_ENGINE_VERSION = "2026-09-28-no-side-per-docs";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -80,9 +85,21 @@ function tradingActive(settings, meta) {
   return meta.selfCheck?.passed === true;
 }
 
+// The documented NO-order format ("long-price") is the only one that turns the
+// NO side on. Anything an older build recorded ("no-price", "unconfirmed",
+// "unknown") is ignored: the new self-check runs on the first cycle after this
+// build starts (its version differs) and records the documented result.
+const DOCUMENTED_SHORT_FORMAT = "long-price";
+
 function shortSideActive(settings, meta) {
   if (settings.shortSide === "off") return false;
-  return meta.selfCheck?.shortConvention === "no-price";
+  return meta.selfCheck?.shortConvention === DOCUMENTED_SHORT_FORMAT && meta.selfCheck?.version === PM_ENGINE_VERSION;
+}
+
+/** The price.value Polymarket expects: always the YES (long) side's price. */
+function longSidePriceCents(long, limitCents) {
+  const limit = Math.floor(limitCents);          // never pay above our limit
+  return long ? limit : 100 - limit;             // BUY NO at L  ==  SELL YES at (100 - L)
 }
 
 const isDraw = (n) => /^(draw|tie)$/i.test(String(n || "").trim());
@@ -202,7 +219,13 @@ export async function runSelfCheck(config = {}) {
       for (const ev of events.filter((e) => !e.ended && !e.closed).slice(0, 25)) {
         for (const t of (ev.teams || []).slice(0, 2)) {
           const r = winnerSideFor(ev, t.name);
-          if (r.ok) { tied++; if (r.long && sampleList.length < 6) sampleList.push({ ev, r }); } else if (r.code !== "pm-no-winner-market") untied++;
+          if (r.ok) {
+            tied++;
+            // Every YES-side winner market seen is a candidate for the price
+            // and NO-preview steps (the NO preview needs a YES bid under 46c,
+            // which roughly half of all games have).
+            if (r.long && !sampleList.some((s) => s.r.slug === r.slug)) sampleList.push({ ev, r, listBid: dollarsOf(r.market?.bestBidQuote) });
+          } else if (r.code !== "pm-no-winner-market") untied++;
         }
       }
       const live = events.find((e) => e.live && !e.ended) || events.find((e) => !e.ended && !e.closed) || events[0];
@@ -220,7 +243,7 @@ export async function runSelfCheck(config = {}) {
   //    The sample is the first listed game whose market is open with a bid.
   let sample = null;
   let px = null;
-  for (const cand of sampleList) {
+  for (const cand of sampleList.slice(0, 12)) {
     try {
       const p = await sidePrice(cand.r.slug, true);
       if (p.open && p.bidCents != null) { sample = cand; px = p; break; }
@@ -241,37 +264,56 @@ export async function runSelfCheck(config = {}) {
       out.previewLongOk = !!o && (echo == null || Math.abs(echo - safeLong) < 0.006) && (!o.side || /BUY/.test(o.side));
       step("preview-buy-yes", out.previewLongOk, `sent BUY YES @ $${safeLong.toFixed(2)} -> ${o.side ?? "?"} @ ${echo ?? "?"}, ${o.state ?? "?"}`);
 
-      // NO side: send a NO price q between the YES bid and 1 - bid, so the
-      // order could not trade under either reading; the echo shows the reading.
-      // Needs a market whose YES bid is under 46c: take the first sampled one.
-      let noSample = bid < 0.46 ? { slug: sample.r.slug, bid } : null;
-      for (const cand of sampleList) {
-        if (noSample) break;
+      // NO side, in the DOCUMENTED format: intent BUY_SHORT, price.value = the
+      // YES (long) price. A preview never executes, and on top of that the
+      // price x is chosen between the YES bid and (1 - YES bid), so it could
+      // not trade even if it did, under either reading of the price:
+      //   documented: SELL YES at x  -> trades only if YES bid >= x   (it is not)
+      //   other:      BUY NO at x    -> trades only if x >= 1 - YES bid (it is not)
+      // That needs a market whose YES bid is under 46c. Candidates whose
+      // listed bid is already under 46c are checked first, up to 16 of them.
+      let noSample = bid < 0.46 && bid > 0.02 ? { slug: sample.r.slug, bid } : null;
+      const pool = [...sampleList].sort((a, b) => {
+        const ka = a.listBid != null && a.listBid < 0.46 && a.listBid > 0.02 ? 0 : 1;
+        const kb = b.listBid != null && b.listBid < 0.46 && b.listBid > 0.02 ? 0 : 1;
+        return ka - kb;
+      });
+      let looked = 0;
+      for (const cand of pool) {
+        if (noSample || looked >= 16) break;
+        if (cand.r.slug === sample.r.slug) continue;
+        looked++;
         try {
           const p2 = await sidePrice(cand.r.slug, true);
-          if (p2.open && p2.bidCents != null && p2.bidCents < 46) noSample = { slug: cand.r.slug, bid: p2.bidCents / 100 };
+          if (p2.open && p2.bidCents != null && p2.bidCents < 46 && p2.bidCents > 2) noSample = { slug: cand.r.slug, bid: p2.bidCents / 100 };
         } catch { /* next */ }
       }
       if (noSample) {
         const nb = noSample.bid;
-        const q = Math.round((nb + 0.25 * (1 - 2 * nb)) * 100) / 100;
-        const ps = await pmPost("/v1/order/preview", previewBody(noSample.slug, "ORDER_INTENT_BUY_SHORT", q), { auth: true });
+        const x = Math.round((nb + 0.25 * (1 - 2 * nb)) * 100) / 100;   // YES-side price sent
+        const ps = await pmPost("/v1/order/preview", previewBody(noSample.slug, "ORDER_INTENT_BUY_SHORT", x), { auth: true });
         const so = ps.order || ps;
         const e = dollarsOf(so.price);
-        // Only an UNAMBIGUOUS answer turns the NO side on. An echo of q marked
-        // SELL could mean either reading, and misreading it would pay up to
-        // 1 - limit for a NO contract - so that case stays off until the raw
-        // preview has been checked by hand.
-        let convention = "unknown";
-        if (e != null && Math.abs(e - (1 - q)) < 0.006 && /SELL/.test(String(so.side || ""))) convention = "no-price";
-        else if (e != null && Math.abs(e - q) < 0.006 && /BUY/.test(String(so.side || ""))) convention = "no-price";
-        else if (e != null && Math.abs(e - q) < 0.006) convention = "unconfirmed";
-        out.previewShort = { market: noSample.slug, yesBid: nb, sentNoPrice: q, side: so.side, intent: so.intent, price: so.price, state: so.state };
-        out.shortConvention = convention;
-        step("preview-buy-no", convention === "no-price", `sent BUY NO @ $${q.toFixed(2)} -> ${so.side ?? "?"} @ ${e ?? "?"}: ${convention === "no-price" ? "confirmed - NO side on" : "format not confirmed - NO side stays off (YES-side bets unaffected)"}`);
+        const intent = String(so.intent || "");
+        const side = String(so.side || "");
+        const rejected = /REJECT/.test(String(so.state || ""));
+        // Accepted as a NO buy: Polymarket echoes intent BUY_SHORT, or the
+        // equivalent YES-terms side (SELL), and does not reject it.
+        const isShort = intent === "ORDER_INTENT_BUY_SHORT" || (!intent && /SELL/.test(side));
+        const priceOk = e != null && (Math.abs(e - x) < 0.006 || Math.abs(e - (1 - x)) < 0.006);
+        const confirmed = !rejected && isShort && priceOk;
+        out.previewShort = {
+          market: noSample.slug, yesBid: nb, sentLongPrice: x, meansNoAtMost: Math.round((1 - x) * 100) / 100,
+          side: so.side, intent: so.intent, price: so.price, state: so.state,
+        };
+        out.shortConvention = confirmed ? DOCUMENTED_SHORT_FORMAT : "not-accepted";
+        step("preview-buy-no", confirmed,
+          `sent BUY_SHORT @ YES price $${x.toFixed(2)} (= NO at most $${(1 - x).toFixed(2)}, the documented format) -> ` +
+          `${so.intent ?? so.side ?? "?"} @ ${e ?? "?"}, ${so.state ?? "?"}: ` +
+          (confirmed ? "accepted - NO side on" : "not accepted as a NO buy - NO side stays off (YES-side bets unaffected)"));
       } else {
-        out.shortConvention = pmMeta().selfCheck?.shortConvention ?? "unknown";
-        step("preview-buy-no", false, "no sampled market has a YES bid under 46c for a safe NO preview - retried next check");
+        out.shortConvention = "no-sample";
+        step("preview-buy-no", false, `none of ${Math.min(16, pool.length)} sampled markets has a YES bid under 46c for a safe NO preview - retried in 10 minutes`);
       }
     } catch (err) {
       out.previewLongOk = out.previewLongOk ?? false;
@@ -368,9 +410,12 @@ function fillFromOrder(o) {
   };
 }
 
-async function placeEntry({ c, limitCents, contracts, convention }) {
-  if (!c.side.long && convention !== "no-price") throw new Error("NO-side order format not confirmed");
-  const priceDollars = limitCents / 100;
+async function placeEntry({ c, limitCents, contracts, convention, seenAskCents }) {
+  if (!c.side.long && convention !== DOCUMENTED_SHORT_FORMAT) throw new Error("NO-side order format not confirmed by the self-check");
+  // price.value is ALWAYS the YES side's price (Polymarket docs). Backing the
+  // NO team at up to L cents is BUY_SHORT at a YES price of (100 - L): it only
+  // trades against YES bids at or above that, i.e. NO at or under L.
+  const priceDollars = longSidePriceCents(c.side.long, limitCents) / 100;
   const body = {
     marketSlug: c.side.slug,
     type: "ORDER_TYPE_LIMIT",
@@ -392,10 +437,24 @@ async function placeEntry({ c, limitCents, contracts, convention }) {
       if (f2.known) fill = f2;
     } catch { /* keep what the create response said */ }
   }
-  // A NO fill may be reported as the YES price it sold at. Read it as the
-  // price that is at or under our NO limit.
+  // A NO fill's price: Polymarket quotes every price on the YES side, so the
+  // NO cost is 100 - reported. If the reported number itself is the only
+  // reading at or under our NO limit, that one is used; if both readings fit,
+  // the one nearest the NO ask we saw a moment ago wins (ties: YES-side, as
+  // documented). Getting this right keeps the ledger's P&L exact.
   let fillCents = fill.avgPx != null ? fill.avgPx * 100 : null;
-  if (!c.side.long && fillCents != null && fillCents > limitCents + 0.5 && 100 - fillCents <= limitCents + 0.5) fillCents = 100 - fillCents;
+  if (!c.side.long && fillCents != null) {
+    const asYesSide = 100 - fillCents;
+    const asNoSide = fillCents;
+    const fits = (v) => v > 0 && v <= Math.floor(limitCents) + 0.5;
+    if (fits(asYesSide) && fits(asNoSide) && Number.isFinite(seenAskCents)) {
+      fillCents = Math.abs(asNoSide - seenAskCents) < Math.abs(asYesSide - seenAskCents) ? asNoSide : asYesSide;
+    } else if (fits(asNoSide) && !fits(asYesSide)) {
+      fillCents = asNoSide;
+    } else {
+      fillCents = asYesSide;
+    }
+  }
   return { orderId: res.id ?? null, filled: fill.shares, fillCents: fillCents != null ? Math.round(fillCents * 10) / 10 : null, feeCents: Math.round(fill.commission * 100), rejected: fill.rejected };
 }
 
@@ -593,7 +652,7 @@ export async function scanPolymarket(config, settings, active) {
         if (isDraw(t.name)) continue;
         const side = winnerSideFor(ev, t.name);
         if (!side.ok) { bump(side.code, side.reason); continue; }
-        if (!side.long && !shortOn) { bump("pm-no-side-not-confirmed", `${t.name}: needs the NO side, which turns on after the self-check confirms its order format`); continue; }
+        if (!side.long && !shortOn) { bump("pm-no-side-not-confirmed", `${t.name}: needs the NO side, which turns on once Polymarket accepts the self-check's NO preview in the documented format`); continue; }
         const opponent = teamNames.find((n) => normName(n) !== normName(t.name)) ?? null;
         const c = { sportKey, teamName: t.name, opponent, commenceTime, timing, prob: t.info.trueProbability, lineAgeSeconds: t.info.lineAgeSeconds ?? null, ev, side };
 
@@ -690,7 +749,7 @@ export async function scanPolymarket(config, settings, active) {
         let result;
         try {
           appendLog(`Polymarket order: BUY ${side.long ? "YES" : "NO"} ${contracts}x ${side.slug} (${t.name}) at up to $${(limit / 100).toFixed(2)} - ${reason}`);
-          result = await placeEntry({ c, limitCents: limit, contracts, convention });
+          result = await placeEntry({ c, limitCents: limit, contracts, convention, seenAskCents: px.askCents });
         } catch (err) {
           bump("pm-order-error", `${side.slug}: ${err.message}`);
           const fails = (pmMeta().consecutiveOrderFailures || 0) + 1;
@@ -758,6 +817,7 @@ export async function scanPolymarket(config, settings, active) {
 // --- The cycle ------------------------------------------------------------------------------
 
 let cycleRunning = false;
+let lastSelfCheckTry = 0;
 
 /** Called after every Kalshi cycle. Never throws. */
 export async function runPolymarketCycle(config) {
@@ -770,8 +830,18 @@ export async function runPolymarketCycle(config) {
 
     const meta = pmMeta();
     const last = meta.selfCheck?.at ? Date.parse(meta.selfCheck.at) : 0;
-    const due = !last || Date.now() - last > (meta.selfCheck?.passed ? SELF_CHECK_EVERY_MS : SELF_CHECK_RETRY_MS);
-    if (due) { try { await runSelfCheck(config); } catch (err) { appendLog(`Polymarket self-check error: ${err.message}`, "warn"); } }
+    // Due: never run, run by an older build (so a new build re-checks at once),
+    // failed (every 5 min), passed without the NO side yet (every 10 min), or
+    // fully passed (every 30 min).
+    const sc = meta.selfCheck;
+    const every = !sc?.passed ? SELF_CHECK_RETRY_MS
+      : sc.shortConvention !== DOCUMENTED_SHORT_FORMAT ? 2 * SELF_CHECK_RETRY_MS
+      : SELF_CHECK_EVERY_MS;
+    const due = (!last || sc?.version !== PM_ENGINE_VERSION || Date.now() - last > every) && Date.now() - lastSelfCheckTry > 60 * 1000;
+    if (due) {
+      lastSelfCheckTry = Date.now();
+      try { await runSelfCheck(config); } catch (err) { appendLog(`Polymarket self-check error: ${err.message}`, "warn"); }
+    }
 
     try {
       const { settled } = await reconcilePolymarket();
