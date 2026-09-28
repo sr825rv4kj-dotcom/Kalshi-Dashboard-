@@ -43,7 +43,9 @@ import { recordTrade } from "../tradeLedgerStore.js";
 import { entryTiming, getRecentLines, rememberLines } from "../scanner.js";
 import { getSharpProbabilities } from "../scraper.js";
 import { getLiveScores, findLiveGameForTeam } from "../scoresFetcher.js";
-import { corroboratedProbability, fractionRemaining, paramsFor, pregamePrior } from "../liveModel.js";
+import { corroboratedProbability, fractionRemaining, paramsFor, pregamePrior, rememberPregame, flushPregamePriors } from "../liveModel.js";
+import { allActiveSportKeys } from "../sportsDiscovery.js";
+import { getSeriesMap } from "../tickerResolver.js";
 import { assessOpportunity, feePerContractCents, flatBetContracts } from "../riskManager.js";
 import { learnedBlock, streakStakeFactor } from "../outcomeLearner.js";
 import { tieredStake } from "../scaling.js";
@@ -54,7 +56,7 @@ import { pmGet, pmPost, pmConfigured, pmClientStats, pmCredentialReport, dollars
 import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues, getLeagueEvents, matchEvent, winnerSideFor, sidePrice, pmMarketsReport } from "./pmMarkets.js";
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, heldOnKalshi, normName } from "./pmState.js";
 
-export const PM_ENGINE_VERSION = "2026-09-28-verified-leagues";
+export const PM_ENGINE_VERSION = "2026-09-28-every-odds-api-sport";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -67,7 +69,6 @@ export function pmSettings(config = {}) {
     enabled: true,
     trading: "auto",        // "auto" | "on" | "off"
     shortSide: "auto",      // "auto" | "on" | "off"
-    maxOpenPositions: 3,
     ...(config.polymarket && typeof config.polymarket === "object" ? config.polymarket : {}),
   };
 }
@@ -400,22 +401,117 @@ async function placeEntry({ c, limitCents, contracts, convention }) {
 
 // --- The scan ----------------------------------------------------------------------------
 
+/*
+ * EVERY ODDS-FEED SPORT POLYMARKET LISTS (2026-09-28, evening).
+ *
+ * Polymarket used to price only the sports the Kalshi scan had just read, so
+ * a sport Kalshi does not list (Austrian Bundesliga, Chile, League Two,
+ * Greece, Ireland, Superettan, Veikkausliiga...) was never looked at on
+ * Polymarket even when Polymarket listed its games.
+ *
+ * Now the engine takes every sport the odds feed reports ACTIVE, keeps those
+ * with a Polymarket league, and:
+ *   - reuses the Kalshi scan's lines when they are under 2 minutes old
+ *     (no second odds call), otherwise
+ *   - fetches the lines itself: every 60 seconds while that sport has a game
+ *     in play, every 10 minutes when it only has upcoming games, every 30
+ *     minutes when it has nothing from 12h back to 24h ahead. Each fetch is
+ *     one odds call (2 credits): 12 credits an hour for an idle league, 4 for
+ *     an empty one, 120 while a game is live.
+ * Upcoming lines are recorded as pre-game priors, so live games in these
+ * sports get the same in-game check as everything else.
+ */
+const pmLineCache = new Map();          // sportKey -> { at, entry, hasLive }
+let activeCache = { at: 0, keys: [] };
+const LIVE_REFRESH_MS = 60 * 1000;
+const IDLE_REFRESH_MS = 10 * 60 * 1000;
+const EMPTY_REFRESH_MS = 30 * 60 * 1000;
+const WINDOW_BACK_MS = 12 * 60 * 60 * 1000;   // same rolling window as the Kalshi scan
+const WINDOW_AHEAD_MS = 24 * 60 * 60 * 1000;
+
+async function activeOddsSports() {
+  if (Date.now() - activeCache.at < 10 * 60 * 1000 && activeCache.keys.length) return activeCache.keys;
+  const keys = await allActiveSportKeys();
+  if (keys.length) activeCache = { at: Date.now(), keys };
+  return keys.length ? keys : activeCache.keys;
+}
+
 async function linesForCycle(config) {
-  const recent = getRecentLines(30 * 60 * 1000);
   const out = new Map();
-  for (const [sportKey, entry] of recent) {
-    if (Date.now() - entry.at <= LINE_MAX_AGE_MS) { out.set(sportKey, entry); continue; }
-    // Kalshi did not scan this sport this cycle (at its cap, or parked). Only
-    // refetch for sports Polymarket actually lists, so no credit is wasted.
+  for (const [sportKey, entry] of getRecentLines(LINE_MAX_AGE_MS)) out.set(sportKey, entry);
+
+  const off = new Set(Array.isArray(config.disabledSports) ? config.disabledSports : []);
+  let active = [];
+  try { active = await activeOddsSports(); } catch { active = []; }
+  const now = Date.now();
+  let priorsSeen = false;
+  // Kalshi's "parked" flag is NOT used here: Kalshi parks a sport when KALSHI's
+  // board is empty, and Polymarket can still list those games. Polymarket goes
+  // by its own read of the odds feed instead - a sport whose last read had no
+  // game from 12h back to 24h ahead is re-read every 30 minutes, not skipped.
+  for (const sportKey of active) {
+    if (out.has(sportKey) || off.has(sportKey)) continue;
+    let slugs = [];
+    try { slugs = await leagueSlugsFor(sportKey); } catch { continue; }
+    if (!slugs.length) continue;
+    const cached = pmLineCache.get(sportKey);
+    const every = cached?.hasLive ? LIVE_REFRESH_MS : cached?.hasGames === false ? EMPTY_REFRESH_MS : IDLE_REFRESH_MS;
+    if (cached && now - cached.at < every) { out.set(sportKey, cached.entry); continue; }
     try {
-      if (!(await leagueSlugFor(sportKey))) continue;
       const tournamentId = (config.oddsPapiTournamentIds || {})[sportKey];
       const r = await getSharpProbabilities(sportKey, { oddsPapiTournamentId: tournamentId, providerOrder: config.oddsProviderOrder });
-      rememberLines(sportKey, r);
-      out.set(sportKey, { at: Date.now(), probabilities: r.probabilities || {}, provider: r.provider });
+      const probabilities = r.probabilities || {};
+      let hasLive = false;
+      let hasGames = false;
+      for (const [teamName, info] of Object.entries(probabilities)) {
+        const start = Date.parse(info.commenceTime);
+        if (!Number.isFinite(start)) continue;
+        if (start >= now - WINDOW_BACK_MS && start <= now + WINDOW_AHEAD_MS) hasGames = true;
+        if (start <= now) hasLive = true;
+        else { rememberPregame({ sportKey, teamName, commenceTime: info.commenceTime, probability: info.trueProbability }); priorsSeen = true; }
+      }
+      const entry = { at: now, probabilities, provider: r.provider, source: "polymarket" };
+      pmLineCache.set(sportKey, { at: now, entry, hasLive, hasGames });
+      out.set(sportKey, entry);
     } catch { /* this sport sits out one cycle */ }
   }
+  if (priorsSeen) flushPregamePriors();
   return out;
+}
+
+/**
+ * COVERAGE, sport by sport: for every sport the odds feed reports active,
+ * whether Kalshi lists it (and is scanning it) and whether Polymarket does.
+ * Rebuilt at most every 10 minutes; shown on the dashboard and the monitor.
+ */
+export async function buildCoverage(config) {
+  const active = await activeOddsSports();
+  let health = {};
+  try { health = loadState().sportHealth || {}; } catch { health = {}; }
+  const series = getSeriesMap() || {};
+  const off = new Set(Array.isArray(config.disabledSports) ? config.disabledSports : []);
+  const now = Date.now();
+  const rows = [];
+  for (const sportKey of active) {
+    const slugs = await leagueSlugsFor(sportKey).catch(() => []);
+    const h = health[sportKey];
+    rows.push({
+      sportKey,
+      kalshi: off.has(sportKey) ? "switched off" : !series[sportKey] ? "not listed on Kalshi"
+        : h && h.parkedUntil > now ? `parked (no games) until ${new Date(h.parkedUntil).toISOString().slice(11, 16)}Z` : `scanning (${series[sportKey]})`,
+      polymarket: off.has(sportKey) ? "switched off" : slugs.length ? `scanning (${slugs.join("+")})` : "not listed on Polymarket",
+    });
+  }
+  rows.sort((a, b) => a.sportKey.localeCompare(b.sportKey));
+  const count = (f) => rows.filter(f).length;
+  return {
+    at: new Date().toISOString(),
+    activeSports: rows.length,
+    kalshiScanning: count((r) => r.kalshi.startsWith("scanning")),
+    polymarketScanning: count((r) => r.polymarket.startsWith("scanning")),
+    either: count((r) => r.kalshi.startsWith("scanning") || r.polymarket.startsWith("scanning")),
+    rows,
+  };
 }
 
 export async function scanPolymarket(config, settings, active) {
@@ -458,6 +554,9 @@ export async function scanPolymarket(config, settings, active) {
   try { resting = Object.values(getRestingOrders()); } catch { resting = []; }
 
   const lines = await linesForCycle(config);
+  if (!meta.coverage?.at || Date.now() - Date.parse(meta.coverage.at) > 10 * 60 * 1000) {
+    try { updatePmMeta({ coverage: await buildCoverage(config) }); } catch { /* shown next time */ }
+  }
   for (const [sportKey, entry] of lines) {
     let slugs = [];
     try { slugs = await leagueSlugsFor(sportKey); } catch (err) { bump("pm-leagues-failed", err.message); break; }
@@ -583,7 +682,10 @@ export async function scanPolymarket(config, settings, active) {
         if (!active) { bump("pm-would-trade", reason); continue; }
         if (halted) { bump("pm-halted", t.name); continue; }
         if (paused) continue;
-        if (pmPositions().length >= Number(settings.maxOpenPositions ?? 3)) { bump("pm-at-cap", `${pmPositions().length} open`); continue; }
+        // NO LIMIT ON OPEN BETS (2026-09-28, account holder's call) - the same as
+        // Kalshi. What limits it is the cash on the account: every order is
+        // sized to the stake and capped by buying power above, and one bet per
+        // game across both exchanges still applies.
 
         let result;
         try {
@@ -693,7 +795,7 @@ export async function runPolymarketCycle(config) {
 // --- Status ---------------------------------------------------------------------------------
 
 export function pmStatus(config = {}) {
-  const settings = pmSettings(config);
+  const { maxOpenPositions: _ignored, ...settings } = pmSettings(config);
   const meta = pmMeta();
   const sc = meta.selfCheck || null;
   return {
@@ -713,6 +815,7 @@ export function pmStatus(config = {}) {
       valueDollars: p.cashValue ?? null,
     })),
     lastScan: meta.lastScan ?? null,
+    coverage: meta.coverage ?? null,
     haltedForDay: meta.haltedForDay === true,
     pausedUntil: meta.pausedUntil && Date.parse(meta.pausedUntil) > Date.now() ? meta.pausedUntil : null,
   };
