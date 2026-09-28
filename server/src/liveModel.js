@@ -170,7 +170,7 @@ export function liveWinProbability({ sportKey, pregameProbability, lead, fracRem
  * behaviour, which is stricter, never looser.
  */
 
-export const LIVE_MODEL_VERSION = "2026-09-27-pregame-prior";
+export const LIVE_MODEL_VERSION = "2026-09-27-pregame-prior-start-tolerant";
 
 const priors = new Map();     // key -> { p, commenceTime, at }
 let priorsLoaded = false;
@@ -204,11 +204,48 @@ export function rememberPregame({ sportKey, teamName, commenceTime, probability 
   priors.set(k, { p, commenceTime, at: new Date().toISOString() });
 }
 
-/** The closing pre-game probability for this team, or null if it was never seen before kickoff. */
-export function pregamePrior({ sportKey, teamName, commenceTime }) {
+/**
+ * START TIMES MOVE (2026-09-27). Production 23:48Z vetoed both sides of
+ * Washington-Atlanta (WNBA) on the old, stricter check:
+ *
+ *   atlanta dream: sharp line 51% vs in-game model 35% (32-36, 74% left,
+ *   pre-game 51% from live line (no pre-game line seen))
+ *
+ * The prior was looked up by an exact start time. By that log line the game
+ * was 39 minutes old - a 23:09Z start, not a scheduled :00 or :30 - so the
+ * feed's start time for a game in play is not necessarily the one it showed
+ * before tip-off, and an exact key misses. The lookup now also accepts the
+ * same team in the same sport starting within 3 hours of the stored start
+ * (nearest wins). A team cannot play two games of one sport 3 hours apart.
+ *
+ * pregamePriorDetail says which path matched, so the log and the monitor show
+ * exactly why a live game did or did not get its pre-game line.
+ */
+const PRIOR_START_TOLERANCE_MS = 3 * 60 * 60 * 1000;
+
+export function pregamePriorDetail({ sportKey, teamName, commenceTime }) {
   loadPriors();
-  const v = priors.get(priorKey(sportKey, teamName, commenceTime));
-  return v ? Number(v.p) : null;
+  const exact = priors.get(priorKey(sportKey, teamName, commenceTime));
+  if (exact) return { p: Number(exact.p), match: "exact", shiftMinutes: 0, teamPriors: 1 };
+  const want = Date.parse(commenceTime);
+  const prefix = `${sportKey}|${String(teamName || "").toLowerCase()}|`;
+  let best = null;
+  let teamPriors = 0;
+  for (const [k, v] of priors) {
+    if (!k.startsWith(prefix)) continue;
+    teamPriors++;
+    const at = Date.parse(v.commenceTime);
+    if (!Number.isFinite(at) || !Number.isFinite(want)) continue;
+    const gap = Math.abs(at - want);
+    if (gap <= PRIOR_START_TOLERANCE_MS && (!best || gap < best.gap)) best = { v, gap, at };
+  }
+  if (best) return { p: Number(best.v.p), match: "start-moved", shiftMinutes: Math.round((want - best.at) / 60000), teamPriors };
+  return { p: null, match: "none", shiftMinutes: null, teamPriors };
+}
+
+/** The closing pre-game probability for this team, or null if it was never seen before kickoff. */
+export function pregamePrior(args) {
+  return pregamePriorDetail(args).p;
 }
 
 /** Write remembered priors to state (at most once per scan, only when something moved). */
