@@ -5,7 +5,7 @@ import { kalshiGet } from "../kalshiClient.js";
 import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker } from "../botController.js";
 import { loadConfig, saveConfig, setEnvironment } from "../configStore.js";
 import { loadState, getRecentLog } from "../stateStore.js";
-import { getRecentTrades, getTradeStats, getTradeLifecycles, loadLedger } from "../tradeLedgerStore.js";
+import { getRecentTrades, getTradeStats, getTradeLifecycles, loadLedger, filterByVenue, venueOf } from "../tradeLedgerStore.js";
 import { clvReport, backfillFromLedger, clearKill } from "../clvTracker.js";
 import { fairValueReport } from "../fairValue.js";
 import { buildStrategyReview } from "../strategyReview.js";
@@ -126,7 +126,12 @@ export function registerBotRoutes(app) {
    */
   app.get("/api/trade-lifecycles", async (req, res) => {
     try {
-      const { completed, open } = getTradeLifecycles();
+      // ?venue=kalshi | polymarket | all (default all) - the dashboard's
+      // account switcher. Each trade also carries its venue.
+      const venue = String(req.query.venue || "all");
+      const lc = getTradeLifecycles();
+      const completed = filterByVenue(lc.completed, venue).map((t) => ({ ...t, venue: venueOf(t.ticker) }));
+      const open = filterByVenue(lc.open, venue).map((t) => ({ ...t, venue: venueOf(t.ticker) }));
 
       if (req.query.withScores === "true" && completed.length) {
         const sportKeys = [...new Set(completed.map((t) => t.sportKey).filter(Boolean))];
@@ -145,7 +150,7 @@ export function registerBotRoutes(app) {
         }
       }
 
-      res.json({ completed, open, stats: getTradeStats() });
+      res.json({ completed, open, venue, stats: getTradeStats(venue) });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
