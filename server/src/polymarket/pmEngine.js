@@ -51,10 +51,10 @@ import { getRestingOrders } from "../makerEngine.js";
 import { notifyEntry } from "../notifier.js";
 import { getTelegramCredentials } from "../telegramStore.js";
 import { pmGet, pmPost, pmConfigured, pmClientStats, pmCredentialReport, dollarsOf, centsOf, numberOf, PM_CLIENT_VERSION } from "./pmClient.js";
-import { leagueSlugFor, getLeagues, getLeagueEvents, matchEvent, winnerSideFor, sidePrice, pmMarketsReport } from "./pmMarkets.js";
+import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues, getLeagueEvents, matchEvent, winnerSideFor, sidePrice, pmMarketsReport } from "./pmMarkets.js";
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, heldOnKalshi, normName } from "./pmState.js";
 
-export const PM_ENGINE_VERSION = "2026-09-27-polymarket-engine";
+export const PM_ENGINE_VERSION = "2026-09-28-verified-leagues";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -125,9 +125,15 @@ function trimEvent(ev) {
       slug: m.slug, title: m.title, question: m.question, sportsMarketType: m.sportsMarketType,
       sportsMarketTypeV2: m.sportsMarketTypeV2, active: m.active, closed: m.closed, line: m.line,
       bestBidQuote: m.bestBidQuote, bestAskQuote: m.bestAskQuote, minimumTradeQty: m.minimumTradeQty,
-      marketSides: m.marketSides,
+      marketSides: (m.marketSides || []).map((sd) => ({
+        description: sd.description, long: sd.long, teamId: sd.teamId, team: sd.team?.name ?? null, price: sd.price, tradable: sd.tradable,
+      })),
     } : null,
     marketTypes: [...new Set((ev.markets || []).map((x) => x.sportsMarketType))],
+    // Every winner market (soccer has one per outcome), slimmed.
+    winnerMarkets: (ev.markets || []).filter((x) => /MONEYLINE|DRAWABLE|WINNER/i.test(JSON.stringify([x.sportsMarketType, x.sportsMarketTypeV2])))
+      .map((x) => ({ slug: x.slug, type: x.sportsMarketType, typeV2: x.sportsMarketTypeV2, title: x.title,
+        sides: (x.marketSides || []).map((sd) => `${sd.long ? "YES" : "NO"}=${sd.team?.name ?? sd.description}(${sd.teamId ?? "-"})`) })),
   };
 }
 
@@ -175,14 +181,22 @@ export async function runSelfCheck(config = {}) {
   try {
     const leagues = await getLeagues();
     out.leagues = leagues.map((l) => ({ slug: l.slug, name: l.name, abbreviation: l.abbreviation, operational: l.isOperational }));
-    const sportKeys = ["americanfootball_nfl", "baseball_mlb", "americanfootball_ncaaf", "basketball_wnba", "icehockey_nhl", "basketball_nba", "soccer_epl", "soccer_usa_mls"];
     out.mapped = {};
-    for (const k of sportKeys) out.mapped[k] = await leagueSlugFor(k);
-    step("leagues", leagues.length > 0, `${leagues.length} leagues; mapped: ${Object.entries(out.mapped).map(([k, v]) => `${k.split("_").pop()}=${v ?? "none"}`).join(", ")}`);
+    const notListed = [];
+    for (const [k, want] of Object.entries(mappedSports())) {
+      const have = await leagueSlugsFor(k);
+      out.mapped[k] = have.length ? have.join("+") : null;
+      if (have.length !== want.length) notListed.push(`${k}(${want.filter((w) => !have.includes(w)).join(",")})`);
+    }
+    const listed = Object.values(out.mapped).filter(Boolean).length;
+    step("leagues", leagues.length > 0 && !notListed.length,
+      `${leagues.length} Polymarket leagues; ${listed} of ${Object.keys(out.mapped).length} mapped sports found by exact slug` +
+      (notListed.length ? `; MISSING: ${notListed.join(", ")}` : ""));
 
     let tied = 0, untied = 0;
     const samples = [];
-    for (const slug of [...new Set(Object.values(out.mapped).filter(Boolean))].slice(0, 4)) {
+    const sampleSlugs = ["nfl", "mls", "mlb", "wnba", "epl", "nhl", "cfb", "nba"].filter((sl) => Object.values(out.mapped).some((v) => v && v.split("+").includes(sl)));
+    for (const slug of sampleSlugs.slice(0, 4)) {
       const events = await getLeagueEvents(slug);
       for (const ev of events.filter((e) => !e.ended && !e.closed).slice(0, 25)) {
         for (const t of (ev.teams || []).slice(0, 2)) {
@@ -190,7 +204,8 @@ export async function runSelfCheck(config = {}) {
           if (r.ok) { tied++; if (r.long && sampleList.length < 6) sampleList.push({ ev, r }); } else if (r.code !== "pm-no-winner-market") untied++;
         }
       }
-      if (samples.length < 2 && events[0]) samples.push({ league: slug, events: events.length, first: trimEvent(events[0]) });
+      const live = events.find((e) => e.live && !e.ended) || events.find((e) => !e.ended && !e.closed) || events[0];
+      if (live) samples.push({ league: slug, events: events.length, first: trimEvent(live) });
     }
     out.sampleEvents = samples;
     out.sideMapping = { tied, untied };
@@ -227,9 +242,19 @@ export async function runSelfCheck(config = {}) {
 
       // NO side: send a NO price q between the YES bid and 1 - bid, so the
       // order could not trade under either reading; the echo shows the reading.
-      if (bid < 0.46) {
-        const q = Math.round((bid + 0.25 * (1 - 2 * bid)) * 100) / 100;
-        const ps = await pmPost("/v1/order/preview", previewBody(sample.r.slug, "ORDER_INTENT_BUY_SHORT", q), { auth: true });
+      // Needs a market whose YES bid is under 46c: take the first sampled one.
+      let noSample = bid < 0.46 ? { slug: sample.r.slug, bid } : null;
+      for (const cand of sampleList) {
+        if (noSample) break;
+        try {
+          const p2 = await sidePrice(cand.r.slug, true);
+          if (p2.open && p2.bidCents != null && p2.bidCents < 46) noSample = { slug: cand.r.slug, bid: p2.bidCents / 100 };
+        } catch { /* next */ }
+      }
+      if (noSample) {
+        const nb = noSample.bid;
+        const q = Math.round((nb + 0.25 * (1 - 2 * nb)) * 100) / 100;
+        const ps = await pmPost("/v1/order/preview", previewBody(noSample.slug, "ORDER_INTENT_BUY_SHORT", q), { auth: true });
         const so = ps.order || ps;
         const e = dollarsOf(so.price);
         // Only an UNAMBIGUOUS answer turns the NO side on. An echo of q marked
@@ -240,12 +265,12 @@ export async function runSelfCheck(config = {}) {
         if (e != null && Math.abs(e - (1 - q)) < 0.006 && /SELL/.test(String(so.side || ""))) convention = "no-price";
         else if (e != null && Math.abs(e - q) < 0.006 && /BUY/.test(String(so.side || ""))) convention = "no-price";
         else if (e != null && Math.abs(e - q) < 0.006) convention = "unconfirmed";
-        out.previewShort = { sentNoPrice: q, side: so.side, price: so.price, state: so.state, raw: so };
+        out.previewShort = { market: noSample.slug, yesBid: nb, sentNoPrice: q, side: so.side, intent: so.intent, price: so.price, state: so.state };
         out.shortConvention = convention;
         step("preview-buy-no", convention === "no-price", `sent BUY NO @ $${q.toFixed(2)} -> ${so.side ?? "?"} @ ${e ?? "?"}: ${convention === "no-price" ? "confirmed - NO side on" : "format not confirmed - NO side stays off (YES-side bets unaffected)"}`);
       } else {
         out.shortConvention = pmMeta().selfCheck?.shortConvention ?? "unknown";
-        step("preview-buy-no", false, "sample market's YES bid too high for a safe NO preview - retried next check");
+        step("preview-buy-no", false, "no sampled market has a YES bid under 46c for a safe NO preview - retried next check");
       }
     } catch (err) {
       out.previewLongOk = out.previewLongOk ?? false;
@@ -434,9 +459,10 @@ export async function scanPolymarket(config, settings, active) {
 
   const lines = await linesForCycle(config);
   for (const [sportKey, entry] of lines) {
-    let slug = null;
-    try { slug = await leagueSlugFor(sportKey); } catch (err) { bump("pm-leagues-failed", err.message); break; }
-    if (!slug) { bump("pm-league-not-listed", sportKey); continue; }
+    let slugs = [];
+    try { slugs = await leagueSlugsFor(sportKey); } catch (err) { bump("pm-leagues-failed", err.message); break; }
+    if (!slugs.length) { bump("pm-league-not-listed", sportKey); continue; }
+    const slug = slugs.join("+");
 
     // Group the odds feed's teams into games.
     const games = new Map();
@@ -460,7 +486,7 @@ export async function scanPolymarket(config, settings, active) {
       if (heldOnKalshi({ sportKey, commenceTime, teamNames, restingOrders: resting })) { bump("pm-held-on-kalshi", teamNames.join(" vs ")); continue; }
       if (heldOnPolymarket({ sportKey, commenceTime, teamNames })) { bump("pm-already-held", teamNames.join(" vs ")); continue; }
 
-      try { events ??= await getLeagueEvents(slug); } catch (err) { bump("pm-events-failed", err.message); break; }
+      try { events ??= await getSportEvents(sportKey); } catch (err) { bump("pm-events-failed", err.message); break; }
       const ev = matchEvent(events, teamNames, commenceTime);
       if (!ev || ev.ambiguous) { bump(ev?.ambiguous ? "pm-game-ambiguous" : "pm-game-not-listed", `${teamNames.join(" vs ")} (${slug})`); continue; }
 
