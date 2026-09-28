@@ -41,18 +41,74 @@ const stats = { requests: 0, errors: 0, rateLimited: 0, lastError: null, lastOkA
 
 // --- Credentials -------------------------------------------------------------
 
-function envValue(name) {
-  const direct = process.env[name];
-  if (direct) return String(direct).trim().replace(/^["']|["']$/g, "");
-  // A phone-edited Railway variable can pick up stray spaces in its NAME.
-  const key = Object.keys(process.env).find((k) => k.replace(/\s+/g, "").toUpperCase() === name);
-  return key ? String(process.env[key]).trim().replace(/^["']|["']$/g, "") : "";
+/*
+ * KEYS ARE FOUND BY WHAT THEY ARE, NOT ONLY BY THEIR NAME (2026-09-27).
+ *
+ * The first Railway setup named the Key ID "POLYMARKET_API_KEY", which the
+ * server did not read - so the bot never contacted Polymarket and nothing said
+ * why. Now every variable whose name starts with POLYMARKET is examined:
+ *
+ *   - a value shaped like a UUID (8-4-4-4-12 hex) is the Key ID
+ *   - a value that decodes from base64 to 32 or 64 bytes is the Secret Key
+ *
+ * The standard names POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY (also what the
+ * dashboard's key form saves) win when present. Which variable supplied each
+ * key is reported by NAME ONLY on the dashboard and the monitor - a value is
+ * never logged, returned or shown.
+ */
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function clean(v) {
+  return String(v ?? "").trim().replace(/^["']|["']$/g, "").trim();
+}
+
+function secretByteLength(v) {
+  const s = String(v || "").replace(/\s+/g, "");
+  if (!s || !/^[A-Za-z0-9+/=_-]+$/.test(s)) return 0;
+  try { return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64").length; } catch { return 0; }
+}
+
+/** Every POLYMARKET* variable: its normalised name and its raw value (never exported). */
+function polymarketVars() {
+  return Object.keys(process.env)
+    .map((k) => ({ raw: k, name: k.replace(/\s+/g, "").toUpperCase() }))
+    .filter((k) => k.name.startsWith("POLYMARKET"))
+    .map((k) => ({ name: k.name, value: clean(process.env[k.raw]) }))
+    .filter((k) => k.value);
+}
+
+function resolveCredentials() {
+  const vars = polymarketVars();
+  const byName = (n) => vars.find((v) => v.name === n);
+  let keyVar = byName("POLYMARKET_KEY_ID");
+  if (!keyVar || !UUID_RE.test(keyVar.value)) keyVar = vars.find((v) => UUID_RE.test(v.value)) || keyVar || null;
+  const validSecret = (v) => v && v !== keyVar && [32, 64].includes(secretByteLength(v.value));
+  let secretVar = byName("POLYMARKET_SECRET_KEY");
+  if (!validSecret(secretVar)) secretVar = vars.find(validSecret) || secretVar || null;
+  return { vars, keyVar, secretVar };
 }
 
 export function pmCredentials() {
+  const { keyVar, secretVar } = resolveCredentials();
   return {
-    keyId: envValue("POLYMARKET_KEY_ID"),
-    secretKey: envValue("POLYMARKET_SECRET_KEY").replace(/\s+/g, ""),
+    keyId: keyVar ? keyVar.value : "",
+    secretKey: secretVar ? secretVar.value.replace(/\s+/g, "") : "",
+  };
+}
+
+/** Names only - what the server found, and what it took each one to be. */
+export function pmCredentialReport() {
+  const { vars, keyVar, secretVar } = resolveCredentials();
+  return {
+    keyIdFrom: keyVar ? keyVar.name : null,
+    secretFrom: secretVar ? secretVar.name : null,
+    variablesSeen: vars.map((v) => ({
+      name: v.name,
+      looksLike: UUID_RE.test(v.value) ? "Key ID"
+        : [32, 64].includes(secretByteLength(v.value)) ? "Secret Key"
+        : `not a Polymarket key (${v.value.length} characters)`,
+    })),
   };
 }
 
