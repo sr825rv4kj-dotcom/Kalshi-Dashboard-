@@ -59,8 +59,10 @@ const stats = { requests: 0, errors: 0, rateLimited: 0, lastError: null, lastOkA
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Neither a Key ID nor a Secret Key ever contains a space or line break, so
+// all of them are removed - a key pasted on a phone often picks one up.
 function clean(v) {
-  return String(v ?? "").trim().replace(/^["']|["']$/g, "").trim();
+  return String(v ?? "").replace(/\s+/g, "").replace(/^["']+|["']+$/g, "");
 }
 
 function secretByteLength(v) {
