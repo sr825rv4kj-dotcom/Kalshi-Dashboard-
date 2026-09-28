@@ -15,6 +15,7 @@ function money(n) {
 
 /** Opponent code from the ticker: KX...-26SEP19MONTORST-MONT -> ORST */
 function opponentFrom(ticker) {
+  if (String(ticker || "").startsWith("PM:")) return null;   // Polymarket slug, not a Kalshi ticker
   const parts = String(ticker || "").split("-");
   const side = parts[2] || "";
   const middle = (parts[1] || "").replace(/^\d{2}[A-Z]{3}\d{2}(\d{4})?/, "");
@@ -34,7 +35,7 @@ export default function PnlChart({ series }) {
         value: Number(s.cumulativePnl),
         change: Number(s.pnl),
         label: `${name}${opp ? ` vs ${opp}` : ""}`,
-        sub: s.exit ? String(s.exit).replace(/-/g, " ") : s.ticker,
+        sub: `${String(s.ticker || "").startsWith("PM:") ? "Polymarket · " : ""}${s.exit ? String(s.exit).replace(/-/g, " ") : s.ticker}`,
         date: s.date,
       };
     }), [series]);
