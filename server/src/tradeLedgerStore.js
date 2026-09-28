@@ -173,8 +173,24 @@ export function getTradeLifecycles() {
   return { completed: completed.reverse(), open: open.reverse() };
 }
 
-export function getTradeStats() {
-  const { completed, open } = getTradeLifecycles();
+/**
+ * WHICH EXCHANGE A TRADE WAS ON (2026-09-27). Polymarket trades are recorded
+ * with a "PM:" ticker; everything else is Kalshi. venue: "kalshi" |
+ * "polymarket" | "all".
+ */
+export function venueOf(ticker) {
+  return String(ticker || "").startsWith("PM:") ? "polymarket" : "kalshi";
+}
+
+export function filterByVenue(list, venue = "all") {
+  if (!venue || venue === "all" || venue === "combined") return list || [];
+  return (list || []).filter((t) => venueOf(t.ticker) === venue);
+}
+
+export function getTradeStats(venue = "all") {
+  const all = getTradeLifecycles();
+  const completed = filterByVenue(all.completed, venue);
+  const open = filterByVenue(all.open, venue);
   const wins = completed.filter((t) => t.netDollars > 0).length;
   const losses = completed.filter((t) => t.netDollars < 0).length;
   const totalNet = completed.reduce((sum, t) => sum + t.netDollars, 0);
