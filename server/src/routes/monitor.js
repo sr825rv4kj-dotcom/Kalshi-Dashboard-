@@ -36,7 +36,8 @@ import { lastDiscovery } from "../seriesDiscovery.js";
 import { getSeriesMap, RESOLVER_VERSION } from "../tickerResolver.js";
 import { SCANNER_VERSION } from "../scanner.js";
 import { EXECUTOR_VERSION } from "../executor.js";
-import { describeCadence } from "../cadence.js";
+import { scheduleReport, describeScheduleCadence, LIVE_SCHEDULE_VERSION } from "../liveSchedule.js";
+import { kalshiOpenTradeCap, CONTROLLER_VERSION } from "../botController.js";
 import { diagnose, startHealthAlerts, HEALTH_VERSION } from "../healthReport.js";
 import { getRestingOrders, MAKER_VERSION } from "../makerEngine.js";
 import { learnerReport } from "../outcomeLearner.js";
@@ -184,9 +185,21 @@ export function registerMonitorRoutes(app) {
       scaling: SCALING_VERSION,
       liveModel: LIVE_MODEL_VERSION,
       polymarket: PM_ENGINE_VERSION,
+      schedule: LIVE_SCHEDULE_VERSION,
+      controller: CONTROLLER_VERSION,
       pregamePriorsRemembered: pregamePriorCount(),
-      cadence: describeCadence(),
+      cadence: describeScheduleCadence(),
     }));
+
+    // THE LIVE SCHEDULE: what is live now, what starts next, and which sports
+    // are being scanned because of it (liveSchedule.js).
+    section("schedule", () => {
+      const r = scheduleReport();
+      return { ...r, upcoming: (r.upcoming || []).slice(0, 25) };
+    });
+
+    // Open-trade cap by balance (5-10), Kalshi. Polymarket's is in its lastScan.
+    section("openTradeCap", () => ({ kalshi: kalshiOpenTradeCap(loadConfig()) }));
 
     section("bot", () => {
       const st = loadState();
