@@ -21,6 +21,7 @@ import StrategyReviewPanel from "./components/StrategyReviewPanel.jsx";
 import CoveragePanel from "./components/CoveragePanel.jsx";
 import PolymarketPanel from "./components/PolymarketPanel.jsx";
 import LiveSchedulePanel from "./components/LiveSchedulePanel.jsx";
+import ScannerPanel from "./components/ScannerPanel.jsx";
 import VenueTabs, { readVenue, saveVenue, venueLabel } from "./components/VenueTabs.jsx";
 import { applyWallpaper, readLocal, defaultSettings } from "./wallpapers.js";
 
@@ -181,6 +182,7 @@ function DashboardApp() {
       </div>
 
       <BotControlPanel apiBase={API_BASE} />
+      <ScannerPanel apiBase={API_BASE} />
       <LiveSchedulePanel apiBase={API_BASE} />
       <PolymarketPanel apiBase={API_BASE} />
       <CoveragePanel apiBase={API_BASE} />
