@@ -88,10 +88,11 @@ import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame, normName } from "./polymarket/pmState.js";
+import { noteDecision, noteScan } from "./scanFeed.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-28-same-trades-both";
+export const SCANNER_VERSION = "2026-09-28-scanner-tab";
 
 /**
  * SHARED LINES (2026-09-27). Every sharp line this scan reads is kept for the
@@ -349,6 +350,19 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     tally[code] = (tally[code] || 0) + 1;
     if (example && !samples[code]) samples[code] = String(example).slice(0, 220);
   };
+  // SCANNER TAB (scanFeed.js): the latest verdict per team, in plain words.
+  // (gameTeams is filled in below, before the first decision is recorded.)
+  const opponentOf = (teamName) => {
+    try {
+      for (const names of gameTeams.values()) {
+        if (names.includes(teamName)) return names.find((n) => n !== teamName && !/^(draw|tie)$/i.test(String(n).trim())) ?? null;
+      }
+    } catch { /* not built yet */ }
+    return null;
+  };
+  const feed = (teamName, code, why, extra = {}) =>
+    noteDecision("kalshi", { sportKey, team: teamName, verdict: "skipped", code, why, ...extra, opponent: extra.opponent ?? opponentOf(teamName) });
+  noteScan("kalshi");
   const rejected = [];
 
   let probResult;
@@ -394,6 +408,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
 
   const prepared = await Promise.all(teamEntries.map(async ([teamName, info]) => {
     const { trueProbability, commenceTime } = info;
+    const opponentForFeed = (gameTeams.get(info.eventId || commenceTime) || [])
+      .find((n) => n !== teamName && !/^(draw|tie)$/i.test(String(n).trim())) ?? null;
+    const feedHere = (code, why, extra = {}) =>
+      feed(teamName, code, why, { opponent: opponentForFeed, commenceTime, fairPct: trueProbability * 100, ...extra });
 
     const timing = entryTiming(commenceTime, {
       entryWindowHours: config.entryWindowHours ?? 0,
@@ -402,6 +420,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
 
     if (timing.live && !allowLive) {
       drops.live++;
+      feedHere("live-trading-off", "Live trading is switched off in Bot Settings");
       if (!sampleReason) sampleReason = `${teamName}: live trading switched off in config`;
       return null;
     }
@@ -419,6 +438,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     const pmTeam = polymarketTeamOnGame({ sportKey, commenceTime, teamNames: gameTeams.get(info.eventId || commenceTime) || [teamName] });
     if (pmTeam && pmTeam !== normName(teamName)) {
       drops.duplicate++;
+      feedHere("opposite-of-polymarket", `Polymarket holds ${pmTeam} in this game - only the same team is bought on Kalshi`);
       if (!sampleReason) sampleReason = `${teamName}: Polymarket holds ${pmTeam} in this game - only the same team is bought on Kalshi`;
       return null;
     }
@@ -436,6 +456,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         // none-tradeable" is three fixable things.
         drops.unresolved++;
         bump(`unresolved:${resolved.code || "unknown"}`, `${teamName}: ${resolved.reason}`);
+        feedHere(`unresolved:${resolved.code || "unknown"}`, `No Kalshi market found for this game: ${resolved.reason}`);
         if (!sampleReason) sampleReason = `${teamName}: ${resolved.reason}`;
         return null;
       }
@@ -449,7 +470,11 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     let addOn = null;
     if (openEvents.has(eventKeyOf(ticker))) {
       const elig = timing.live ? addOnEligible(ticker, config) : { ok: false };
-      if (!elig.ok) { drops.duplicate++; return null; }
+      if (!elig.ok) {
+        drops.duplicate++;
+        feedHere("already-held", "Already holding this game on Kalshi (one bet per game)", { market: ticker });
+        return null;
+      }
       addOn = elig.held;
     }
 
@@ -461,6 +486,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         const label = status || "missing";
         statusCounts[label] = (statusCounts[label] || 0) + 1;
         drops.closed++;
+        feedHere("market-closed", `Kalshi market is not open for trading (status "${status || "missing"}")`, { market: ticker });
         if (!sampleReason) sampleReason = `${teamName}: status "${status || "missing"}"`;
         return null;
       }
@@ -473,6 +499,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       };
     } catch (err) {
       drops.error++;
+      feedHere("fetch-error", `Couldn't read the Kalshi market: ${err.message}`, { market: ticker });
       if (!sampleReason) sampleReason = `${teamName}: ${err.message}`;
       return null;
     }
@@ -491,7 +518,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         `${sportKey}: ${livePending.length} in-play market(s) skipped - no in-game model exists for this sport, ` +
         `so a stale line could not be detected.`, "warn"
       );
-      for (const c of viable) if (c.timing.live && !c.addOn) bump("no-model-for-sport");
+      for (const c of viable) if (c.timing.live && !c.addOn) {
+        bump("no-model-for-sport");
+        feed(c.teamName, "no-model-for-sport", "No in-game model for this sport, so a stale line can't be detected", { opponent: null, commenceTime: c.commenceTime, market: c.ticker, priceCents: c.pricing?.askCents, fairPct: c.trueProbability * 100 });
+      }
       viable = viable.filter((c) => !c.timing.live);
     } else {
       let events = [];
@@ -506,7 +536,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
 
       if (scoresError && !events.length) {
         appendLog(`${sportKey}: live scores unavailable (${scoresError}) - in-play markets skipped this cycle.`, "warn");
-        for (const c of viable) if (c.timing.live && !c.addOn) bump("live-scores-unavailable");
+        for (const c of viable) if (c.timing.live && !c.addOn) {
+          bump("live-scores-unavailable");
+          feed(c.teamName, "live-scores-unavailable", `Live scores unavailable this cycle (${scoresError})`, { opponent: null, commenceTime: c.commenceTime, market: c.ticker, priceCents: c.pricing?.askCents, fairPct: c.trueProbability * 100 });
+        }
         viable = viable.filter((c) => !c.timing.live);
       } else {
         const vetoed = [];
@@ -520,6 +553,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           if (!game) {
             vetoed.push(`${c.teamName}: in play but no live score found - cannot check the line against the game`);
             bump("no-live-score-match", `${c.teamName}: in play, no live score row matched this team`);
+            feed(c.teamName, "no-live-score-match", "In play, but no live score was found for this team", { opponent: null, commenceTime: c.commenceTime, market: c.ticker, priceCents: c.pricing?.askCents, fairPct: c.trueProbability * 100 });
             return false;
           }
 
@@ -537,6 +571,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           if (!corr.usable) {
             vetoed.push(`${c.teamName}: in play, could not model the game state`);
             bump("unmodellable", `${c.teamName}: in play, the game state could not be modelled`);
+            feed(c.teamName, "unmodellable", "In play, but the game state could not be modelled", { opponent: null, commenceTime: c.commenceTime, market: c.ticker, priceCents: c.pricing?.askCents, fairPct: c.trueProbability * 100 });
             return false;
           }
 
@@ -564,6 +599,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
               `${corr.disagreementPoints.toFixed(0)}pt gap exceeds ${maxDisagree}, line is stale`
             );
             bump("model-disagrees", vetoed[vetoed.length - 1]);
+            feed(c.teamName, "model-disagrees", vetoed[vetoed.length - 1], { opponent: null, commenceTime: c.commenceTime, market: c.ticker, priceCents: c.pricing?.askCents, fairPct: c.trueProbability * 100 });
             return false;
           }
 
@@ -656,7 +692,13 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // An add-on is re-checked here: a fill earlier in this scan may have
     // doubled the game already.
     if (c.addOn ? !addOnEligible(c.ticker, config).ok : openEvents.has(eventKeyOf(c.ticker))) continue;
-    const ddBump = (code, example) => bump(c.addOn ? `double-down:${code}` : code, example);
+    const feedC = (code, why, verdict = "skipped") => {
+      if (!c.addOn) feed(c.teamName, code, why, { verdict, commenceTime: c.commenceTime, market: c.ticker, priceCents: c.pricing?.askCents, fairPct: c.trueProbability * 100 });
+    };
+    const ddBump = (code, example) => {
+      bump(c.addOn ? `double-down:${code}` : code, example);
+      feedC(code, example, code === "no-fill" ? "tried" : "skipped");
+    };
 
     const askCents = c.pricing.askCents;
     if (askCents <= 0 || askCents >= 100) {
@@ -848,6 +890,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // book, taking would risk holding this game twice - wait one cycle.
     if (bidOnGame || cancelPendingOnEvent(c.ticker)) {
       rejected.push(`${c.ticker}: taker entry waits one cycle for a resting bid on this game to clear`);
+      feedC("waiting-for-bid-cancel", "Clearing a resting bid on this game first - buys next cycle if the edge holds");
       continue;
     }
 
@@ -897,10 +940,15 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       // One rejected order must not cost the remaining candidates their turn.
       bump("order-error");   // a real failure - never hidden under the double-down label
       rejected.push(`${c.ticker}: order failed - ${err.message}`);
+      feedC("order-error", `Order failed: ${err.message}`, "tried");
       continue;
     }
 
     if (result && result.filled > 0) {
+      feedC("bought",
+        `${c.addOn ? "Double-down: " : ""}bought ${result.filled} contract(s), limit ${assessment.limitCents}c against a fair value of ` +
+        `${(c.trueProbability * 100).toFixed(1)}%${c.liveContext ? ` | ${c.liveContext}` : ""}`, "bought");
+      if (c.addOn) noteDecision("kalshi", { sportKey, team: c.teamName, verdict: "bought", code: "double-down", commenceTime: c.commenceTime, market: c.ticker, priceCents: askCents, fairPct: c.trueProbability * 100, why: `Double-down: added ${result.filled} contract(s)` });
       openEvents.add(eventKeyOf(c.ticker));
       heldEvents.add(eventKeyOf(c.ticker));
       entered += 1;
