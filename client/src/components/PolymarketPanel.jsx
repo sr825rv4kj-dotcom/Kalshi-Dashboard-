@@ -22,6 +22,8 @@ const STEP_LABEL = {
 const REASON_LABEL = {
   "pm-pregame": "Game not started (live only)",
   "pm-held-on-kalshi": "Already bet on Kalshi",
+  "pm-opposite-of-kalshi": "Other team of a game Kalshi holds - same team only",
+  "pm-at-cap": "At the open-trade cap (5-10 by balance)",
   "pm-already-held": "Already held here",
   "pm-game-not-listed": "Game not listed on Polymarket",
   "pm-league-not-listed": "League not on Polymarket",
