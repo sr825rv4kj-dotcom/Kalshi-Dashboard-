@@ -50,6 +50,7 @@ import { getSharpProbabilities } from "../scraper.js";
 import { getLiveScores, findLiveGameForTeam } from "../scoresFetcher.js";
 import { corroboratedProbability, fractionRemaining, paramsFor, pregamePrior, rememberPregame, flushPregamePriors } from "../liveModel.js";
 import { allActiveSportKeys } from "../sportsDiscovery.js";
+import { schedulePlan, shouldScanSport, openTradeCap } from "../liveSchedule.js";
 import { getSeriesMap } from "../tickerResolver.js";
 import { assessOpportunity, feePerContractCents, flatBetContracts } from "../riskManager.js";
 import { learnedBlock, streakStakeFactor } from "../outcomeLearner.js";
@@ -61,7 +62,7 @@ import { pmGet, pmPost, pmConfigured, pmClientStats, pmCredentialReport, dollars
 import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues, getLeagueEvents, matchEvent, winnerSideFor, sidePrice, pmMarketsReport } from "./pmMarkets.js";
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, heldOnKalshi, normName } from "./pmState.js";
 
-export const PM_ENGINE_VERSION = "2026-09-28-no-side-per-docs";
+export const PM_ENGINE_VERSION = "2026-09-28-live-schedule";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -90,10 +91,18 @@ function tradingActive(settings, meta) {
 // "unknown") is ignored: the new self-check runs on the first cycle after this
 // build starts (its version differs) and records the documented result.
 const DOCUMENTED_SHORT_FORMAT = "long-price";
+// Builds whose self-check sends the NO preview in the documented format. A
+// confirmation from any of them stands: the order format does not change
+// between builds, so a new build does not switch the NO side off.
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", PM_ENGINE_VERSION]);
+
+function shortConfirmed(sc) {
+  return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
+}
 
 function shortSideActive(settings, meta) {
   if (settings.shortSide === "off") return false;
-  return meta.selfCheck?.shortConvention === DOCUMENTED_SHORT_FORMAT && meta.selfCheck?.version === PM_ENGINE_VERSION;
+  return shortConfirmed(meta.selfCheck);
 }
 
 /** The price.value Polymarket expects: always the YES (long) side's price. */
@@ -307,17 +316,41 @@ export async function runSelfCheck(config = {}) {
           side: so.side, intent: so.intent, price: so.price, state: so.state,
         };
         out.shortConvention = confirmed ? DOCUMENTED_SHORT_FORMAT : "not-accepted";
+        if (confirmed) out.shortConfirmedAt = out.at;
         step("preview-buy-no", confirmed,
           `sent BUY_SHORT @ YES price $${x.toFixed(2)} (= NO at most $${(1 - x).toFixed(2)}, the documented format) -> ` +
           `${so.intent ?? so.side ?? "?"} @ ${e ?? "?"}, ${so.state ?? "?"}: ` +
           (confirmed ? "accepted - NO side on" : "not accepted as a NO buy - NO side stays off (YES-side bets unaffected)"));
       } else {
-        out.shortConvention = "no-sample";
-        step("preview-buy-no", false, `none of ${Math.min(16, pool.length)} sampled markets has a YES bid under 46c for a safe NO preview - retried in 10 minutes`);
+        // No market cheap enough for a safe preview right now. A confirmation
+        // already on record stands (Polymarket accepted the documented format
+        // once; the format does not change) - only a REJECTED preview turns
+        // the NO side off.
+        const prev = pmMeta().selfCheck;
+        if (shortConfirmed(prev)) {
+          out.shortConvention = DOCUMENTED_SHORT_FORMAT;
+          out.previewShort = prev.previewShort ?? null;
+          out.shortConfirmedAt = prev.shortConfirmedAt ?? prev.at;
+          step("preview-buy-no", true, `no market under 46c for a new preview right now - Polymarket's acceptance from ${out.shortConfirmedAt} stands, NO side stays on`);
+        } else {
+          out.shortConvention = "no-sample";
+          step("preview-buy-no", false, `none of ${Math.min(16, pool.length)} sampled markets has a YES bid under 46c for a safe NO preview - retried in 10 minutes`);
+        }
       }
     } catch (err) {
       out.previewLongOk = out.previewLongOk ?? false;
       step("preview", false, err.message);
+    }
+  }
+
+  // The preview steps could not run this time (no open sample, or an error
+  // before them): a NO-side confirmation already on record stands.
+  if (out.shortConvention == null) {
+    const prev = pmMeta().selfCheck;
+    if (shortConfirmed(prev)) {
+      out.shortConvention = DOCUMENTED_SHORT_FORMAT;
+      out.previewShort = prev.previewShort ?? null;
+      out.shortConfirmedAt = prev.shortConfirmedAt ?? prev.at;
     }
   }
 
@@ -479,9 +512,17 @@ async function placeEntry({ c, limitCents, contracts, convention, seenAskCents }
  *     an empty one, 120 while a game is live.
  * Upcoming lines are recorded as pre-game priors, so live games in these
  * sports get the same in-game check as everything else.
+ *
+ * LIVE SCHEDULE (2026-09-28, liveSchedule.js). When the schedule is built,
+ * it decides instead: a sport with a game LIVE is read every 20 seconds (every
+ * cycle); a sport with a game starting within 30 minutes is read every 5
+ * minutes, so the last pre-game line is on record at kickoff; any other sport
+ * is not read at all (0 credits). Without a schedule, the rules above apply.
  */
 const pmLineCache = new Map();          // sportKey -> { at, entry, hasLive }
 let activeCache = { at: 0, keys: [] };
+const SCHEDULE_LIVE_REFRESH_MS = 20 * 1000;
+const SCHEDULE_SOON_REFRESH_MS = 5 * 60 * 1000;
 const LIVE_REFRESH_MS = 60 * 1000;
 const IDLE_REFRESH_MS = 10 * 60 * 1000;
 const EMPTY_REFRESH_MS = 30 * 60 * 1000;
@@ -504,17 +545,22 @@ async function linesForCycle(config) {
   try { active = await activeOddsSports(); } catch { active = []; }
   const now = Date.now();
   let priorsSeen = false;
+  const plan = schedulePlan(now);
   // Kalshi's "parked" flag is NOT used here: Kalshi parks a sport when KALSHI's
   // board is empty, and Polymarket can still list those games. Polymarket goes
-  // by its own read of the odds feed instead - a sport whose last read had no
-  // game from 12h back to 24h ahead is re-read every 30 minutes, not skipped.
+  // by the live schedule, or - without one - by its own read of the odds feed
+  // (a sport whose last read had no game from 12h back to 24h ahead is
+  // re-read every 30 minutes, not skipped).
   for (const sportKey of active) {
     if (out.has(sportKey) || off.has(sportKey)) continue;
+    if (!shouldScanSport(sportKey, plan)) continue;          // nothing live or within 30 minutes
     let slugs = [];
     try { slugs = await leagueSlugsFor(sportKey); } catch { continue; }
     if (!slugs.length) continue;
     const cached = pmLineCache.get(sportKey);
-    const every = cached?.hasLive ? LIVE_REFRESH_MS : cached?.hasGames === false ? EMPTY_REFRESH_MS : IDLE_REFRESH_MS;
+    const every = plan.ready
+      ? (plan.live.has(sportKey) || plan.failed.includes(sportKey) || !plan.known.has(sportKey) ? SCHEDULE_LIVE_REFRESH_MS : SCHEDULE_SOON_REFRESH_MS)
+      : cached?.hasLive ? LIVE_REFRESH_MS : cached?.hasGames === false ? EMPTY_REFRESH_MS : IDLE_REFRESH_MS;
     if (cached && now - cached.at < every) { out.set(sportKey, cached.entry); continue; }
     try {
       const tournamentId = (config.oddsPapiTournamentIds || {})[sportKey];
@@ -540,7 +586,9 @@ async function linesForCycle(config) {
 
 /**
  * COVERAGE, sport by sport: for every sport the odds feed reports active,
- * whether Kalshi lists it (and is scanning it) and whether Polymarket does.
+ * whether Kalshi lists it, whether Polymarket does, and - from the live
+ * schedule - whether it is being scanned right now (a game live or starting
+ * within 30 minutes) or when its next game starts.
  * Rebuilt at most every 10 minutes; shown on the dashboard and the monitor.
  */
 export async function buildCoverage(config) {
@@ -550,25 +598,42 @@ export async function buildCoverage(config) {
   const series = getSeriesMap() || {};
   const off = new Set(Array.isArray(config.disabledSports) ? config.disabledSports : []);
   const now = Date.now();
+  const plan = schedulePlan(now);
+  const when = (sportKey) => {
+    if (!plan.ready) return null;
+    const liveN = plan.live.get(sportKey)?.length || 0;
+    if (liveN) return `${liveN} live - scanning`;
+    if (plan.soon.has(sportKey)) return "starting within 30 min - scanning";
+    if (plan.failed.includes(sportKey) || !plan.known.has(sportKey)) return "scanning (no calendar for it)";
+    return "no game live - waits for the schedule";
+  };
   const rows = [];
   for (const sportKey of active) {
     const slugs = await leagueSlugsFor(sportKey).catch(() => []);
     const h = health[sportKey];
+    const w = when(sportKey);
     rows.push({
       sportKey,
       kalshi: off.has(sportKey) ? "switched off" : !series[sportKey] ? "not listed on Kalshi"
+        : w ? `${series[sportKey]}: ${w}`
         : h && h.parkedUntil > now ? `parked (no games) until ${new Date(h.parkedUntil).toISOString().slice(11, 16)}Z` : `scanning (${series[sportKey]})`,
-      polymarket: off.has(sportKey) ? "switched off" : slugs.length ? `scanning (${slugs.join("+")})` : "not listed on Polymarket",
+      polymarket: off.has(sportKey) ? "switched off" : !slugs.length ? "not listed on Polymarket"
+        : w ? `${slugs.join("+")}: ${w}` : `scanning (${slugs.join("+")})`,
     });
   }
   rows.sort((a, b) => a.sportKey.localeCompare(b.sportKey));
   const count = (f) => rows.filter(f).length;
+  // "Covered" = the exchange lists the sport and it is not switched off: it is
+  // scanned whenever the schedule has one of its games live or about to start.
+  const covered = (v) => !/^(not listed|switched off)/.test(v);
   return {
     at: new Date().toISOString(),
     activeSports: rows.length,
-    kalshiScanning: count((r) => r.kalshi.startsWith("scanning")),
-    polymarketScanning: count((r) => r.polymarket.startsWith("scanning")),
-    either: count((r) => r.kalshi.startsWith("scanning") || r.polymarket.startsWith("scanning")),
+    kalshiScanning: count((r) => covered(r.kalshi)),
+    polymarketScanning: count((r) => covered(r.polymarket)),
+    either: count((r) => covered(r.kalshi) || covered(r.polymarket)),
+    liveNowSports: plan.ready ? plan.live.size : null,
+    schedule: plan.ready ? "live schedule" : `no schedule (${plan.reason})`,
     rows,
   };
 }
@@ -607,6 +672,9 @@ export async function scanPolymarket(config, settings, active) {
   const stakeDecision = tieredStake(config, equity);
   const brake = streakStakeFactor(config);
   const stake = Number(stakeDecision.stake) * brake.factor;
+  // OPEN-TRADE CAP BY BALANCE (2026-09-28): the same rule as Kalshi, read from
+  // the POLYMARKET account - stakes that fit in 75% of its equity, 5 to 10.
+  const openCap = openTradeCap({ equity, stake: Number(stakeDecision.stake) || Number(config.flatStakeDollars) || 5 });
   const shortOn = shortSideActive(settings, meta);
   const convention = meta.selfCheck?.shortConvention;
   let resting = [];
@@ -741,10 +809,14 @@ export async function scanPolymarket(config, settings, active) {
         if (!active) { bump("pm-would-trade", reason); continue; }
         if (halted) { bump("pm-halted", t.name); continue; }
         if (paused) continue;
-        // NO LIMIT ON OPEN BETS (2026-09-28, account holder's call) - the same as
-        // Kalshi. What limits it is the cash on the account: every order is
-        // sized to the stake and capped by buying power above, and one bet per
-        // game across both exchanges still applies.
+        // OPEN-TRADE CAP BY BALANCE (2026-09-28, account holder's rule): 5 to 10
+        // open bets depending on the Polymarket balance - see openCap above.
+        // One bet per game across both exchanges still applies.
+        const openNow = pmPositions().length;
+        if (openNow >= openCap) {
+          bump("pm-at-cap", `${openNow} open of ${openCap} allowed at $${equity.toFixed(2)} equity - waiting for a game to settle`);
+          continue;
+        }
 
         let result;
         try {
@@ -796,7 +868,7 @@ export async function scanPolymarket(config, settings, active) {
     }
   }
 
-  const lastScan = { at: new Date().toISOString(), active, seen, entered, reasons: tally, samples, stake: stakeDecision.stake * brake.factor, equity: Math.round(equity * 100) / 100 };
+  const lastScan = { at: new Date().toISOString(), active, seen, entered, reasons: tally, samples, stake: stakeDecision.stake * brake.factor, equity: Math.round(equity * 100) / 100, openCap, open: pmPositions().length };
   updatePmMeta({ lastScan, lastAccount: account ? { cash: account.cash, buyingPower: account.buyingPower, equity: lastScan.equity, at: lastScan.at } : pmMeta().lastAccount });
   // Logged when something changed, a trade went in, or every 10 minutes -
   // not every 20-second cycle, which would push useful lines out of the log.
