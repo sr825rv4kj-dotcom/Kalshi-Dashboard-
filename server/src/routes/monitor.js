@@ -38,6 +38,7 @@ import { SCANNER_VERSION } from "../scanner.js";
 import { EXECUTOR_VERSION } from "../executor.js";
 import { scheduleReport, describeScheduleCadence, LIVE_SCHEDULE_VERSION } from "../liveSchedule.js";
 import { kalshiOpenTradeCap, CONTROLLER_VERSION } from "../botController.js";
+import { scanFeedMonitor, SCAN_FEED_VERSION } from "../scanFeed.js";
 import { diagnose, startHealthAlerts, HEALTH_VERSION } from "../healthReport.js";
 import { getRestingOrders, MAKER_VERSION } from "../makerEngine.js";
 import { learnerReport } from "../outcomeLearner.js";
@@ -197,6 +198,10 @@ export function registerMonitorRoutes(app) {
       const r = scheduleReport();
       return { ...r, upcoming: (r.upcoming || []).slice(0, 25) };
     });
+
+    // THE SCANNER TAB: every team each exchange priced in the last 15 minutes,
+    // with the verdict in plain words (scanFeed.js).
+    section("scanner", () => ({ version: SCAN_FEED_VERSION, ...scanFeedMonitor() }));
 
     // Open-trade cap by balance (5-10), Kalshi. Polymarket's is in its lastScan.
     section("openTradeCap", () => ({ kalshi: kalshiOpenTradeCap(loadConfig()) }));
