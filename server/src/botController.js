@@ -7,8 +7,13 @@ import { loadState, saveState, appendLog } from "./stateStore.js";
 import { loadConfig } from "./configStore.js";
 import { discoverActiveSports, allActiveSportKeys } from "./sportsDiscovery.js";
 import { discoverSeriesMap } from "./seriesDiscovery.js";
-import { setSeriesMap } from "./tickerResolver.js";
-import { currentCadenceSeconds, describeCadence } from "./cadence.js";
+import { setSeriesMap, getSeriesMap } from "./tickerResolver.js";
+import { describeCadence } from "./cadence.js";
+import { tieredStake } from "./scaling.js";
+import {
+  startScheduleLoop, stopScheduleLoop, schedulePlan, shouldScanSport, cycleSeconds,
+  logIdleOnce, openTradeCap, MIN_OPEN_TRADES, LIVE_SCHEDULE_VERSION,
+} from "./liveSchedule.js";
 import { scanSport } from "./scanner.js";
 import { notifyMilestone, notifyDailyHalt, notifyDailySummary } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
@@ -26,7 +31,7 @@ const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-09-24-fair-value-clv";
+export const CONTROLLER_VERSION = "2026-09-28-live-schedule";
 
 /**
  * 2026-09-24 - four changes in this file:
@@ -86,6 +91,10 @@ let consecutiveFailures = 0;
 let breakerOpenedAt = null;
 let breakerTrips = 0;
 let lastCapLogAt = 0;
+// Kalshi equity (cash + open positions at market) from the latest cycle - the
+// open-trade cap reads it. Null until the first balance read.
+let lastEquity = null;
+let lastCash = null;
 
 /**
  * How long the breaker stays shut before it will try again, doubling on each
@@ -187,16 +196,34 @@ async function checkDailySummary(config, currentBalance) {
   saveState(state);
 }
 
-/** The position cap in force at this bankroll (survival mode or milestone tier). */
-function positionCapFor(config, bankroll) {
+/**
+ * OPEN-TRADE CAP BY BALANCE (2026-09-28, account holder's rule: 5-10 open
+ * trades depending on the portfolio). As many stakes as fit in 75% of Kalshi
+ * equity (cash + open positions at market), never fewer than 5, never more
+ * than 10 - liveSchedule.js openTradeCap. At $70 with $5 stakes that is 10.
+ *
+ *   - maxConcurrentPositions set to a POSITIVE number by hand still wins.
+ *   - 0 or empty means "no fixed cap" - the balance rule applies. (0 never
+ *     blocked a trade: every check below reads a 0 cap as "no cap".)
+ *   - Survival mode (balance under its threshold) keeps its earned slots, but
+ *     never below the 5-trade floor and never above the balance rule.
+ */
+function positionCapFor(config, bankroll, equity = lastEquity ?? bankroll) {
+  const fixed = Number(config.maxConcurrentPositions);
+  if (Number.isFinite(fixed) && fixed > 0) return fixed;
+  const stake = tieredStake(config, equity).stake ?? (Number(config.flatStakeDollars) || 5);
+  const byBalance = openTradeCap({ equity, stake });
   const sm = config.survivalMode;
-  const inSurvival = sm && bankroll < sm.balanceThreshold;
-  const tier = tierFor(bankroll, config);
-  // In survival mode, open slots are EARNED: 3 until the last 20 closed trades
-  // are net profitable, then 5, then the full cap once the last 40 are.
-  return inSurvival
-    ? earnedPositionCap(sm.maxConcurrentPositions, config)
-    : (config.maxConcurrentPositions ?? tier.maxConcurrentPositions);
+  if (sm && bankroll < sm.balanceThreshold) {
+    return Math.max(MIN_OPEN_TRADES, Math.min(byBalance, earnedPositionCap(sm.maxConcurrentPositions, config)));
+  }
+  return byBalance;
+}
+
+/** For the monitor and dashboard: the Kalshi cap in force right now. */
+export function kalshiOpenTradeCap(config = loadConfig()) {
+  const equity = lastEquity;
+  return { cap: equity != null ? positionCapFor(config, lastCash ?? equity, equity) : null, equity, open: loadState().positions.length };
 }
 
 function atConcurrentPositionCap(config, bankroll) {
@@ -968,6 +995,8 @@ export async function runCycle() {
     const tickerMap = loadTickerMap();
     const balanceData = await kalshiGet(`${V2}/portfolio/balance`);
     const bankroll = (balanceData.balance ?? 0) / 100;
+    lastEquity = ((balanceData.balance ?? 0) + (balanceData.portfolio_value ?? 0)) / 100;
+    lastCash = bankroll;
     await checkMilestones(config, bankroll);
     await checkDailySummary(config, bankroll);
 
@@ -996,7 +1025,7 @@ export async function runCycle() {
       const now = Date.now();
       if (now - lastCapLogAt > 10 * 60 * 1000) {
         lastCapLogAt = now;
-        appendLog(`At the concurrent position cap with ${loadState().positions.length} open - waiting for games to settle.`);
+        appendLog(`At the open-trade cap: ${loadState().positions.length} open of ${positionCapFor(config, bankroll)} allowed at $${(lastEquity ?? bankroll).toFixed(2)} equity - waiting for games to settle.`);
       }
       // Not scanning - but held games still need a fresh fair value for exits.
       await refreshHeldFairValues(config);
@@ -1007,8 +1036,9 @@ export async function runCycle() {
     // Six hardcoded sports were the real reason the bot sat idle on a board of
     // 86 live markets; this asks Kalshi what it actually lists. Cached 6h, so
     // this is one extra call a few times a day.
+    let candidates = [];
     try {
-      const candidates = await allActiveSportKeys();
+      candidates = await allActiveSportKeys();
       if (candidates.length) {
         setSeriesMap(await discoverSeriesMap(kalshiGet, candidates));
       }
@@ -1016,7 +1046,23 @@ export async function runCycle() {
       appendLog(`Series discovery skipped this cycle (${err.message}).`, "warn");
     }
 
-    const activeSports = await discoverActiveSports();
+    // LIVE SCHEDULE (liveSchedule.js): scan only the sports with a game live
+    // or starting within 30 minutes. The schedule replaces parking - a sport
+    // is scanned the moment its game is due, whatever happened earlier. With
+    // no trustworthy schedule, the previous discovery (with parking) is used.
+    const plan = schedulePlan();
+    let activeSports;
+    if (plan.ready && candidates.length) {
+      const seriesMap = getSeriesMap() || {};
+      activeSports = candidates.filter((k) => seriesMap[k] && shouldScanSport(k, plan));
+      if (!activeSports.length) {
+        logIdleOnce(plan);
+        await refreshHeldFairValues(config);
+        return;
+      }
+    } else {
+      activeSports = await discoverActiveSports();
+    }
     if (!activeSports.length) {
       appendLog("No active sports returned by the odds provider.", "warn");
       return;
@@ -1179,7 +1225,7 @@ function scheduleNextCycle() {
     } finally {
       if (intervalHandle) scheduleNextCycle();
     }
-  }, currentCadenceSeconds() * 1000);
+  }, cycleSeconds() * 1000);
 }
 
 export function startBot() {
@@ -1189,9 +1235,12 @@ export function startBot() {
   consecutiveFailures = 0;
   breakerOpenedAt = null;
   breakerTrips = 0;
+  // The live schedule rebuilds itself every 10 minutes from the odds feed's
+  // free events list; the first build starts now and takes a few seconds.
+  startScheduleLoop(loadConfig);
   const { seconds, phase } = describeCadence();
   appendLog(
-    `Bot started (${config.environment}). Scanning every ${seconds}s (${phase}). ` +
+    `Bot started (${config.environment}). Live schedule ${LIVE_SCHEDULE_VERSION} loading - until it is built, scanning every ${seconds}s (${phase}). ` +
     `Live and pre-game entries, ${config.minEntryPriceCents}-${config.maxEntryPriceCents}c band, ` +
     `fair-value exit ${fairValueMode(config)}, CLV kill switch ${config.clvKillSwitch === false ? "off" : "on"}.`
   );
@@ -1219,6 +1268,7 @@ export function stopBot() {
     clearTimeout(intervalHandle);
     intervalHandle = null;
   }
+  stopScheduleLoop();
   if (positionMonitorHandle) {
     clearInterval(positionMonitorHandle);
     positionMonitorHandle = null;
