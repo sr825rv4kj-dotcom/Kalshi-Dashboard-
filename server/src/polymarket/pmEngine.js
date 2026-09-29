@@ -17,11 +17,12 @@
  *     shared trade ledger, so both exchanges learn from all results
  *   - held to settlement, like Kalshi
  *
- * ONE BET PER GAME ACROSS BOTH EXCHANGES. A game held on Kalshi is not bought
- * on Polymarket and vice versa - two bets on one game is double the risk,
- * not double the edge. Kalshi scans first each cycle; Polymarket then takes
- * the games whose Kalshi price did not clear the bar but whose Polymarket
- * price does.
+ * SAME TRADES ON BOTH EXCHANGES (2026-09-28, account holder's rule - replaces
+ * "one bet per game across both exchanges", which gave every game to Kalshi
+ * because Kalshi scans first). A game held on Kalshi may also be bought here,
+ * on the SAME team, when Polymarket's own price clears the same rules; the
+ * other team is never bought. One bet per game still applies on each
+ * exchange by itself.
  *
  * SWITCHED ON BY A LIVE SELF-CHECK, NOT BY GUESSWORK. Before the first order,
  * the engine checks the real API: the keys sign correctly and read the
@@ -60,9 +61,9 @@ import { notifyEntry } from "../notifier.js";
 import { getTelegramCredentials } from "../telegramStore.js";
 import { pmGet, pmPost, pmConfigured, pmClientStats, pmCredentialReport, dollarsOf, centsOf, numberOf, PM_CLIENT_VERSION } from "./pmClient.js";
 import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues, getLeagueEvents, matchEvent, winnerSideFor, sidePrice, pmMarketsReport } from "./pmMarkets.js";
-import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, heldOnKalshi, normName } from "./pmState.js";
+import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, kalshiTeamOnGame, normName } from "./pmState.js";
 
-export const PM_ENGINE_VERSION = "2026-09-28-live-schedule";
+export const PM_ENGINE_VERSION = "2026-09-28-same-trades-both";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -94,7 +95,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -709,8 +710,10 @@ export async function scanPolymarket(config, settings, active) {
       if (!timing.live && !timing.ok) { bump("pm-window"); continue; }
       seen += 2;
 
-      if (heldOnKalshi({ sportKey, commenceTime, teamNames, restingOrders: resting })) { bump("pm-held-on-kalshi", teamNames.join(" vs ")); continue; }
+      // SAME TRADES ON BOTH: a game Kalshi holds is still priced here, but only
+      // on the team Kalshi holds. One bet per game on Polymarket itself.
       if (heldOnPolymarket({ sportKey, commenceTime, teamNames })) { bump("pm-already-held", teamNames.join(" vs ")); continue; }
+      const kalshiTeam = kalshiTeamOnGame({ sportKey, commenceTime, teamNames, restingOrders: resting });
 
       try { events ??= await getSportEvents(sportKey); } catch (err) { bump("pm-events-failed", err.message); break; }
       const ev = matchEvent(events, teamNames, commenceTime);
@@ -718,6 +721,10 @@ export async function scanPolymarket(config, settings, active) {
 
       for (const t of teams) {
         if (isDraw(t.name)) continue;
+        if (kalshiTeam && normName(t.name) !== kalshiTeam) {
+          bump("pm-opposite-of-kalshi", `${t.name}: Kalshi holds ${kalshiTeam} in this game - only the same team is bought here`);
+          continue;
+        }
         const side = winnerSideFor(ev, t.name);
         if (!side.ok) { bump(side.code, side.reason); continue; }
         if (!side.long && !shortOn) { bump("pm-no-side-not-confirmed", `${t.name}: needs the NO side, which turns on once Polymarket accepts the self-check's NO preview in the documented format`); continue; }
@@ -801,7 +808,7 @@ export async function scanPolymarket(config, settings, active) {
         const r = returnAt(limit);
         const dollarsIn = contracts * perContract;
         const reason =
-          `Polymarket: ${timing.live ? "In-play" : "Pre-game"} edge on "${t.name}" ` +
+          `Polymarket: ${timing.live ? "In-play" : "Pre-game"} edge on "${t.name}"${kalshiTeam ? " (same trade as Kalshi)" : ""} ` +
           `(sharp ${(c.prob * 100).toFixed(1)}% vs $${(askCents / 100).toFixed(2)} ask, limit $${(limit / 100).toFixed(2)}, ` +
           `${contracts} contracts, $${dollarsIn.toFixed(2)} in, expected +$${((r.ev * contracts) / 100).toFixed(2)} (${r.pct.toFixed(1)}%))` +
           (c.liveContext ? ` | ${c.liveContext}` : "");
