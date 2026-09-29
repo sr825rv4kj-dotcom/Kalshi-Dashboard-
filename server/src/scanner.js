@@ -87,11 +87,11 @@ import { recordFairFromProbabilities } from "./fairValue.js";
 import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
-import { heldOnPolymarket } from "./polymarket/pmState.js";
+import { polymarketTeamOnGame, normName } from "./polymarket/pmState.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-27-opponent-and-prior-fixes";
+export const SCANNER_VERSION = "2026-09-28-same-trades-both";
 
 /**
  * SHARED LINES (2026-09-27). Every sharp line this scan reads is kept for the
@@ -413,9 +413,13 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     if (!timing.live && config.liveOnly !== false) { drops.pregame++; return null; }
     if (!timing.ok) { drops.window++; return null; }
 
-    // ONE BET PER GAME ACROSS BOTH EXCHANGES: already held on Polymarket.
-    if (heldOnPolymarket({ sportKey, commenceTime, teamNames: gameTeams.get(info.eventId || commenceTime) || [teamName] })) {
+    // SAME TRADES ON BOTH EXCHANGES (2026-09-28): a game Polymarket holds may
+    // be bought here too, but only on the team Polymarket holds - never the
+    // other side. (It used to drop the whole game.)
+    const pmTeam = polymarketTeamOnGame({ sportKey, commenceTime, teamNames: gameTeams.get(info.eventId || commenceTime) || [teamName] });
+    if (pmTeam && pmTeam !== normName(teamName)) {
       drops.duplicate++;
+      if (!sampleReason) sampleReason = `${teamName}: Polymarket holds ${pmTeam} in this game - only the same team is bought on Kalshi`;
       return null;
     }
 
