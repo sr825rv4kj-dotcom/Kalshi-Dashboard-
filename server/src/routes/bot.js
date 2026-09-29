@@ -2,7 +2,9 @@
  * Bot control, trade history and the original diagnostic scan.
  */
 import { kalshiGet } from "../kalshiClient.js";
-import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker } from "../botController.js";
+import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker, kalshiOpenTradeCap } from "../botController.js";
+import { scheduleReport, schedulePlan, refreshSchedule } from "../liveSchedule.js";
+import { pmStatus } from "../polymarket/pmEngine.js";
 import { loadConfig, saveConfig, setEnvironment } from "../configStore.js";
 import { loadState, getRecentLog } from "../stateStore.js";
 import { getRecentTrades, getTradeStats, getTradeLifecycles, loadLedger, filterByVenue, venueOf } from "../tradeLedgerStore.js";
@@ -39,6 +41,31 @@ export function registerBotRoutes(app) {
       res.json(setEnvironment(environment, confirmed));
     } catch (err) {
       res.status(400).json({ error: err.message });
+    }
+  });
+
+  // --- Live schedule (liveSchedule.js) --------------------------------------
+  // What is live now, what starts next, which sports are being scanned because
+  // of it, and the open-trade cap on each exchange. If the calendar is not
+  // built (bot stopped, or just started) it is built here first - the odds
+  // feed's events list is free, so this costs no credits.
+  app.get("/api/schedule", async (_req, res) => {
+    try {
+      const config = loadConfig();
+      if (!schedulePlan().ready) await refreshSchedule(config);
+      const pm = (() => { try { return pmStatus(config); } catch { return null; } })();
+      res.json({
+        ...scheduleReport(),
+        botRunning: isRunning(),
+        openTradeCap: {
+          kalshi: kalshiOpenTradeCap(config),
+          polymarket: pm?.lastScan
+            ? { cap: pm.lastScan.openCap ?? null, equity: pm.lastScan.equity ?? null, open: (pm.positions || []).length }
+            : null,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
   });
 
