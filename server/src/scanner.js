@@ -92,7 +92,20 @@ import { noteDecision, noteScan } from "./scanFeed.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-28-scanner-tab";
+export const SCANNER_VERSION = "2026-09-29-no-score-fresh-line";
+
+/** Max age (seconds) of the sharp line for trading a live game that has no live score. */
+function noScoreMaxAge(config = {}) {
+  const n = Number(config.noScoreMaxLineAgeSeconds);
+  return Number.isFinite(n) && n > 0 ? n : 120;
+}
+
+/** A live game with no score may trade only on a sharp line of KNOWN age, updated within the limit. */
+function freshLineOk(lineAgeSeconds, config = {}) {
+  const max = noScoreMaxAge(config);
+  const age = Number.isFinite(Number(lineAgeSeconds)) && lineAgeSeconds != null ? Math.round(Number(lineAgeSeconds)) : null;
+  return { ok: age != null && age <= max, age, max };
+}
 
 /**
  * SHARED LINES (2026-09-27). Every sharp line this scan reads is kept for the
@@ -534,14 +547,16 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         scoresError = err.message;
       }
 
+      // NO SCORE FEED (2026-09-29). The odds feed publishes live scores for some
+      // sports only - its own coverage list has none for KBO, NPB, Liiga,
+      // cricket, MMA or boxing. Those games used to be refused outright, on
+      // both exchanges, every scan. Now a game with no live score is judged on
+      // the line itself (freshLineOk below); a score read that failed this
+      // cycle is handled the same way instead of vetoing every live market.
       if (scoresError && !events.length) {
-        appendLog(`${sportKey}: live scores unavailable (${scoresError}) - in-play markets skipped this cycle.`, "warn");
-        for (const c of viable) if (c.timing.live && !c.addOn) {
-          bump("live-scores-unavailable");
-          feed(c.teamName, "live-scores-unavailable", `Live scores unavailable this cycle (${scoresError})`, { opponent: null, commenceTime: c.commenceTime, market: c.ticker, priceCents: c.pricing?.askCents, fairPct: c.trueProbability * 100 });
-        }
-        viable = viable.filter((c) => !c.timing.live);
-      } else {
+        appendLog(`${sportKey}: live scores unavailable (${scoresError}) - in-play markets need a sharp line updated within ${noScoreMaxAge(config)}s this cycle.`, "warn");
+      }
+      {
         const vetoed = [];
         viable = viable.filter((c) => {
           if (!c.timing.live) return true;
@@ -551,9 +566,20 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           // The held team's lead, from its own side: +1 means ahead by one.
           const lead = game && c.addOn ? observeLead(c.ticker, game.lead, config) : null;
           if (!game) {
-            vetoed.push(`${c.teamName}: in play but no live score found - cannot check the line against the game`);
-            bump("no-live-score-match", `${c.teamName}: in play, no live score row matched this team`);
-            feed(c.teamName, "no-live-score-match", "In play, but no live score was found for this team", { opponent: null, commenceTime: c.commenceTime, market: c.ticker, priceCents: c.pricing?.askCents, fairPct: c.trueProbability * 100 });
+            // No live score for this game. The score check exists to catch a
+            // STALE line (the sharp book stopped updating while the exchange
+            // kept moving). A line the sharp book repriced within the last
+            // two minutes is not stale - trade on it, at the sharp price.
+            const fresh = freshLineOk(c.lineAgeSeconds, config);
+            if (fresh.ok) {
+              c.liveContext = `no live score feed for this game - sharp line updated ${fresh.age}s ago`;
+              return true;
+            }
+            const why = `In play with no live score, and the sharp line is ${fresh.age == null ? "of unknown age" : `${fresh.age}s old`} - ` +
+              `trading without a score needs a line updated within ${fresh.max}s`;
+            vetoed.push(`${c.teamName}: ${why}`);
+            bump("no-live-score-match", `${c.teamName}: ${why}`);
+            feed(c.teamName, "no-live-score-match", why, { opponent: null, commenceTime: c.commenceTime, market: c.ticker, priceCents: c.pricing?.askCents, fairPct: c.trueProbability * 100 });
             return false;
           }
 
