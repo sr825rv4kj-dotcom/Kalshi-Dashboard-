@@ -52,6 +52,7 @@ import { getLiveScores, findLiveGameForTeam } from "../scoresFetcher.js";
 import { corroboratedProbability, fractionRemaining, paramsFor, pregamePrior, rememberPregame, flushPregamePriors } from "../liveModel.js";
 import { allActiveSportKeys } from "../sportsDiscovery.js";
 import { schedulePlan, shouldScanSport, openTradeCap } from "../liveSchedule.js";
+import { noteDecision, noteScan } from "../scanFeed.js";
 import { getSeriesMap } from "../tickerResolver.js";
 import { assessOpportunity, feePerContractCents, flatBetContracts } from "../riskManager.js";
 import { learnedBlock, streakStakeFactor } from "../outcomeLearner.js";
@@ -63,7 +64,7 @@ import { pmGet, pmPost, pmConfigured, pmClientStats, pmCredentialReport, dollars
 import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues, getLeagueEvents, matchEvent, winnerSideFor, sidePrice, pmMarketsReport } from "./pmMarkets.js";
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, kalshiTeamOnGame, normName } from "./pmState.js";
 
-export const PM_ENGINE_VERSION = "2026-09-28-same-trades-both";
+export const PM_ENGINE_VERSION = "2026-09-28-scanner-tab";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -95,7 +96,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -648,6 +649,9 @@ export async function scanPolymarket(config, settings, active) {
   };
   let seen = 0, entered = 0;
   const meta = pmMeta();
+  // SCANNER TAB (scanFeed.js): the latest verdict per team, in plain words.
+  const feed = (row) => noteDecision("polymarket", { verdict: "skipped", ...row });
+  noteScan("polymarket");
 
   let account = null;
   try { account = await readPmAccount(); } catch (err) { bump("pm-balance-failed", err.message); }
@@ -712,56 +716,78 @@ export async function scanPolymarket(config, settings, active) {
 
       // SAME TRADES ON BOTH: a game Kalshi holds is still priced here, but only
       // on the team Kalshi holds. One bet per game on Polymarket itself.
-      if (heldOnPolymarket({ sportKey, commenceTime, teamNames })) { bump("pm-already-held", teamNames.join(" vs ")); continue; }
+      if (heldOnPolymarket({ sportKey, commenceTime, teamNames })) {
+        bump("pm-already-held", teamNames.join(" vs "));
+        for (const n of teamNames) feed({ sportKey, team: n, opponent: teamNames.find((x) => x !== n), commenceTime, code: "pm-already-held", why: "Already holding this game on Polymarket (one bet per game)" });
+        continue;
+      }
       const kalshiTeam = kalshiTeamOnGame({ sportKey, commenceTime, teamNames, restingOrders: resting });
 
       try { events ??= await getSportEvents(sportKey); } catch (err) { bump("pm-events-failed", err.message); break; }
       const ev = matchEvent(events, teamNames, commenceTime);
-      if (!ev || ev.ambiguous) { bump(ev?.ambiguous ? "pm-game-ambiguous" : "pm-game-not-listed", `${teamNames.join(" vs ")} (${slug})`); continue; }
+      if (!ev || ev.ambiguous) {
+        const code = ev?.ambiguous ? "pm-game-ambiguous" : "pm-game-not-listed";
+        bump(code, `${teamNames.join(" vs ")} (${slug})`);
+        const why = ev?.ambiguous
+          ? `This game matched ${ev.ambiguous} Polymarket events in ${slug} - skipped rather than guessed`
+          : `No Polymarket game in ${slug} has both these teams starting within 12 hours of this time (finished, not listed yet, or not offered)`;
+        for (const n of teamNames) feed({ sportKey, team: n, opponent: teamNames.find((x) => x !== n), commenceTime, code, why });
+        continue;
+      }
 
       for (const t of teams) {
         if (isDraw(t.name)) continue;
+        const opp = teamNames.find((n) => normName(n) !== normName(t.name)) ?? null;
+        // What the feed shows for this team so far: filled in as the checks go.
+        const at = { market: null, priceCents: null, fairPct: t.info.trueProbability * 100 };
+        const skip = (code, why, verdict = "skipped") => {
+          bump(code, why);
+          feed({ sportKey, team: t.name, opponent: opp, commenceTime, verdict, code, why, ...at });
+        };
         if (kalshiTeam && normName(t.name) !== kalshiTeam) {
-          bump("pm-opposite-of-kalshi", `${t.name}: Kalshi holds ${kalshiTeam} in this game - only the same team is bought here`);
+          skip("pm-opposite-of-kalshi", `Kalshi holds ${kalshiTeam} in this game - only the same team is bought on Polymarket`);
           continue;
         }
         const side = winnerSideFor(ev, t.name);
-        if (!side.ok) { bump(side.code, side.reason); continue; }
-        if (!side.long && !shortOn) { bump("pm-no-side-not-confirmed", `${t.name}: needs the NO side, which turns on once Polymarket accepts the self-check's NO preview in the documented format`); continue; }
+        if (!side.ok) { skip(side.code, side.reason); continue; }
+        at.market = side.slug;
+        if (!side.long && !shortOn) { skip("pm-no-side-not-confirmed", `${t.name}: needs the NO side, which turns on once Polymarket accepts the self-check's NO preview in the documented format`); continue; }
         const opponent = teamNames.find((n) => normName(n) !== normName(t.name)) ?? null;
         const c = { sportKey, teamName: t.name, opponent, commenceTime, timing, prob: t.info.trueProbability, lineAgeSeconds: t.info.lineAgeSeconds ?? null, ev, side };
 
         // Price.
         let px;
-        try { px = await sidePrice(side.slug, side.long); } catch (err) { bump("pm-price-failed", `${side.slug}: ${err.message}`); continue; }
-        if (!px.open) { bump("pm-market-not-open", `${side.slug}: ${px.state}`); continue; }
-        if (px.askCents == null || px.askCents <= 0 || px.askCents >= 100) { bump("pm-no-price", side.slug); continue; }
+        try { px = await sidePrice(side.slug, side.long); } catch (err) { skip("pm-price-failed", `${side.slug}: ${err.message}`); continue; }
+        if (!px.open) { skip("pm-market-not-open", `Market not open for trading (${px.state})`); continue; }
+        if (px.askCents == null || px.askCents <= 0 || px.askCents >= 100) { skip("pm-no-price", "No one is selling this side right now (no ask in the book)"); continue; }
         const askCents = Math.ceil(px.askCents - 1e-9);
+        at.priceCents = askCents;
         const maxSpread = config.maxSpreadCents ?? 25;
-        if (maxSpread && px.spreadCents != null && px.spreadCents > maxSpread) { bump("pm-spread-too-wide", `${side.slug}: ${px.spreadCents}c`); continue; }
+        if (maxSpread && px.spreadCents != null && px.spreadCents > maxSpread) { skip("pm-spread-too-wide", `Bid-ask spread ${px.spreadCents}c is over the ${maxSpread}c limit`); continue; }
 
         // In-game model, exactly as the Kalshi scan does it.
         if (timing.live) {
-          if (!paramsFor(sportKey)) { bump("pm-no-model"); continue; }
+          if (!paramsFor(sportKey)) { skip("pm-no-model", "No in-game model for this sport, so a stale line can't be detected"); continue; }
           try { scores ??= (await getLiveScores(sportKey)).events || []; } catch { scores = []; }
           const game = findLiveGameForTeam(scores, t.name);
-          if (!game) { bump("pm-no-live-score", t.name); continue; }
+          if (!game) { skip("pm-no-live-score", "In play, but no live score was found for this team"); continue; }
           const frac = fractionRemaining(sportKey, commenceTime);
           const corr = corroboratedProbability({
             sportKey, sharpProbability: c.prob, lead: game.lead, fracRemaining: frac,
             pregameProbability: pregamePrior({ sportKey, teamName: t.name, commenceTime }),
           });
-          if (!corr.usable) { bump("pm-unmodellable", t.name); continue; }
+          if (!corr.usable) { skip("pm-unmodellable", "In play, but the game state could not be modelled"); continue; }
           if (corr.disagreementPoints > (config.maxModelDisagreementPoints ?? 12)) {
-            bump("pm-model-disagrees", `${t.name}: sharp ${(c.prob * 100).toFixed(0)}% vs model ${(corr.modelProbability * 100).toFixed(0)}%`);
+            skip("pm-model-disagrees", `Betting line ${(c.prob * 100).toFixed(0)}% vs in-game model ${(corr.modelProbability * 100).toFixed(0)}% (${game.homeScore}-${game.awayScore}, ${(frac * 100).toFixed(0)}% left) - over ${config.maxModelDisagreementPoints ?? 12} points apart, line treated as stale`);
             continue;
           }
           c.prob = corr.probability;
+          at.fairPct = c.prob * 100;
           c.liveContext = `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ${(frac * 100).toFixed(0)}% left, model ${(corr.modelProbability * 100).toFixed(0)}%`;
         }
 
         const learned = learnedBlock({ sportKey, priceCents: askCents }, config);
-        if (learned.blocked) { bump("pm-learned-block", learned.reason); continue; }
+        if (learned.blocked) { skip("pm-learned-block", learned.reason); continue; }
 
         const bankroll = account?.buyingPower ?? 0;
         const assessment = assessOpportunity({
@@ -784,7 +810,7 @@ export async function scanPolymarket(config, settings, active) {
           maxLineAgeSecondsPregame: config.maxLineAgeSecondsPregame ?? 7200,
           survivalMode: { ...(config.survivalMode || {}), balanceThreshold: Infinity, flatBetDollars: stake },
         });
-        if (assessment.action === "skip") { bump(`pm-${assessment.code || "skip"}`, `${t.name} ${askCents}c (sharp ${(c.prob * 100).toFixed(1)}%): ${assessment.reason}`); continue; }
+        if (assessment.action === "skip") { skip(`pm-${assessment.code || "skip"}`, `${askCents}c vs fair ${(c.prob * 100).toFixed(1)}%: ${assessment.reason}`); continue; }
 
         // Same minimum expected return as Kalshi, with Polymarket's fee.
         const minReturnPct = Number(config.minExpectedReturnPct ?? 10);
@@ -797,14 +823,14 @@ export async function scanPolymarket(config, settings, active) {
         for (let p = assessment.limitCents; p >= askCents; p--) if (returnAt(p).pct >= minReturnPct) { limit = p; break; }
         if (limit == null) {
           const r = returnAt(askCents);
-          bump("pm-return-too-small", `${t.name} ${askCents}c (sharp ${(c.prob * 100).toFixed(1)}%): ${r.pct.toFixed(1)}% expected, under ${minReturnPct}%`);
+          skip("pm-return-too-small", `${askCents}c vs fair ${(c.prob * 100).toFixed(1)}%: ${r.pct.toFixed(1)}% expected return, under the ${minReturnPct}% minimum`);
           continue;
         }
         let contracts = countAt(limit);
         const perContract = (limit + feePerContractCents(limit, contracts, PM_FEE)) / 100;
         if (contracts * perContract > bankroll) contracts = Math.floor(bankroll / perContract);
         const minQty = numberOf(side.market?.minimumTradeQty) ?? 1;
-        if (contracts < Math.max(1, minQty)) { bump("pm-size-zero", `${t.name}: $${bankroll.toFixed(2)} buying power`); continue; }
+        if (contracts < Math.max(1, minQty)) { skip("pm-size-zero", `Not enough buying power ($${bankroll.toFixed(2)}) for one contract`); continue; }
         const r = returnAt(limit);
         const dollarsIn = contracts * perContract;
         const reason =
@@ -813,15 +839,15 @@ export async function scanPolymarket(config, settings, active) {
           `${contracts} contracts, $${dollarsIn.toFixed(2)} in, expected +$${((r.ev * contracts) / 100).toFixed(2)} (${r.pct.toFixed(1)}%))` +
           (c.liveContext ? ` | ${c.liveContext}` : "");
 
-        if (!active) { bump("pm-would-trade", reason); continue; }
-        if (halted) { bump("pm-halted", t.name); continue; }
-        if (paused) continue;
+        if (!active) { skip("pm-would-trade", `Would buy, but Polymarket trading is not active: ${reason}`); continue; }
+        if (halted) { skip("pm-halted", "Polymarket paused for today by the daily loss limit"); continue; }
+        if (paused) { feed({ sportKey, team: t.name, opponent: opp, commenceTime, code: "pm-paused-after-failures", why: `Paused after 3 failed orders, until ${meta.pausedUntil}`, ...at }); continue; }
         // OPEN-TRADE CAP BY BALANCE (2026-09-28, account holder's rule): 5 to 10
         // open bets depending on the Polymarket balance - see openCap above.
         // One bet per game across both exchanges still applies.
         const openNow = pmPositions().length;
         if (openNow >= openCap) {
-          bump("pm-at-cap", `${openNow} open of ${openCap} allowed at $${equity.toFixed(2)} equity - waiting for a game to settle`);
+          skip("pm-at-cap", `${openNow} open of ${openCap} allowed at $${equity.toFixed(2)} equity - waiting for a game to settle`);
           continue;
         }
 
@@ -830,7 +856,7 @@ export async function scanPolymarket(config, settings, active) {
           appendLog(`Polymarket order: BUY ${side.long ? "YES" : "NO"} ${contracts}x ${side.slug} (${t.name}) at up to $${(limit / 100).toFixed(2)} - ${reason}`);
           result = await placeEntry({ c, limitCents: limit, contracts, convention, seenAskCents: px.askCents });
         } catch (err) {
-          bump("pm-order-error", `${side.slug}: ${err.message}`);
+          skip("pm-order-error", `Order failed: ${err.message}`, "tried");
           const fails = (pmMeta().consecutiveOrderFailures || 0) + 1;
           const patch = { consecutiveOrderFailures: fails };
           if (fails >= 3) {
@@ -844,8 +870,8 @@ export async function scanPolymarket(config, settings, active) {
           continue;
         }
         updatePmMeta({ consecutiveOrderFailures: 0 });
-        if (result.rejected) { bump("pm-order-rejected", `${side.slug}: ${result.rejected}`); continue; }
-        if (!(result.filled > 0) || result.fillCents == null) { bump("pm-no-fill", `${side.slug}: nothing at or under $${(limit / 100).toFixed(2)}`); continue; }
+        if (result.rejected) { skip("pm-order-rejected", `Polymarket rejected the order: ${result.rejected}`, "tried"); continue; }
+        if (!(result.filled > 0) || result.fillCents == null) { skip("pm-no-fill", `Order sent, nothing filled at or under $${(limit / 100).toFixed(2)} before it expired`, "tried"); continue; }
 
         const filled = Math.floor(result.filled);
         const ticker = `PM:${side.slug}:${side.long ? "YES" : "NO"}`;
@@ -865,6 +891,8 @@ export async function scanPolymarket(config, settings, active) {
           environment: "production", teamName: t.name, sportKey, commenceTime, feeCents: entryFeeCents,
         });
         appendLog(`Polymarket filled ${filled}x ${t.name} @ ${result.fillCents}c (fee ${(entryFeeCents / 100).toFixed(2)}).`);
+        feed({ sportKey, team: t.name, opponent: opp, commenceTime, verdict: "bought", code: "bought", market: side.slug, priceCents: result.fillCents, fairPct: c.prob * 100,
+          why: `Bought ${filled} contract(s) at ${result.fillCents}c against a fair value of ${(c.prob * 100).toFixed(1)}%${kalshiTeam ? " - same trade as Kalshi" : ""}${c.liveContext ? ` | ${c.liveContext}` : ""}` });
         try {
           const { botToken, chatId } = getTelegramCredentials();
           notifyEntry({ botToken, chatId, ticker, side: side.long ? "yes" : "no", contracts: filled, priceCents: result.fillCents, reason, environment: "production" }).catch(() => {});
