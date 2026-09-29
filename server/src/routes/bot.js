@@ -5,6 +5,9 @@ import { kalshiGet } from "../kalshiClient.js";
 import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker, kalshiOpenTradeCap } from "../botController.js";
 import { scheduleReport, schedulePlan, refreshSchedule } from "../liveSchedule.js";
 import { pmStatus } from "../polymarket/pmEngine.js";
+import { scanFeedReport } from "../scanFeed.js";
+import { getSeriesMap } from "../tickerResolver.js";
+import { mappedSports } from "../polymarket/pmMarkets.js";
 import { loadConfig, saveConfig, setEnvironment } from "../configStore.js";
 import { loadState, getRecentLog } from "../stateStore.js";
 import { getRecentTrades, getTradeStats, getTradeLifecycles, loadLedger, filterByVenue, venueOf } from "../tradeLedgerStore.js";
@@ -64,6 +67,38 @@ export function registerBotRoutes(app) {
             : null,
         },
       });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // --- Scanner tab (scanFeed.js) ---------------------------------------------
+  // One exchange at a time: every team its scanner priced in the last 15
+  // minutes and the verdict in plain words, plus any game the live schedule
+  // has in play that this exchange did NOT look at, and why.
+  app.get("/api/scanner", (req, res) => {
+    try {
+      const venue = req.query.venue === "polymarket" ? "polymarket" : "kalshi";
+      const feed = scanFeedReport(venue);
+      const norm = (x) => String(x ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+      const seen = new Set(feed.rows.map((r) => `${r.sportKey}|${norm(r.team)}`));
+      const sched = scheduleReport();
+      const off = new Set((loadConfig().disabledSports || []).map(String));
+      let series = {};
+      try { series = getSeriesMap() || {}; } catch { series = {}; }
+      let pmLeagues = {};
+      try { pmLeagues = mappedSports() || {}; } catch { pmLeagues = {}; }
+      const notLooked = [];
+      for (const g of sched.live || []) {
+        if (seen.has(`${g.sportKey}|${norm(g.home)}`) || seen.has(`${g.sportKey}|${norm(g.away)}`)) continue;
+        let why;
+        if (off.has(g.sportKey)) why = "Sport switched off in Bot Settings";
+        else if (venue === "kalshi" && !series[g.sportKey]) why = "Kalshi does not list this league";
+        else if (venue === "polymarket" && !pmLeagues[g.sportKey] && !/^tennis_(atp|wta)/.test(g.sportKey)) why = "Polymarket does not list this league";
+        else why = "Not priced yet - the scanner reaches it on its next pass (or the betting feed has no line for it right now)";
+        notLooked.push({ sportKey: g.sportKey, home: g.home, away: g.away, commence: g.commence, minutesIn: g.minutesIn, why });
+      }
+      res.json({ ...feed, schedule: { ready: sched.ready, liveGames: sched.counts?.liveGames ?? 0 }, notLooked });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
