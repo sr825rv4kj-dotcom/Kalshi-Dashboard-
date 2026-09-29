@@ -64,7 +64,7 @@ import { pmGet, pmPost, pmConfigured, pmClientStats, pmCredentialReport, dollars
 import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues, getLeagueEvents, matchEvent, winnerSideFor, sidePrice, pmMarketsReport } from "./pmMarkets.js";
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, kalshiTeamOnGame, normName } from "./pmState.js";
 
-export const PM_ENGINE_VERSION = "2026-09-28-scanner-tab";
+export const PM_ENGINE_VERSION = "2026-09-29-no-score-fresh-line";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -96,7 +96,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -108,6 +108,14 @@ function shortSideActive(settings, meta) {
 }
 
 /** The price.value Polymarket expects: always the YES (long) side's price. */
+/** A live game with no score may trade only on a sharp line of KNOWN age, updated within the limit (default 120s). */
+function freshLineOk(lineAgeSeconds, config = {}) {
+  const n = Number(config.noScoreMaxLineAgeSeconds);
+  const max = Number.isFinite(n) && n > 0 ? n : 120;
+  const age = Number.isFinite(Number(lineAgeSeconds)) && lineAgeSeconds != null ? Math.round(Number(lineAgeSeconds)) : null;
+  return { ok: age != null && age <= max, age, max };
+}
+
 function longSidePriceCents(long, limitCents) {
   const limit = Math.floor(limitCents);          // never pay above our limit
   return long ? limit : 100 - limit;             // BUY NO at L  ==  SELL YES at (100 - L)
@@ -753,7 +761,11 @@ export async function scanPolymarket(config, settings, active) {
         at.market = side.slug;
         if (!side.long && !shortOn) { skip("pm-no-side-not-confirmed", `${t.name}: needs the NO side, which turns on once Polymarket accepts the self-check's NO preview in the documented format`); continue; }
         const opponent = teamNames.find((n) => normName(n) !== normName(t.name)) ?? null;
-        const c = { sportKey, teamName: t.name, opponent, commenceTime, timing, prob: t.info.trueProbability, lineAgeSeconds: t.info.lineAgeSeconds ?? null, ev, side };
+        // The line's age NOW: its age when it was read, plus the time since (a
+        // line reused from this cycle's Kalshi scan can be up to 2 minutes old).
+        const readAgo = Number.isFinite(Number(entry.at)) ? Math.max(0, (Date.now() - Number(entry.at)) / 1000) : 0;
+        const lineAgeNow = t.info.lineAgeSeconds != null && Number.isFinite(Number(t.info.lineAgeSeconds)) ? Number(t.info.lineAgeSeconds) + readAgo : null;
+        const c = { sportKey, teamName: t.name, opponent, commenceTime, timing, prob: t.info.trueProbability, lineAgeSeconds: lineAgeNow, ev, side };
 
         // Price.
         let px;
@@ -770,20 +782,33 @@ export async function scanPolymarket(config, settings, active) {
           if (!paramsFor(sportKey)) { skip("pm-no-model", "No in-game model for this sport, so a stale line can't be detected"); continue; }
           try { scores ??= (await getLiveScores(sportKey)).events || []; } catch { scores = []; }
           const game = findLiveGameForTeam(scores, t.name);
-          if (!game) { skip("pm-no-live-score", "In play, but no live score was found for this team"); continue; }
-          const frac = fractionRemaining(sportKey, commenceTime);
-          const corr = corroboratedProbability({
-            sportKey, sharpProbability: c.prob, lead: game.lead, fracRemaining: frac,
-            pregameProbability: pregamePrior({ sportKey, teamName: t.name, commenceTime }),
-          });
-          if (!corr.usable) { skip("pm-unmodellable", "In play, but the game state could not be modelled"); continue; }
-          if (corr.disagreementPoints > (config.maxModelDisagreementPoints ?? 12)) {
-            skip("pm-model-disagrees", `Betting line ${(c.prob * 100).toFixed(0)}% vs in-game model ${(corr.modelProbability * 100).toFixed(0)}% (${game.homeScore}-${game.awayScore}, ${(frac * 100).toFixed(0)}% left) - over ${config.maxModelDisagreementPoints ?? 12} points apart, line treated as stale`);
-            continue;
+          if (!game) {
+            // NO SCORE FEED (2026-09-29): the odds feed has no live scores for
+            // KBO, NPB, Liiga, cricket, MMA or boxing. The score check exists to
+            // catch a STALE line; a line the sharp book repriced within the last
+            // two minutes is not stale, so the game trades on it at the sharp
+            // price. Same rule as the Kalshi scanner.
+            const fresh = freshLineOk(c.lineAgeSeconds, config);
+            if (!fresh.ok) {
+              skip("pm-no-live-score", `In play with no live score, and the sharp line is ${fresh.age == null ? "of unknown age" : `${fresh.age}s old`} - trading without a score needs a line updated within ${fresh.max}s`);
+              continue;
+            }
+            c.liveContext = `no live score feed for this game - sharp line updated ${fresh.age}s ago`;
+          } else {
+            const frac = fractionRemaining(sportKey, commenceTime);
+            const corr = corroboratedProbability({
+              sportKey, sharpProbability: c.prob, lead: game.lead, fracRemaining: frac,
+              pregameProbability: pregamePrior({ sportKey, teamName: t.name, commenceTime }),
+            });
+            if (!corr.usable) { skip("pm-unmodellable", "In play, but the game state could not be modelled"); continue; }
+            if (corr.disagreementPoints > (config.maxModelDisagreementPoints ?? 12)) {
+              skip("pm-model-disagrees", `Betting line ${(c.prob * 100).toFixed(0)}% vs in-game model ${(corr.modelProbability * 100).toFixed(0)}% (${game.homeScore}-${game.awayScore}, ${(frac * 100).toFixed(0)}% left) - over ${config.maxModelDisagreementPoints ?? 12} points apart, line treated as stale`);
+              continue;
+            }
+            c.prob = corr.probability;
+            at.fairPct = c.prob * 100;
+            c.liveContext = `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ${(frac * 100).toFixed(0)}% left, model ${(corr.modelProbability * 100).toFixed(0)}%`;
           }
-          c.prob = corr.probability;
-          at.fairPct = c.prob * 100;
-          c.liveContext = `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ${(frac * 100).toFixed(0)}% left, model ${(corr.modelProbability * 100).toFixed(0)}%`;
         }
 
         const learned = learnedBlock({ sportKey, priceCents: askCents }, config);
