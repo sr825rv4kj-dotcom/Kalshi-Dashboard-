@@ -1,388 +1,232 @@
+import React, { useEffect, useState } from "react";
+
 /**
- * Bot control, trade history and the original diagnostic scan.
+ * Scanner - Kalshi and Polymarket kept apart.
+ *
+ * Every team the chosen exchange's scanner priced in the last 15 minutes,
+ * with the price, the fair value from the betting line, and the verdict in
+ * plain words: bought, or the exact rule that stopped it. Below that, any
+ * game the live schedule has in play that this exchange did not look at, and
+ * why. Refreshes every 10 seconds.
  */
-import { kalshiGet } from "../kalshiClient.js";
-import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker, kalshiOpenTradeCap } from "../botController.js";
-import { scheduleReport, schedulePlan, refreshSchedule } from "../liveSchedule.js";
-import { pmStatus } from "../polymarket/pmEngine.js";
-import { scanFeedReport } from "../scanFeed.js";
-import { getSeriesMap } from "../tickerResolver.js";
-import { mappedSports } from "../polymarket/pmMarkets.js";
-import { loadConfig, saveConfig, setEnvironment } from "../configStore.js";
-import { loadState, getRecentLog } from "../stateStore.js";
-import { getRecentTrades, getTradeStats, getTradeLifecycles, loadLedger, filterByVenue, venueOf } from "../tradeLedgerStore.js";
-import { clvReport, backfillFromLedger, clearKill } from "../clvTracker.js";
-import { fairValueReport } from "../fairValue.js";
-import { buildStrategyReview } from "../strategyReview.js";
-import { getRecentScores, findScoreForTeam } from "../scoresFetcher.js";
-import { getSharpProbabilities } from "../scraper.js";
-import { resolveTicker } from "../tickerResolver.js";
-import { discoverActiveSports } from "../sportsDiscovery.js";
-import { runCoverageCheck, REQUIRED_SPORTS, COVERAGE_VERSION } from "../coverageCheck.js";
 
-const V2 = "/trade-api/v2";
+const TABS = [["kalshi", "Kalshi"], ["polymarket", "Polymarket"]];
 
-export function registerBotRoutes(app) {
-  // --- Bot config ---
-  app.get("/api/bot/config", (_req, res) => res.json(loadConfig()));
+// Short, plain names for the reasons. The detail line under each row says
+// exactly what was measured.
+const LABEL = {
+  bought: "Bought",
+  "double-down": "Bought (double-down)",
+  "already-held": "Already holding this game",
+  "pm-already-held": "Already holding this game",
+  "opposite-of-polymarket": "Other team of a game Polymarket holds",
+  "pm-opposite-of-kalshi": "Other team of a game Kalshi holds",
+  "price-below-floor": "Price under the live band",
+  "pm-price-below-floor": "Price under the live band",
+  "price-above-ceiling": "Price over the live band",
+  "pm-price-above-ceiling": "Price over the live band",
+  "edge-too-small": "No edge at this price",
+  "pm-edge-too-small": "No edge at this price",
+  "edge-implausible": "Gap to the betting line too big - stale line",
+  "pm-edge-implausible": "Gap to the betting line too big - stale line",
+  "return-too-small": "Expected return under the minimum",
+  "pm-return-too-small": "Expected return under the minimum",
+  "model-disagrees": "In-game model disagrees with the line",
+  "pm-model-disagrees": "In-game model disagrees with the line",
+  "no-live-score-match": "No live score found",
+  "pm-no-live-score": "No live score found",
+  unmodellable: "Game state can't be modelled",
+  "pm-unmodellable": "Game state can't be modelled",
+  "no-model-for-sport": "No in-game model for this sport",
+  "pm-no-model": "No in-game model for this sport",
+  "live-scores-unavailable": "Live scores unavailable",
+  "spread-too-wide": "Spread too wide",
+  "pm-spread-too-wide": "Spread too wide",
+  "no-price": "No price in the book",
+  "pm-no-price": "No price in the book",
+  "at-cap": "At the open-trade cap",
+  "pm-at-cap": "At the open-trade cap",
+  "learned-block": "Sport/price band has been losing",
+  "pm-learned-block": "Sport/price band has been losing",
+  "no-fill": "Order sent, nothing filled",
+  "pm-no-fill": "Order sent, nothing filled",
+  "order-error": "Order failed",
+  "pm-order-error": "Order failed",
+  "pm-order-rejected": "Order rejected",
+  "market-closed": "Market closed",
+  "pm-market-not-open": "Market closed",
+  "pm-game-not-listed": "Game not found on Polymarket",
+  "pm-game-ambiguous": "Game matched twice - skipped",
+  "pm-no-side-not-confirmed": "NO side not switched on yet",
+  "pm-would-trade": "Would buy - trading not active",
+  "pm-halted": "Paused today (loss limit)",
+  "pm-paused-after-failures": "Paused after failed orders",
+  "pm-size-zero": "Not enough cash for one contract",
+  "live-trading-off": "Live trading switched off",
+  "waiting-for-bid-cancel": "Clearing a resting bid first",
+  "fetch-error": "Couldn't read the market",
+  "pm-price-failed": "Couldn't read the price",
+  "pm-side-unknown": "Couldn't tie a market side to the team",
+  "pm-side-ambiguous": "Team on more than one side",
+  "pm-team-not-in-event": "Team not in the Polymarket game",
+  "pm-no-winner-market": "No open winner market",
+};
 
-  app.post("/api/bot/config", (req, res) => {
+function label(code) {
+  if (!code) return "Skipped";
+  if (LABEL[code]) return LABEL[code];
+  if (code.startsWith("unresolved:")) return "No Kalshi market found";
+  if (code.startsWith("skipped:")) return "Order not placed";
+  return code;
+}
+
+function title(s) {
+  return String(s || "").replace(/\b\w/g, (m) => m.toUpperCase());
+}
+
+function prettySport(key) {
+  return String(key || "")
+    .replace(/^americanfootball_/, "")
+    .replace(/^basketball_/, "")
+    .replace(/^baseball_/, "")
+    .replace(/^icehockey_/, "")
+    .replace(/^soccer_/, "")
+    .replace(/^tennis_/, "tennis ")
+    .replace(/_/g, " ")
+    .toUpperCase();
+}
+
+function ago(iso) {
+  if (!iso) return "never";
+  const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+}
+
+function readTab() {
+  try {
+    const v = localStorage.getItem("kx-scanner-tab");
+    return TABS.some(([k]) => k === v) ? v : "kalshi";
+  } catch {
+    return "kalshi";
+  }
+}
+
+const HEAD = { display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 };
+
+// Not a problem - the game is already covered - so shown without the red.
+const NEUTRAL = new Set(["already-held", "pm-already-held", "opposite-of-polymarket", "pm-opposite-of-kalshi", "waiting-for-bid-cancel"]);
+
+export default function ScannerPanel({ apiBase }) {
+  const [tab, setTab] = useState(readTab);
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [, setTick] = useState(0);
+
+  async function refresh(which = tab) {
     try {
-      const { environment, confirmedProductionAt, ...safeUpdates } = req.body || {};
-      res.json(saveConfig(safeUpdates));
+      const res = await fetch(`${apiBase}/api/scanner?venue=${which}`);
+      const body = await res.json();
+      if (body.error) throw new Error(body.error);
+      if (body.venue === which) setData(body);
+      setError(null);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      setError(err.message);
     }
-  });
+  }
 
-  app.post("/api/bot/environment", (req, res) => {
-    try {
-      const { environment, confirmed } = req.body || {};
-      if (!["demo", "production"].includes(environment)) {
-        return res.status(400).json({ error: "environment must be 'demo' or 'production'" });
-      }
-      res.json(setEnvironment(environment, confirmed));
-    } catch (err) {
-      res.status(400).json({ error: err.message });
-    }
-  });
+  useEffect(() => {
+    setData(null);
+    refresh(tab);
+    const poll = setInterval(() => refresh(tab), 10000);
+    const tick = setInterval(() => setTick((n) => n + 1), 5000);
+    return () => { clearInterval(poll); clearInterval(tick); };
+  }, [tab]);
 
-  // --- Live schedule (liveSchedule.js) --------------------------------------
-  // What is live now, what starts next, which sports are being scanned because
-  // of it, and the open-trade cap on each exchange. If the calendar is not
-  // built (bot stopped, or just started) it is built here first - the odds
-  // feed's events list is free, so this costs no credits.
-  app.get("/api/schedule", async (_req, res) => {
-    try {
-      const config = loadConfig();
-      if (!schedulePlan().ready) await refreshSchedule(config);
-      const pm = (() => { try { return pmStatus(config); } catch { return null; } })();
-      res.json({
-        ...scheduleReport(),
-        botRunning: isRunning(),
-        openTradeCap: {
-          kalshi: kalshiOpenTradeCap(config),
-          polymarket: pm?.lastScan
-            ? { cap: pm.lastScan.openCap ?? null, equity: pm.lastScan.equity ?? null, open: (pm.positions || []).length }
-            : null,
-        },
-      });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  function choose(v) {
+    try { localStorage.setItem("kx-scanner-tab", v); } catch { /* still works for this visit */ }
+    setTab(v);
+  }
 
-  // --- Scanner tab (scanFeed.js) ---------------------------------------------
-  // One exchange at a time: every team its scanner priced in the last 15
-  // minutes and the verdict in plain words, plus any game the live schedule
-  // has in play that this exchange did NOT look at, and why.
-  app.get("/api/scanner", (req, res) => {
-    try {
-      const venue = req.query.venue === "polymarket" ? "polymarket" : "kalshi";
-      const feed = scanFeedReport(venue);
-      const norm = (x) => String(x ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
-      const seen = new Set(feed.rows.map((r) => `${r.sportKey}|${norm(r.team)}`));
-      const sched = scheduleReport();
-      const off = new Set((loadConfig().disabledSports || []).map(String));
-      let series = {};
-      try { series = getSeriesMap() || {}; } catch { series = {}; }
-      let pmLeagues = {};
-      try { pmLeagues = mappedSports() || {}; } catch { pmLeagues = {}; }
-      const notLooked = [];
-      for (const g of sched.live || []) {
-        if (seen.has(`${g.sportKey}|${norm(g.home)}`) || seen.has(`${g.sportKey}|${norm(g.away)}`)) continue;
-        let why;
-        if (off.has(g.sportKey)) why = "Sport switched off in Bot Settings";
-        else if (venue === "kalshi" && !series[g.sportKey]) why = "Kalshi does not list this league";
-        else if (venue === "polymarket" && !pmLeagues[g.sportKey] && !/^tennis_(atp|wta)/.test(g.sportKey)) why = "Polymarket does not list this league";
-        else why = "Not priced yet - the scanner reaches it on its next pass (or the betting feed has no line for it right now)";
-        notLooked.push({ sportKey: g.sportKey, home: g.home, away: g.away, commence: g.commence, minutesIn: g.minutesIn, why });
-      }
-      res.json({ ...feed, schedule: { ready: sched.ready, liveGames: sched.counts?.liveGames ?? 0 }, notLooked });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  const name = tab === "polymarket" ? "Polymarket" : "Kalshi";
+  const rows = data?.rows || [];
+  const notLooked = data?.notLooked || [];
 
-  // --- Bot start/stop/status ---
-  app.get("/api/bot/status", async (_req, res) => {
-    try {
-      const state = loadState();
-      const config = loadConfig();
+  return (
+    <div className="panel">
+      <h2>Scanner</h2>
+      <div className="env-pill-group" role="tablist" aria-label="Scanner exchange"
+        style={{ display: "flex", width: "100%", boxSizing: "border-box", margin: "6px 0 12px" }}>
+        {TABS.map(([v, text]) => (
+          <button key={v} type="button" role="tab" aria-selected={tab === v}
+            className={`env-pill ${tab === v ? "env-pill-active" : ""}`}
+            style={{ flex: 1, padding: "10px 6px" }}
+            onClick={() => choose(v)}>
+            {text}
+          </button>
+        ))}
+      </div>
 
-      let currentBalance = null;
-      let survivalModeActive = null;
-      try {
-        const balanceData = await kalshiGet(`${V2}/portfolio/balance`);
-        currentBalance = (balanceData.balance ?? 0) / 100;
-        if (config.survivalMode) survivalModeActive = currentBalance < config.survivalMode.balanceThreshold;
-      } catch {
-        // leave null - the frontend handles it
-      }
+      <p className="setup-copy">
+        Every team the {name} scanner priced in the last 15 minutes and what it decided.
+        A game is bought only when the {name} price clears every rule on its own.
+      </p>
 
-      res.json({
-        running: isRunning(),
-        environment: config.environment,
-        haltedForDay: state.haltedForDay,
-        haltReason: state.haltReason,
-        dayStartBalance: state.dayStartBalance,
-        currentBalance,
-        survivalMode: config.survivalMode ? { active: survivalModeActive, ...config.survivalMode } : null,
-        openPositions: state.positions,
-        botStartedAt: state.botStartedAt,
-        tradeStats: getTradeStats(),
-      });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+      {error && <div className="error-banner" style={{ marginTop: 12 }}>{error}</div>}
+      {!data && !error && <div className="ledger-reason">Loading...</div>}
 
-  app.post("/api/bot/start", (_req, res) => {
-    try {
-      res.json(startBot());
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+      {data && (
+        <>
+          <div className="ledger-figures ledger-summary">
+            <div><span>Last scan</span><strong>{ago(data.lastScanAt)}</strong></div>
+            <div><span>Teams priced</span><strong>{data.counts?.teams ?? 0}</strong></div>
+            <div><span>Bought</span><strong className={data.counts?.bought ? "pos" : ""}>{data.counts?.bought ?? 0}</strong></div>
+            <div><span>Live games</span><strong>{data.schedule?.liveGames ?? "—"}</strong></div>
+          </div>
 
-  /**
-   * Clears a day halt and re-bases the drawdown baseline to current equity.
-   *
-   * Without this the only way out of a halt was to wait for the server's
-   * calendar day to roll over - which on a UTC host is mid-afternoon local
-   * time, and meant a loss taken under a strategy that has since been replaced
-   * went on blocking the replacement from ever trading.
-   */
-  app.post("/api/bot/resume", async (_req, res) => {
-    try {
-      const result = await resumeTrading();
-      resetCircuitBreaker();
-      res.json(result);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+          {!rows.length && (
+            <div className="ledger-reason" style={{ marginTop: 10 }}>
+              {data.lastScanAt
+                ? `Nothing priced on ${name} in the last 15 minutes - no game was live or starting in its covered leagues.`
+                : `The ${name} scanner has not run since the last restart - it starts with the next cycle.`}
+            </div>
+          )}
 
-  app.post("/api/bot/stop", (_req, res) => {
-    try {
-      res.json(stopBot());
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+          {rows.map((r) => (
+            <div key={`${r.sportKey}-${r.team}`} className="ledger-card" style={{ marginTop: 8 }}>
+              <div className="ledger-card-head" style={HEAD}>
+                <span>{title(r.team)}{r.opponent ? <span style={{ fontWeight: 400, opacity: 0.75 }}> vs {title(r.opponent)}</span> : null}</span>
+                <span className={r.verdict === "bought" ? "pos" : r.verdict === "tried" || NEUTRAL.has(r.code) ? "" : "neg"}>
+                  {r.verdict === "bought" ? "✅ " : ""}{label(r.code)}
+                </span>
+              </div>
+              <div className="ledger-reason">
+                {prettySport(r.sportKey)}
+                {r.priceCents != null ? ` · price ${r.priceCents}¢` : ""}
+                {r.fairPct != null ? ` · fair ${r.fairPct}%` : ""}
+                {` · ${ago(r.lastCheckedAt || r.at)}`}
+              </div>
+              {r.why && <div className="ledger-reason" style={{ marginTop: 4 }}>{r.why}</div>}
+            </div>
+          ))}
 
-  app.get("/api/bot/log", (req, res) => {
-    const limit = Number(req.query.limit) || 100;
-    res.json({ log: getRecentLog(limit) });
-  });
-
-  app.get("/api/trade-ledger", (req, res) => {
-    const limit = Number(req.query.limit) || 100;
-    res.json({ trades: getRecentTrades(limit) });
-  });
-
-  /**
-   * Full trade lifecycles: completed round-trips with real cost, proceeds and
-   * ROI, plus still-open positions. Final scores are opt-in (?withScores=true)
-   * because they bill against the odds API separately from odds.
-   */
-  app.get("/api/trade-lifecycles", async (req, res) => {
-    try {
-      // ?venue=kalshi | polymarket | all (default all) - the dashboard's
-      // account switcher. Each trade also carries its venue.
-      const venue = String(req.query.venue || "all");
-      const lc = getTradeLifecycles();
-      const completed = filterByVenue(lc.completed, venue).map((t) => ({ ...t, venue: venueOf(t.ticker) }));
-      const open = filterByVenue(lc.open, venue).map((t) => ({ ...t, venue: venueOf(t.ticker) }));
-
-      if (req.query.withScores === "true" && completed.length) {
-        const sportKeys = [...new Set(completed.map((t) => t.sportKey).filter(Boolean))];
-        const scoresBySport = {};
-        for (const sportKey of sportKeys) {
-          try {
-            const { events } = await getRecentScores(sportKey);
-            scoresBySport[sportKey] = events;
-          } catch {
-            scoresBySport[sportKey] = [];
-          }
-        }
-        for (const trade of completed) {
-          if (!trade.sportKey || !trade.teamName) continue;
-          trade.finalScore = findScoreForTeam(scoresBySport[trade.sportKey] || [], trade.teamName);
-        }
-      }
-
-      res.json({ completed, open, venue, stats: getTradeStats(venue) });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  /**
-   * Original diagnostic. Fully guarded - an unhandled throw here used to return
-   * Express's HTML error page, which the panel reported as a JSON parse error
-   * that named nothing useful. /api/diagnose/v2 in diagnostics.js is the
-   * deeper report; this stays for compatibility.
-   */
-  /**
-   * Groups completed trades by the dimensions the strategy has knobs for -
-   * exit behaviour, entry price band, edge size, in-play vs pre-game - so
-   * thresholds can be tuned against results instead of argument.
-   */
-  app.get("/api/strategy-review", (_req, res) => {
-    try {
-      res.json(buildStrategyReview());
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  /**
-   * CLOSING LINE VALUE. Per-segment CLV (sport, timing, price band), what is
-   * killed, what is proven, and the most recent marks - every one a live
-   * Kalshi book read.
-   */
-  app.get("/api/clv", (_req, res) => {
-    try {
-      res.json(clvReport(loadConfig()));
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  /**
-   * Marks the account's HISTORICAL trades from Kalshi's one-minute candles, so
-   * the kill switch starts from the real record. Safe to run more than once -
-   * trades already marked are skipped. Reports every skip with its reason.
-   */
-  app.post("/api/clv/backfill", async (_req, res) => {
-    try {
-      const entries = loadLedger().filter((t) => t.action === "enter" && t.filled > 0);
-      res.json(await backfillFromLedger(entries, loadConfig()));
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  /** Clears a kill by hand: body { segment: "sport:baseball_mlb" } or { segment: "*" }. */
-  app.post("/api/clv/clear-kill", (req, res) => {
-    try {
-      const seg = String(req.body?.segment || "");
-      if (!seg) return res.status(400).json({ error: "segment is required (or \"*\" for all)" });
-      res.json({ cleared: clearKill(seg) });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  /** Fair-value exit: mode, and every WOULD SELL / SOLD / SUSPECT decision with its real numbers. */
-  app.get("/api/fair-value", (_req, res) => {
-    try {
-      res.json(fairValueReport(loadConfig()));
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  app.get("/api/diagnose", async (_req, res) => {
-    const report = { config: {}, pool: [], activeSports: [], sports: [] };
-
-    try {
-      const config = loadConfig();
-      report.pool = config.sportsPool || config.sports || [];
-      report.config = {
-        entryWindowHours: config.entryWindowHours,
-        minEntryPriceCents: config.minEntryPriceCents,
-        perPositionStopLossPct: config.perPositionStopLossPct,
-        exitBelowCost: config.exitBelowCost,
-      };
-
-      try {
-        report.activeSports = await discoverActiveSports();
-      } catch (err) {
-        report.sportsError = err.message;
-      }
-
-      for (const sportKey of report.activeSports) {
-        const entry = { sportKey, oddsOk: false, teamsFound: 0, samples: [] };
-        try {
-          const probResult = await getSharpProbabilities(sportKey, {
-            oddsPapiTournamentId: (config.oddsPapiTournamentIds || {})[sportKey],
-            providerOrder: config.oddsProviderOrder,
-          });
-          entry.oddsOk = true;
-          entry.provider = probResult.provider;
-          entry.quotaRemaining = probResult.quota?.remaining ?? null;
-
-          const teams = Object.entries(probResult.probabilities);
-          entry.teamsFound = teams.length;
-
-          for (const [teamName, info] of teams.slice(0, 3)) {
-            const sample = { teamName, trueProbability: info.trueProbability, commenceTime: info.commenceTime };
-            try {
-              const resolved = await resolveTicker({ sportKey, teamName, commenceTime: info.commenceTime });
-              sample.ticker = resolved.ticker;
-              sample.resolveReason = resolved.reason;
-              if (resolved.ticker) {
-                const m = await kalshiGet(`${V2}/markets/${resolved.ticker}`);
-                sample.marketStatus = m.market?.status;
-                sample.yesAsk = m.market?.yes_ask;
-                sample.yesAskSize = m.market?.yes_ask_size;
-              }
-            } catch (err) {
-              sample.marketError = err.message;
-            }
-            entry.samples.push(sample);
-          }
-        } catch (err) {
-          entry.oddsError = err.message;
-        }
-        report.sports.push(entry);
-      }
-
-      res.json(report);
-    } catch (err) {
-      res.status(500).json({ error: err.message, partial: report });
-    }
-  });
-
-  /**
-   * Per-sport coverage walk.
-   *
-   * Answers "would this sport trade if an edge existed", stage by stage, using
-   * the same functions the scanner uses. On demand only: it spends one odds
-   * credit per sport, so nothing here runs on a timer.
-   *
-   *   GET /api/coverage                      -> the 12 required sports
-   *   GET /api/coverage?sports=a,b           -> just those
-   *   GET /api/coverage?discovered=true      -> whatever the feed says is live
-   *   GET /api/coverage?sample=3             -> markets sampled per sport (1-12)
-   */
-  app.get("/api/coverage", async (req, res) => {
-    try {
-      let sports = null;
-
-      if (typeof req.query.sports === "string" && req.query.sports.trim()) {
-        sports = req.query.sports.split(",").map((s) => s.trim()).filter(Boolean);
-      } else if (req.query.discovered === "true") {
-        try {
-          const active = await discoverActiveSports();
-          // Union with the required list so a required sport going missing from
-          // discovery is visible as a row rather than silently absent.
-          sports = [...new Set([...REQUIRED_SPORTS, ...active])];
-        } catch (err) {
-          sports = REQUIRED_SPORTS;
-          res.set("X-Coverage-Note", `discovery failed: ${err.message}`);
-        }
-      }
-
-      const sampleSize = Math.min(12, Math.max(1, Number(req.query.sample) || 6));
-      const report = await runCoverageCheck({ sports, sampleSize });
-      report.requiredSports = REQUIRED_SPORTS;
-      report.coverageVersion = COVERAGE_VERSION;
-      res.json(report);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+          {notLooked.length > 0 && (
+            <div className="bot-subsection">
+              <h3 style={{ margin: "14px 0 6px" }}>Live now, not priced on {name}</h3>
+              {notLooked.map((g) => (
+                <div key={`${g.sportKey}-${g.home}-${g.away}`} className="ledger-card">
+                  <div className="ledger-card-head" style={HEAD}>
+                    <span>{g.home ?? "?"} v {g.away ?? "?"}</span>
+                    <span>{g.minutesIn != null ? `${g.minutesIn} min in` : ""}</span>
+                  </div>
+                  <div className="ledger-reason">{prettySport(g.sportKey)} · {g.why}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
 }
