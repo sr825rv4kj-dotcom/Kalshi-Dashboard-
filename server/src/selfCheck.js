@@ -10,6 +10,7 @@
 import { loadConfig } from "./configStore.js";
 import { loadState } from "./stateStore.js";
 import { kalshiGet } from "./kalshiClient.js";
+import { kalshiOpenTradeCap } from "./botController.js";
 
 const V2 = "/trade-api/v2";
 
@@ -225,12 +226,28 @@ function checkConfig(config, bankroll) {
     });
   }
 
-  const cap = config.maxConcurrentPositions;
-  if (cap != null && cap < 1) {
+  // OPEN-TRADE CAP (2026-09-28). The old check here called 0 a blocker ("no
+  // position can ever open"). That was wrong: every cap check in the bot reads
+  // 0 or empty as "no fixed cap" - the Bears were bought with it at 0. Now 0 or
+  // empty means the balance rule: as many stakes as fit in 75% of equity,
+  // never fewer than 5 open trades, never more than 10, on each exchange.
+  const cap = Number(config.maxConcurrentPositions);
+  if (Number.isFinite(cap) && cap > 0) {
     f.push({
-      level: "blocker", area: "limits",
-      detail: `maxConcurrentPositions is ${cap} - no position can ever open.`,
-      fix: "Set it to 2 or more.",
+      level: cap < 2 ? "warn" : "ok", area: "limits",
+      detail: `Fixed cap: at most ${cap} open trade(s) on Kalshi, set by hand - it overrides the 5-10 balance rule.`,
+      fix: cap < 2 ? "Clear maxConcurrentPositions (set it to 0) to use the 5-10 balance rule." : "No action needed. Set it to 0 to go back to the balance rule.",
+    });
+  } else {
+    let live = null;
+    try { live = kalshiOpenTradeCap(config); } catch { live = null; }
+    const detail = live && live.cap != null
+      ? `Kalshi right now: $${live.equity.toFixed(2)} equity -> up to ${live.cap} open (${live.open} open now).`
+      : "Kalshi's cap is shown here after the bot's first cycle reads the balance.";
+    f.push({
+      level: "ok", area: "limits",
+      detail: `No fixed cap - open trades follow the balance rule on each exchange: 5 to 10, as many stakes as fit in 75% of equity. ${detail}`,
+      fix: "No action needed. The cap rises and falls with the balance on its own.",
     });
   }
 
