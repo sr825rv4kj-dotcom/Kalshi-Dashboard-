@@ -13,6 +13,11 @@
  *   - the book only quotes the YES side. YES ask = what a YES buyer pays;
  *     a NO buyer pays 1 - YES bid.
  *   - prices:   GET gateway /v1/markets/{slug}/bbo
+ *     The game listing carries the same best bid / best ask on each market
+ *     (bestBidQuote / bestAskQuote, YES side) - on real data at 00:58Z
+ *     2026-09-30 the listing and the price endpoint both read 57.5c / 58c for
+ *     aec-nfl-pit-cle. When the price endpoint is rate-limited, the listing
+ *     read seconds earlier is used instead (see sidePrice).
  *
  * WRONG-TEAM PROTECTION. The Kalshi resolver once bought the Mets for a
  * Yankees model because two teams shared a city. Here a game only matches
@@ -25,7 +30,7 @@
 import { pmGet, centsOf, numberOf } from "./pmClient.js";
 import { normName } from "./pmState.js";
 
-export const PM_MARKETS_VERSION = "2026-09-28-docs-market-type";
+export const PM_MARKETS_VERSION = "2026-09-29-listing-price-fallback";
 
 /**
  * Odds-feed sport -> Polymarket league slug(s). VERIFIED 2026-09-28 against the
@@ -204,19 +209,46 @@ export function mappedSports() {
 
 const eventCache = new Map();   // slug -> { at, events }
 const EVENT_TTL_MS = 20_000;
+// A listing this old still names the right games (teams, sides, market
+// slugs) when a fresh read is rate-limited; it is never used for PRICES
+// beyond LISTING_PRICE_MAX_AGE_MS below.
+const EVENT_STALE_OK_MS = 5 * 60 * 1000;
+const LISTING_PRICE_MAX_AGE_MS = 30_000;
+const fallbackStats = { listingReads: 0, listingPrices: 0, lastListingPriceAt: null };
 
 export async function getLeagueEvents(slug) {
   const hit = eventCache.get(slug);
   if (hit && Date.now() - hit.at < EVENT_TTL_MS) return hit.events;
   const events = [];
-  for (let offset = 0; offset < 300; offset += 100) {
-    const res = await pmGet(`/v2/leagues/${encodeURIComponent(slug)}/events`, { query: { limit: 100, offset, type: "sport" } });
-    const rows = res.events || [];
-    events.push(...rows);
-    if (rows.length < 100) break;
+  try {
+    for (let offset = 0; offset < 300; offset += 100) {
+      const res = await pmGet(`/v2/leagues/${encodeURIComponent(slug)}/events`, { query: { limit: 100, offset, type: "sport" } });
+      const rows = res.events || [];
+      events.push(...rows);
+      if (rows.length < 100) break;
+    }
+  } catch (err) {
+    // Rate-limited or unreachable: the last listing (under 5 minutes old)
+    // still identifies the games; prices come from the price endpoint.
+    if (hit && Date.now() - hit.at < EVENT_STALE_OK_MS && (err.kind === "rate-limited" || err.kind === "transport")) {
+      fallbackStats.listingReads++;
+      return hit.events;
+    }
+    throw err;
   }
   eventCache.set(slug, { at: Date.now(), events });
   return events;
+}
+
+/** The market with this slug in a cached game listing, and how old that listing is. */
+function listedMarket(marketSlug) {
+  for (const { at, events } of eventCache.values()) {
+    for (const ev of events) {
+      const m = (ev.markets || []).find((x) => x.slug === marketSlug);
+      if (m) return { market: m, ageMs: Date.now() - at };
+    }
+  }
+  return null;
 }
 
 // --- Name matching -------------------------------------------------------------------
@@ -406,8 +438,32 @@ export function winnerSideFor(ev, teamName) {
  *   short: ask = 100 - YES best bid,    size = shares bid
  */
 export async function sidePrice(slug, long) {
-  const res = await pmGet(`/v1/markets/${encodeURIComponent(slug)}/bbo`);
-  const d = res.marketData || res.bbo || res;
+  let d;
+  let source = "bbo";
+  try {
+    const res = await pmGet(`/v1/markets/${encodeURIComponent(slug)}/bbo`);
+    d = res.marketData || res.bbo || res;
+  } catch (err) {
+    // RATE LIMIT FALLBACK (2026-09-29): the game listing read within the last
+    // 30 seconds carries the same best bid / best ask (YES side). Depth is
+    // not in the listing, so the size is left open - the order is
+    // immediate-or-cancel at a limit that is positive-EV by construction, so
+    // it can only fill what is there at or under that price.
+    const hit = (err.kind === "rate-limited" || err.kind === "transport") ? listedMarket(slug) : null;
+    if (!hit || hit.ageMs > LISTING_PRICE_MAX_AGE_MS) throw err;
+    const m = hit.market;
+    if (m.bestBidQuote == null && m.bestAskQuote == null) throw err;
+    fallbackStats.listingPrices++;
+    fallbackStats.lastListingPriceAt = new Date().toISOString();
+    source = `listing (${Math.round(hit.ageMs / 1000)}s old)`;
+    d = {
+      bestBid: m.bestBidQuote ?? null,
+      bestAsk: m.bestAskQuote ?? null,
+      state: m.closed === true || m.active === false ? "MARKET_STATE_CLOSED" : "MARKET_STATE_OPEN",
+      askShares: 1e9,
+      bidShares: 1e9,
+    };
+  }
   const bid = centsOf(d.bestBid);
   const ask = centsOf(d.bestAsk);
   const state = String(d.state || "");
@@ -415,14 +471,14 @@ export async function sidePrice(slug, long) {
   if (long) {
     return {
       askCents: ask, bidCents: bid, askSize: numberOf(d.askShares, d.askQty) ?? 0,
-      spreadCents: ask != null && bid != null ? ask - bid : null, state, open, raw: d,
+      spreadCents: ask != null && bid != null ? ask - bid : null, state, open, raw: d, source,
     };
   }
   return {
     askCents: bid != null ? Math.round((100 - bid) * 10) / 10 : null,
     bidCents: ask != null ? Math.round((100 - ask) * 10) / 10 : null,
     askSize: numberOf(d.bidShares, d.bidQty) ?? 0,
-    spreadCents: ask != null && bid != null ? ask - bid : null, state, open, raw: d,
+    spreadCents: ask != null && bid != null ? ask - bid : null, state, open, raw: d, source,
   };
 }
 
@@ -431,5 +487,6 @@ export function pmMarketsReport() {
     version: PM_MARKETS_VERSION,
     leaguesCached: leagueCache.leagues.map((l) => l.slug),
     eventCaches: [...eventCache.entries()].map(([slug, v]) => ({ slug, events: v.events.length, ageSeconds: Math.round((Date.now() - v.at) / 1000) })),
+    rateLimitFallback: { ...fallbackStats },
   };
 }
