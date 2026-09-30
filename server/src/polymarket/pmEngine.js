@@ -738,7 +738,7 @@ export async function scanPolymarket(config, settings, active) {
       // positions are still managed and sold by the swing engine).
       if (timing.live && !entryAllowedForSport(sportKey, config)) {
         bump("pm-no-model", `${teamNames.join(" vs ")} (${sportKey})`);
-        for (const n of teamNames) feed({ sportKey, team: n, opponent: teamNames.find((x) => x !== n), commenceTime, code: "pm-no-model", why: "No calibrated in-game model for this sport - only modelled sports are bought" });
+        for (const n of teamNames) feed({ sportKey, team: n, opponent: teamNames.find((x) => x !== n), commenceTime, code: "pm-no-model", why: "This sport is not on the trade list - only sports with a proven record are bought" });
         continue;
       }
       seen += 2;
