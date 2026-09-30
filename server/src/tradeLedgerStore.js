@@ -73,7 +73,7 @@ function writeLedger(ledger) {
 
 export function recordTrade({
   action, ticker, side, contracts, priceCents, reason, environment, edgePct, filled,
-  teamName, sportKey, commenceTime, exitPriceCents, feeCents, maker,
+  teamName, sportKey, commenceTime, exitPriceCents, feeCents, maker, lotId,
 }) {
   const ledger = loadLedger();
   ledger.push({
@@ -85,6 +85,9 @@ export function recordTrade({
     teamName: teamName ?? null,
     sportKey: sportKey ?? null,
     commenceTime: commenceTime ?? null,
+    // The position this row belongs to (its openedAt) - lets a sale be matched
+    // to the exact buy when one ticker holds two positions (double-down).
+    lotId: lotId ?? undefined,
   });
   writeLedger(ledger);
 }
@@ -95,57 +98,42 @@ export function getRecentTrades(limit = 100) {
 }
 
 /**
- * Pairs each entry with its matching exit to produce completed round-trips
- * with real cost, proceeds, net P&L and ROI.
+ * ROUND TRIPS, INCLUDING PARTIAL SELLS (2026-09-29, swing trading).
  *
- * All dollar figures derive from actual fill prices and counts recorded at
- * execution time - nothing here is estimated or simulated.
+ * The swing engine sells a position in pieces - half when the price climbs
+ * back to fair value, the rest at the +65% target (swingEngine.js). One entry
+ * can therefore close through two or more exit rows, and a game can be bought
+ * again after it is sold.
+ *
+ * Exits are matched to entries by LOT first: a row carrying lotId (the
+ * position's openedAt, written by this build) closes contracts of the entry
+ * with the same lotId. Anything left - and every older row without one - is
+ * matched FIRST IN, FIRST OUT, per ticker, in ledger order: the oldest open
+ * entry of that ticker, then the next. A trade (one entry) is complete when all of its
+ * contracts are closed; its proceeds are the sum of every piece, net of each
+ * piece's share of that exit's fee.
+ *
+ * For a ledger where every exit closes exactly one whole entry - the whole
+ * history before this build - this gives the same trades, costs and results
+ * as the old one-entry-one-exit pairing (checked on the account's 118 closed
+ * trades). It is also right where the old pairing was not: an exit that only
+ * partly filled, followed by a second exit for the rest.
+ *
+ * Also returned: `pieces`, one row per exit allocation with the profit it
+ * realised and when - today's P&L and round trips per game come from these.
+ * Every figure comes from recorded fills; nothing is estimated.
  */
 export function getTradeLifecycles() {
   const ledger = loadLedger();
-
-  // Pair on LEDGER ORDER, not on a strict timestamp comparison. An exit that
-  // landed in the same second as its entry - routine with immediate-or-cancel
-  // orders - failed "exit.timestamp > entry.timestamp" and left the trade
-  // stranded as permanently open, with no cost, proceeds or ROI ever reported.
-  const entries = ledger
-    .map((t, i) => ({ ...t, _i: i }))
-    .filter((t) => t.action === "enter" && t.filled > 0);
-  const exits = ledger
-    .map((t, i) => ({ ...t, _i: i }))
-    .filter((t) => t.action === "exit" && t.filled > 0);
-  const usedExitIndexes = new Set();
-
+  const lots = [];
   const completed = [];
-  const open = [];
+  const pieces = [];
 
-  for (const entry of entries) {
-    const exitIndex = exits.findIndex(
-      (x, i) => !usedExitIndexes.has(i) && x.ticker === entry.ticker && x._i > entry._i
-    );
-
-    // What was put up: the contracts at the price paid, PLUS the entry fee.
-    const entryFeeDollars = entryFeeCents(entry) / 100;
-    const costDollars = (entry.filled * entry.priceCents) / 100 + entryFeeDollars;
-
-    if (exitIndex === -1) {
-      open.push({
-        ...entry,
-        costDollars,
-        feesDollars: entryFeeDollars,
-        status: "open",
-      });
-      continue;
-    }
-
-    usedExitIndexes.add(exitIndex);
-    const exit = exits[exitIndex];
-    // What came back: the payout, MINUS the exit fee (zero at settlement).
-    const exitFeeDollars = exitFeeCents(exit) / 100;
-    const proceedsDollars = (exit.filled * (exit.exitPriceCents ?? exit.priceCents)) / 100 - exitFeeDollars;
-    const netDollars = proceedsDollars - costDollars;
-    const roiPct = costDollars > 0 ? (netDollars / costDollars) * 100 : null;
-
+  const finish = (lot) => {
+    const entry = lot.entry;
+    const netDollars = lot.proceedsDollars - lot.costDollars;
+    const last = lot.exits[lot.exits.length - 1];
+    const reasons = [...new Set(lot.exits.map((x) => String(x.reason || "")))].filter(Boolean);
     completed.push({
       ticker: entry.ticker,
       side: entry.side,
@@ -154,23 +142,97 @@ export function getTradeLifecycles() {
       commenceTime: entry.commenceTime,
       environment: entry.environment,
       entryTimestamp: entry.timestamp,
-      exitTimestamp: exit.timestamp,
+      exitTimestamp: last.timestamp,
       contracts: entry.filled,
       entryPriceCents: entry.priceCents,
-      exitPriceCents: exit.exitPriceCents ?? exit.priceCents,
-      costDollars,
-      proceedsDollars,
-      feesDollars: entryFeeDollars + exitFeeDollars,
+      exitPriceCents: Math.round((lot.exitValueCents / entry.filled) * 10) / 10,
+      costDollars: lot.costDollars,
+      proceedsDollars: lot.proceedsDollars,
+      feesDollars: lot.entryFeeDollars + lot.exitFeeDollars,
       netDollars,
-      roiPct,
+      roiPct: lot.costDollars > 0 ? (netDollars / lot.costDollars) * 100 : null,
       entryReason: entry.reason,
-      exitReason: exit.reason,
+      exitReason: reasons.length > 1 ? reasons.join(" + ") : (reasons[0] || last.reason),
+      exitPieces: lot.exits.length,
       edgePct: entry.edgePct,
       status: "closed",
+      _order: lot.order,
     });
+  };
+
+  for (const t of ledger) {
+    if (t.action === "enter" && t.filled > 0) {
+      const entryFeeDollars = entryFeeCents(t) / 100;
+      lots.push({
+        order: lots.length,
+        entry: t,
+        remaining: t.filled,
+        // What was put up: the contracts at the price paid, PLUS the entry fee.
+        costDollars: (t.filled * t.priceCents) / 100 + entryFeeDollars,
+        entryFeeDollars,
+        proceedsDollars: 0,
+        exitFeeDollars: 0,
+        exitValueCents: 0,
+        exits: [],
+      });
+      continue;
+    }
+    if (t.action !== "exit" || !(t.filled > 0)) continue;
+
+    // What came back: the payout, MINUS the exit fee (zero at settlement),
+    // shared across the entries this exit closes by contracts.
+    const exitFeeDollars = exitFeeCents(t) / 100;
+    const px = t.exitPriceCents ?? t.priceCents;
+    let left = t.filled;
+    const own = t.lotId ? lots.filter((l) => l.entry.lotId === t.lotId && l.entry.ticker === t.ticker) : [];
+    const rest = lots.filter((l) => !own.includes(l));
+    for (const lot of [...own, ...rest]) {
+      if (left <= 0) break;
+      if (lot.remaining <= 0 || lot.entry.ticker !== t.ticker) continue;
+      const take = Math.min(left, lot.remaining);
+      const feeShare = exitFeeDollars * (take / t.filled);
+      const gross = (take * px) / 100;
+      lot.remaining -= take;
+      left -= take;
+      lot.proceedsDollars += gross - feeShare;
+      lot.exitFeeDollars += feeShare;
+      lot.exitValueCents += take * px;
+      lot.exits.push(t);
+      const costShare = lot.costDollars * (take / lot.entry.filled);
+      pieces.push({
+        ticker: t.ticker,
+        teamName: lot.entry.teamName ?? t.teamName ?? null,
+        sportKey: lot.entry.sportKey ?? t.sportKey ?? null,
+        commenceTime: lot.entry.commenceTime ?? t.commenceTime ?? null,
+        timestamp: t.timestamp,
+        entryTimestamp: lot.entry.timestamp,
+        contracts: take,
+        entryPriceCents: lot.entry.priceCents,
+        exitPriceCents: px,
+        netDollars: gross - feeShare - costShare,
+        reason: t.reason,
+        closesTrade: lot.remaining === 0,
+      });
+      if (lot.remaining === 0) finish(lot);
+    }
   }
 
-  return { completed: completed.reverse(), open: open.reverse() };
+  const open = lots
+    .filter((lot) => lot.remaining > 0)
+    .map((lot) => ({
+      ...lot.entry,
+      remainingContracts: lot.remaining,
+      // Cost of what is still held (a part-sold trade carries its share).
+      costDollars: lot.costDollars * (lot.remaining / lot.entry.filled),
+      feesDollars: lot.entryFeeDollars,
+      realizedDollars: lot.exits.length ? lot.proceedsDollars - lot.costDollars * ((lot.entry.filled - lot.remaining) / lot.entry.filled) : 0,
+      status: lot.exits.length ? "part-sold" : "open",
+    }));
+
+  // Same order as before: by entry, newest first.
+  completed.sort((a, b) => b._order - a._order);
+  for (const c of completed) delete c._order;
+  return { completed, open: open.reverse(), pieces };
 }
 
 /**
