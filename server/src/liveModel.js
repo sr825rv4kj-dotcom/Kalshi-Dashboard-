@@ -118,6 +118,9 @@ export function modeledSportsOnly(config = {}) {
 
 /** True when a new entry in this sport is allowed under the current config. */
 export function entryAllowedForSport(sportKey, config = {}) {
+  // TRADE LIST (2026-09-30): when config.entrySports is a non-empty list, new
+  // buys happen in those sports only. Empty or missing = no list.
+  if (Array.isArray(config.entrySports) && config.entrySports.length) return config.entrySports.includes(sportKey);
   return !modeledSportsOnly(config) || !!SPORT_PARAMS[sportKey];
 }
 
