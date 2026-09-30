@@ -171,6 +171,7 @@ const CODE_GUIDE = {
   "dropped:duplicate": { severity: "info", healthy: true, title: "Already holding that game", fix: "Healthy." },
   "learned-block": { severity: "info", healthy: true, title: "Skipped - this sport or price band has lost more than its prices implied", fix: "Healthy. The learner re-checks every minute and restores it if results recover." },
   "return-too-small": { severity: "info", healthy: true, title: "Expected return under the minimum (minExpectedReturnPct) - skipped", fix: "Healthy. Thin-edge trades are refused by design." },
+  "dropped:unmodeled": { severity: "info", healthy: true, title: "Sport not on the trade list (entrySports) - no new buys there", fix: "Healthy. Set by design: only sports with a proven record are bought." },
   "dropped:pregame": { severity: "info", healthy: true, title: "Game not started yet - the bot trades live games only", fix: "Healthy. It becomes eligible at first pitch / kickoff." },
   "clv-killed": { severity: "info", healthy: true, title: "Paused by the CLV kill switch - shadow-tracked, revives on its own", fix: "Healthy. The segment restarts automatically once its tracked prices recover." },
   "dropped:window": { severity: "info", healthy: true, title: "Game starts outside the entry window", fix: "Healthy - it becomes eligible closer to start." },
