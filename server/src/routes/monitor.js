@@ -128,6 +128,7 @@ function safeConfig(cfg) {
     survivalMode: cfg.survivalMode,
     liveOnly: cfg.liveOnly !== false,
     modeledSportsOnly: cfg.modeledSportsOnly !== false,
+    entrySports: Array.isArray(cfg.entrySports) ? cfg.entrySports : [],
     flatStakeDollars: cfg.flatStakeDollars,
     minExpectedReturnPct: cfg.minExpectedReturnPct,
     liveBandMinCents: cfg.liveBandMinCents,
