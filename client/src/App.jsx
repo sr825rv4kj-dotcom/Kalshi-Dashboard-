@@ -21,7 +21,7 @@ import StrategyReviewPanel from "./components/StrategyReviewPanel.jsx";
 import CoveragePanel from "./components/CoveragePanel.jsx";
 import PolymarketPanel from "./components/PolymarketPanel.jsx";
 import LiveSchedulePanel from "./components/LiveSchedulePanel.jsx";
-import ScannerPanel from "./components/ScannerPanel.jsx";
+import TradingDesk from "./components/TradingDesk.jsx";
 import VenueTabs, { readVenue, saveVenue, venueLabel } from "./components/VenueTabs.jsx";
 import { applyWallpaper, readLocal, defaultSettings } from "./wallpapers.js";
 
@@ -36,6 +36,17 @@ try {
   applyWallpaper((readLocal() || defaultSettings()).active);
 } catch {
   // a wallpaper must never be the reason the dashboard fails to start
+}
+
+const SECTIONS = [["desk", "Desk"], ["performance", "Performance"], ["controls", "Controls"], ["system", "System"]];
+
+function readSection() {
+  try {
+    const v = localStorage.getItem("kx-section");
+    return SECTIONS.some(([k]) => k === v) ? v : "desk";
+  } catch {
+    return "desk";
+  }
 }
 
 function DashboardApp() {
@@ -59,6 +70,10 @@ function DashboardApp() {
   const [pnlSeries, setPnlSeries] = useState([]);
   const [error, setError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
+  // SECTIONS (2026-09-29): Desk (trading now), Performance (results),
+  // Controls (settings and keys), System (schedule, coverage, checks).
+  const [section, setSectionState] = useState(readSection);
+  const setSection = (v) => { try { localStorage.setItem("kx-section", v); } catch { /* still switches */ } setSectionState(v); };
 
   async function checkConfigured() {
     try {
@@ -167,36 +182,65 @@ function DashboardApp() {
         </div>
       )}
 
-      <VenueTabs venue={venue} onChange={setVenue} />
-
-      <BalanceBlock accounts={accounts} venue={venue} />
-
-      <div className="chart-panel panel">
-        <h2>Cumulative P&amp;L · {venueLabel(venue)}</h2>
-        <PnlChart series={pnlSeries} />
+      <div className="env-pill-group" role="tablist" aria-label="Section"
+        style={{ display: "flex", width: "100%", boxSizing: "border-box", margin: "4px 0 14px" }}>
+        {SECTIONS.map(([v, text]) => (
+          <button key={v} type="button" role="tab" aria-selected={section === v}
+            className={`env-pill ${section === v ? "env-pill-active" : ""}`}
+            style={{ flex: 1, padding: "10px 4px" }}
+            onClick={() => setSection(v)}>
+            {text}
+          </button>
+        ))}
       </div>
 
-      <div className="grid">
-        <div className="panel"><h2>Open Positions · {venueLabel(venue)}</h2><PositionsTable positions={positions} showVenue={venue === "all"} /></div>
-        <div className="panel"><h2>Statement · {venueLabel(venue)}</h2><OrdersTable venue={venue} /></div>
-      </div>
+      {section === "desk" && (
+        <>
+          <TradingDesk apiBase={API_BASE} />
+          <VenueTabs venue={venue} onChange={setVenue} />
+          <BalanceBlock accounts={accounts} venue={venue} />
+          <div className="grid">
+            <div className="panel"><h2>Open Positions · {venueLabel(venue)}</h2><PositionsTable positions={positions} showVenue={venue === "all"} /></div>
+            <div className="panel"><h2>Statement · {venueLabel(venue)}</h2><OrdersTable venue={venue} /></div>
+          </div>
+        </>
+      )}
 
-      <BotControlPanel apiBase={API_BASE} />
-      <ScannerPanel apiBase={API_BASE} />
-      <LiveSchedulePanel apiBase={API_BASE} />
-      <PolymarketPanel apiBase={API_BASE} />
-      <CoveragePanel apiBase={API_BASE} />
-      <StrategyReviewPanel apiBase={API_BASE} />
-      <SelfCheckPanel apiBase={API_BASE} />
-      <DiagnosticPanel apiBase={API_BASE} />
-      <BotConfigPanel apiBase={API_BASE} />
-      <GamesBoard apiBase={API_BASE} />
-      <MilestonesPanel apiBase={API_BASE} />
-      <TradeLedgerPanel apiBase={API_BASE} venue={venue} />
-      <NotificationsPanel apiBase={API_BASE} />
-      <CostTrackingPanel apiBase={API_BASE} />
-      <ApiKeysPanel apiBase={API_BASE} />
-      <WallpaperPanel apiBase={API_BASE} />
+      {section === "performance" && (
+        <>
+          <VenueTabs venue={venue} onChange={setVenue} />
+          <div className="chart-panel panel">
+            <h2>Cumulative P&amp;L · {venueLabel(venue)}</h2>
+            <PnlChart series={pnlSeries} />
+          </div>
+          <TradeLedgerPanel apiBase={API_BASE} venue={venue} />
+          <StrategyReviewPanel apiBase={API_BASE} />
+          <MilestonesPanel apiBase={API_BASE} />
+          <CostTrackingPanel apiBase={API_BASE} />
+        </>
+      )}
+
+      {section === "controls" && (
+        <>
+          <BotControlPanel apiBase={API_BASE} />
+          <BotConfigPanel apiBase={API_BASE} />
+          <PolymarketPanel apiBase={API_BASE} />
+          <NotificationsPanel apiBase={API_BASE} />
+          <ApiKeysPanel apiBase={API_BASE} />
+          <WallpaperPanel apiBase={API_BASE} />
+        </>
+      )}
+
+      {section === "system" && (
+        <>
+          <LiveSchedulePanel apiBase={API_BASE} />
+          <CoveragePanel apiBase={API_BASE} />
+          <SelfCheckPanel apiBase={API_BASE} />
+          <DiagnosticPanel apiBase={API_BASE} />
+          <GamesBoard apiBase={API_BASE} />
+        </>
+      )}
+
     </div>
   );
 }
