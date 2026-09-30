@@ -342,16 +342,31 @@ export const DEFAULTS = {
   // STAKE AND RETURN FLOOR (2026-09-25, account holder's call).
   //   flatStakeDollars: every entry sized to this stake (null = old sizing)
   //   minExpectedReturnPct: skip any trade expected to return less than this
-  //     percent of what it risks, after fees (30% - account holder's call)
+  //     percent of what it risks, after fees (10%, account holder's call)
   flatStakeDollars: 5,
 
   // LEARNING + WIN-RATE FOCUS (2026-09-25) - see outcomeLearner.js
-  liveBandMinCents: 35,          // live buys only between these prices
-  liveBandMaxCents: 70,
+  // 2026-09-29: 35-70c -> 25-80c (account holder: live games get traded).
+  // The account's settled live record: 25-80c 80 trades +$57.97 (+25.1% ROI),
+  // 35-70c 62 trades +$54.23 (+26.7%) - same return, 18 more trades.
+  liveBandMinCents: 25,          // live buys only between these prices
+  liveBandMaxCents: 80,
   streakBrakeLosses: 4,          // halve the stake after this many straight losses
   survivalStartingSlots: 3,      // positions at once in survival mode until earned
   learnerMinTrades: 8,           // trades a sport/band needs before it can be cut
-  minExpectedReturnPct: 30,
+  // 2026-09-29: 30% -> 10% (account holder's call). Every trade must expect
+  // at least 10% after the exchange fee, and the order limit is pulled down
+  // to the highest price that still returns 10% - so the walk-up never buys
+  // a thin edge (at 0% the Red Sox limit was 32c for 1.7% expected; at 10%
+  // it is 29c, the ask, for 12.4%). The account's settled live record by
+  // expected return at entry:
+  //   0-5%    28 trades +$10.89 (+27.0% ROI)
+  //   5-10%    7 trades  +$6.23 (+53.4%)
+  //   10-20%   7 trades  +$4.51 (+38.3%)
+  //   20-30%   8 trades  -$1.10  (-8.3%)
+  //   30%+    37 trades +$37.90 (+23.0%)
+  // The 30% floor refused the 10-30% trades and cut entries to 1-2 a day.
+  minExpectedReturnPct: 10,
 
   // STAKE TIERS + DOUBLE-DOWN (2026-09-26, account holder's call) - scaling.js
   //   stakeTiers: equity thresholds. x = multiple of flatStakeDollars,
@@ -380,6 +395,31 @@ export const DEFAULTS = {
   //   call) - cash on the account is the only limit, as on Kalshi
   polymarket: { enabled: true, trading: "auto", shortSide: "auto" },
 
+  // IN-GAME SWING TRADING (2026-09-29, account holder's plan) - swingEngine.js.
+  // Buy the dip (price under what the score and clock say the team is worth),
+  // sell the rally, repeat as many times as the game allows. On BOTH exchanges.
+  //   halfAtFair: sell half once the bid, after the sell fee, is back at fair
+  //     value and the sale is a profit
+  //   targetPct: sell the rest at +65% on what was paid, fees included
+  //   blowoutBelowPct: sell everything when score + clock give the team under
+  //     this chance AND the market agrees (mid at or under
+  //     blowoutMarketMaxCents); close games are ridden out
+  //   reentryMinutes: a fully sold game can be bought again after this
+  //     cool-off (reentryCooldownMinutes applies only with swing off)
+  //   dailyGoalPct: the daily profit goal, % of start-of-day equity (Pacific
+  //     day), shown on the Trading Desk - tracked, it never stops trading
+  //   enabled: false = the old behaviour (hold to settlement)
+  swing: {
+    enabled: true,
+    halfAtFair: true,
+    targetPct: 65,
+    blowoutBelowPct: 10,
+    blowoutMarketMaxCents: 20,
+    minProfitCents: 1,
+    reentryMinutes: 3,
+    dailyGoalPct: 40,
+  },
+
   // --- Account-level, never touched by the strategy migration ------------
   oddsProviderOrder: ["the-odds-api", "oddspapi"],
   oddsPapiTournamentIds: {},
@@ -404,11 +444,53 @@ function writeRaw(obj) {
 }
 
 /**
- * Applies the strategy migration if the persisted file predates this build,
- * then returns defaults merged with whatever the file holds.
+ * ONE-TIME SETTING UPDATES. Each runs once per volume (its id is recorded in
+ * the saved file) and changes ONLY the keys it names - every other saved
+ * setting is left exactly as it is. A value changed by hand afterwards is
+ * never touched again.
+ */
+const ONE_TIME_UPDATES = [
+  {
+    id: "2026-09-29-trade-every-live-edge",
+    apply: (c) => {
+      c.minExpectedReturnPct = 0;
+      c.liveBandMinCents = 25;
+      c.liveBandMaxCents = 80;
+    },
+    note: "minimum expected return 30% -> 0% (any positive edge after fees), live price band 35-70c -> 25-80c",
+  },
+  {
+    // Runs after the one above (on a volume that already ran it, only this
+    // one runs): the account holder chose 10%, bought at the ask.
+    id: "2026-09-29-min-return-10-at-ask",
+    apply: (c) => { c.minExpectedReturnPct = 10; },
+    note: "minimum expected return -> 10% after fees; the order never pays above the price that still returns 10%",
+  },
+];
+
+function applyOneTimeUpdates(stored) {
+  const done = new Set(Array.isArray(stored.oneTimeUpdates) ? stored.oneTimeUpdates : []);
+  let changed = false;
+  for (const u of ONE_TIME_UPDATES) {
+    if (done.has(u.id)) continue;
+    u.apply(stored);
+    done.add(u.id);
+    changed = true;
+    console.log(`[config] One-time update ${u.id}: ${u.note}`);
+  }
+  if (changed) {
+    stored.oneTimeUpdates = [...done];
+    writeRaw(stored);
+  }
+  return stored;
+}
+
+/**
+ * Applies the one-time updates and the strategy migration if the persisted
+ * file predates this build, then returns defaults merged with the file.
  */
 export function loadConfig() {
-  const stored = readRaw();
+  const stored = applyOneTimeUpdates(readRaw());
 
   if ((stored.strategyVersion ?? 0) < STRATEGY_VERSION) {
     const migrated = { ...stored };
