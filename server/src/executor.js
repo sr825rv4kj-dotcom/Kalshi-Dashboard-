@@ -20,7 +20,7 @@ const V2 = "/trade-api/v2";
  */
 const ORDERS_PATH = `${V2}/portfolio/events/orders`;
 
-export const EXECUTOR_VERSION = "2026-09-22-fees-recorded";
+export const EXECUTOR_VERSION = "2026-09-29-partial-sells";
 
 /**
  * Every shard's balance in dollars, as { exchangeIndex: dollars }.
@@ -232,11 +232,18 @@ export async function enterPosition({
 
   const { filled, priceCents: fillPrice } = result;
 
+  // The position's openedAt is also its LOT ID in the ledger, so every later
+  // sale of it is matched to this exact buy (tradeLedgerStore.js).
+  const openedAt = new Date().toISOString();
+  const entryFeeTotal = filled > 0 ? totalFeeCents(result.raw, filled) : 0;
   if (filled > 0) {
     const state = loadState();
     state.positions.push({
       ticker, side: "yes", entryPriceCents: fillPrice, contracts: filled,
-      openedAt: new Date().toISOString(), teamName, sportKey, commenceTime, exchangeIndex,
+      openedAt, teamName, sportKey, commenceTime, exchangeIndex,
+      // The fee actually charged, per contract - the swing exits measure
+      // profit against it (null: Kalshi did not report one).
+      entryFeePerContractCents: Number.isFinite(entryFeeTotal) ? entryFeeTotal / filled : null,
     });
     saveState(state);
     appendLog(`Filled ${filled}x ${ticker} @ ${fillPrice}c` + (result.feeCents != null ? ` (fee ${result.feeCents}c/contract)` : ""));
@@ -248,7 +255,8 @@ export async function enterPosition({
     action: "enter", ticker, side: "yes", contracts, priceCents: fillPrice, filled,
     reason: reason || "no reason recorded", edgePct, environment: config.environment,
     teamName, sportKey, commenceTime,
-    feeCents: filled > 0 ? totalFeeCents(result.raw, filled) : 0,
+    feeCents: entryFeeTotal,
+    lotId: filled > 0 ? openedAt : undefined,
   });
 
   if (filled > 0) {
@@ -260,8 +268,35 @@ export async function enterPosition({
   return { filled, fillPrice };
 }
 
-export async function exitPosition(position, reason) {
-  const { ticker, contracts } = position;
+/**
+ * Sells a held position - all of it, or `count` contracts of it.
+ *
+ * PARTIAL SELLS (2026-09-29, swing trading): the swing engine sells half a
+ * position when the price climbs back to fair value and keeps the rest for
+ * the +65% target. With `count` below the position size, only that many are
+ * sold; the rest stays in state as the same position with the smaller count.
+ * `keep` (e.g. { soldHalf: true }) is merged in only when the WHOLE requested
+ * count sold - a half sale that filled 1 of 5 is not a half sale.
+ * `floorCents` is the lowest price the sell may fill at (default: best bid
+ * minus the exit slippage) - a profit-taking sell never dumps below the price
+ * it was decided at.
+ *
+ * SAFETY, in this order:
+ *   - state is written BEFORE the ledger, so a ledger failure can never make
+ *     the next check sell the same contracts again;
+ *   - the record written back is the CURRENT one from state minus what sold
+ *     (a maker fill booked meanwhile is kept);
+ *   - a partial sale whose order failed with an unknown result is not
+ *     re-sent: the position is flagged exitUncertainAt and its count is
+ *     re-read from Kalshi before the next sale (botController.js);
+ *   - the exit price recorded is the average of every fill, not the last.
+ */
+export async function exitPosition(position, reason, { count = null, keep = null, floorCents = null } = {}) {
+  const { ticker } = position;
+  const held = Number(position.contracts) || 0;
+  const contracts = count != null ? Math.max(0, Math.min(held, Math.floor(count))) : held;
+  if (!(contracts > 0)) return { closed: 0, remaining: held, soldCents: null };
+  const partial = contracts < held;
   const exchangeIndex = position.exchangeIndex ?? null;
   const config = loadConfig();
   // Sell UNDER the best bid so the order crosses and takes.
@@ -269,9 +304,10 @@ export async function exitPosition(position, reason) {
 
   let remaining = contracts;
   let attempts = 0;
-  let lastExitPriceCents = null;
+  let proceedsCents = 0;
   let exitFeeCents = 0;
   let exitFeeKnown = true;
+  let uncertain = false;
 
   while (remaining > 0 && attempts < 3) {
     attempts++;
@@ -302,51 +338,88 @@ export async function exitPosition(position, reason) {
       await new Promise((r) => setTimeout(r, 1000));
       continue;
     }
+    if (floorCents != null && bestBid < floorCents) {
+      appendLog(`${ticker}: best bid ${bestBid}c is under the ${floorCents}c sell floor - not selling this time (${reason})`);
+      break;
+    }
 
-    const limitCents = clampPrice(bestBid - slippage);
+    const limitCents = clampPrice(floorCents != null ? Math.max(floorCents, bestBid - slippage) : bestBid - slippage);
     try {
       const res = await placeIOC({ ticker, side: "ask", limitCents, contracts: remaining, reduceOnly: true, exchangeIndex });
       if (res.filled > 0) {
         const f = totalFeeCents(res.raw, res.filled);
         if (f == null) exitFeeKnown = false; else exitFeeCents += f;
-        lastExitPriceCents = res.priceCents;
+        proceedsCents += res.priceCents * res.filled;
         remaining -= res.filled;
         appendLog(`Sold ${res.filled}x ${ticker} @ ${res.priceCents}c (${reason})`);
       }
     } catch (err) {
       appendLog(`Exit order rejected for ${ticker}: ${err.message}`, "error");
+      // The order's fate is unknown - it may have executed. A PARTIAL sale is
+      // not re-sent (a retry could sell past the half); its count is re-read
+      // from Kalshi before the next sale. A full exit may retry: reduce-only
+      // caps it at what the account actually holds.
+      if (partial) { uncertain = true; break; }
     }
 
     if (remaining > 0) await new Promise((r) => setTimeout(r, 1000));
   }
 
-  if (remaining > 0) {
+  const sold = contracts - remaining;
+  const avgExitCents = sold > 0 ? Math.round((proceedsCents / sold) * 10) / 10 : null;
+  if (remaining > 0 && !partial && floorCents == null) {
     appendLog(
       `CRITICAL: could not fully exit ${ticker} after ${attempts} attempts, ${remaining} contracts still open. ` +
       `Market is illiquid - manual intervention needed in the Kalshi app.`, "error"
     );
+  } else if (remaining > 0) {
+    appendLog(`${ticker} (${reason}): sold ${sold} of ${contracts} - ${remaining} not filled at or above the sell price; still held.`, "warn");
   } else {
-    appendLog(`Exited ${ticker} (${reason}): all ${contracts} contracts closed @ ${lastExitPriceCents}c.`);
+    appendLog(`Exited ${ticker} (${reason}): ${contracts}${partial ? ` of ${held}` : ""} contracts sold @ ${avgExitCents}c.`);
   }
 
-  recordTrade({
-    action: "exit", ticker, side: "yes", contracts, priceCents: position.entryPriceCents,
-    exitPriceCents: lastExitPriceCents,
-    filled: contracts - remaining, reason, edgePct: null, environment: config.environment,
-    feeCents: exitFeeKnown ? exitFeeCents : null,
-    teamName: position.teamName ?? null,
-    sportKey: position.sportKey ?? null,
-    commenceTime: position.commenceTime ?? null,
-  });
-
-  const { botToken, chatId } = getTelegramCredentials();
-  notifyExit({ botToken, chatId, ticker, side: "yes", contracts, reason, closed: contracts - remaining, remaining })
-    .catch(() => {});
-
+  // 1. STATE FIRST - from the current record, minus what sold.
+  let left = held - sold;
   const state = loadState();
-  state.positions = state.positions.filter((p) => p.ticker !== position.ticker || p.openedAt !== position.openedAt);
-  if (remaining > 0) state.positions.push({ ...position, contracts: remaining, note: "exit incomplete" });
-  saveState(state);
+  const idx = state.positions.findIndex((p) => p.ticker === position.ticker && p.openedAt === position.openedAt);
+  if (idx >= 0) {
+    const cur = state.positions[idx];
+    left = Math.max(0, (Number(cur.contracts) || 0) - sold);
+    if (left <= 0) {
+      state.positions.splice(idx, 1);
+    } else {
+      const next = { ...cur, contracts: left };
+      if (partial && remaining === 0 && keep) Object.assign(next, keep);
+      if (!partial && remaining > 0) next.note = "exit incomplete";
+      if (uncertain) next.exitUncertainAt = new Date().toISOString();
+      state.positions[idx] = next;
+    }
+    saveState(state);
+  }
 
-  return { closed: contracts - remaining, remaining };
+  // 2. THE LEDGER. A full exit is always written (a zero fill is ignored by
+  // the trade pairing), a partial one only when something sold.
+  if (sold > 0 || !partial) {
+    try {
+      recordTrade({
+        action: "exit", ticker, side: "yes", contracts, priceCents: position.entryPriceCents,
+        exitPriceCents: avgExitCents,
+        filled: sold, reason, edgePct: null, environment: config.environment,
+        feeCents: exitFeeKnown ? exitFeeCents : null,
+        teamName: position.teamName ?? null,
+        sportKey: position.sportKey ?? null,
+        commenceTime: position.commenceTime ?? null,
+        lotId: position.openedAt ?? undefined,
+      });
+    } catch (err) {
+      appendLog(`LEDGER WRITE FAILED for the sale of ${sold}x ${ticker} @ ${avgExitCents}c (${reason}): ${err.message} - the position itself is updated.`, "error");
+    }
+    try {
+      const { botToken, chatId } = getTelegramCredentials();
+      notifyExit({ botToken, chatId, ticker, side: "yes", contracts, reason, closed: sold, remaining: left })
+        .catch(() => {});
+    } catch { /* notifications never block trading */ }
+  }
+
+  return { closed: sold, remaining: left, soldCents: avgExitCents, uncertain };
 }
