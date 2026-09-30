@@ -81,7 +81,7 @@ import { enterPosition, readShardBalances } from "./executor.js";
 import { appendLog, loadState, saveState } from "./stateStore.js";
 import { resolveTicker } from "./tickerResolver.js";
 import { getLiveScores, findLiveGameForTeam } from "./scoresFetcher.js";
-import { corroboratedProbability, fractionRemaining, paramsFor, rememberPregame, pregamePriorDetail, flushPregamePriors } from "./liveModel.js";
+import { corroboratedProbability, fractionRemaining, paramsFor, entryAllowedForSport, rememberPregame, pregamePriorDetail, flushPregamePriors } from "./liveModel.js";
 import { workCandidate, cancelResting, getRestingOrders, cancelPendingOnEvent } from "./makerEngine.js";
 import { recordFairFromProbabilities } from "./fairValue.js";
 import { clvVerdict, recordShadow } from "./clvTracker.js";
@@ -403,7 +403,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     return false;
   }
 
-  const drops = { live: 0, pregame: 0, window: 0, unresolved: 0, closed: 0, error: 0, duplicate: 0 };
+  const drops = { live: 0, pregame: 0, window: 0, unresolved: 0, closed: 0, error: 0, duplicate: 0, unmodeled: 0 };
   // "8 not-tradeable" told us nothing actionable. Counting the actual status
   // strings turns it into "status=finalized x8", which is a fixable fact.
   const statusCounts = {};
@@ -443,6 +443,13 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // LIVE ONLY: a game that has not started is not traded - no buy, no
     // resting bid. Checked before the ticker lookup, so it costs no Kalshi call.
     if (!timing.live && config.liveOnly !== false) { drops.pregame++; return null; }
+    // MODELLED SPORTS ONLY: no in-game model calibrated for this sport, so no
+    // new buy. Checked before the ticker lookup, so it costs no Kalshi call.
+    if (timing.live && !entryAllowedForSport(sportKey, config)) {
+      drops.unmodeled++;
+      feedHere("no-model-for-sport", "No calibrated in-game model for this sport - only modelled sports are bought");
+      return null;
+    }
     if (!timing.ok) { drops.window++; return null; }
 
     // SAME TRADES ON BOTH EXCHANGES (2026-09-28): a game Polymarket holds may
@@ -526,7 +533,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   // actually needs it - that endpoint is billed separately from /odds.
   const livePending = viable.filter((c) => c.timing.live);
   if (livePending.length) {
-    if (!paramsFor(sportKey)) {
+    if (!paramsFor(sportKey, { allowGeneric: !!entryAllowedForSport(sportKey, config) })) {
       appendLog(
         `${sportKey}: ${livePending.length} in-play market(s) skipped - no in-game model exists for this sport, ` +
         `so a stale line could not be detected.`, "warn"
@@ -649,7 +656,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   appendLog(
     `${sportKey}: ${teamEntries.length} lines -> ${viable.length} tradeable ` +
     `(dropped: ${drops.pregame} not started yet (live-only), ${drops.live} live-disabled, ${drops.unresolved} unresolved, ${drops.window} out-of-window, ` +
-    `${drops.closed} not-tradeable, ${drops.duplicate} already held, ${drops.error} fetch error)` +
+    `${drops.closed} not-tradeable, ${drops.duplicate} already held, ${drops.unmodeled} sport not modelled, ${drops.error} fetch error)` +
     (sampleReason ? ` | e.g. ${sampleReason}` : "")
   );
 
