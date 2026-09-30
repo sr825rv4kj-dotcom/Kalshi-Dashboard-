@@ -339,7 +339,17 @@ export const DEFAULTS = {
   // calibrated in-game model (liveModel.js SPORT_PARAMS). Tennis, preseason and
   // minor leagues ran on a generic model and lost. Held positions in any sport
   // are still managed and sold. Set false to allow every sport again.
-  modeledSportsOnly: true,
+  // 2026-09-30: restored to false with the original Kalshi rules - every sport
+  // trades as it did before. Set true to buy only modelled sports.
+  modeledSportsOnly: false,
+
+  // TRADE LIST (2026-09-30, from the account's own settled trades): new buys
+  // only in these sports. 128 closed trades: football 33 trades +$45.97 (+59%
+  // ROI, 55% win rate); every other sport together 95 trades -$23.97 (-10%,
+  // 41% win rate) - MLB 35 trades -$10.37, tennis -$20.6, preseason NHL
+  // -$9.70, Euroleague -$11.97. Held positions in any sport are still managed.
+  // Empty list = every sport (subject to modeledSportsOnly).
+  entrySports: ["americanfootball_nfl", "americanfootball_ncaaf"],
 
   // Live buys under this price are refused - see scanner.js (all three live
   // buys at 13-16c lost; the fee is 20-40% of the stake down there).
@@ -355,8 +365,8 @@ export const DEFAULTS = {
   // 2026-09-29: 35-70c -> 25-80c (account holder: live games get traded).
   // The account's settled live record: 25-80c 80 trades +$57.97 (+25.1% ROI),
   // 35-70c 62 trades +$54.23 (+26.7%) - same return, 18 more trades.
-  liveBandMinCents: 25,          // live buys only between these prices
-  liveBandMaxCents: 80,
+  liveBandMinCents: 35,          // live buys only between these prices (restored 2026-09-30)
+  liveBandMaxCents: 70,
   streakBrakeLosses: 4,          // halve the stake after this many straight losses
   survivalStartingSlots: 3,      // positions at once in survival mode until earned
   learnerMinTrades: 8,           // trades a sport/band needs before it can be cut
@@ -372,7 +382,9 @@ export const DEFAULTS = {
   //   20-30%   8 trades  -$1.10  (-8.3%)
   //   30%+    37 trades +$37.90 (+23.0%)
   // The 30% floor refused the 10-30% trades and cut entries to 1-2 a day.
-  minExpectedReturnPct: 10,
+  // 2026-09-30: RESTORED to 30% - the original Kalshi rule (see the one-time
+  // update "2026-09-30-restore-original-kalshi" below).
+  minExpectedReturnPct: 30,
 
   // STAKE TIERS + DOUBLE-DOWN (2026-09-26, account holder's call) - scaling.js
   //   stakeTiers: equity thresholds. x = multiple of flatStakeDollars,
@@ -399,7 +411,8 @@ export const DEFAULTS = {
   //   trading: "auto" = trade once the live self-check passes; "on"; "off"
   //   no limit on open Polymarket bets (removed 2026-09-28, account holder's
   //   call) - cash on the account is the only limit, as on Kalshi
-  polymarket: { enabled: true, trading: "auto", shortSide: "auto" },
+  // 2026-09-30: trading "off" - connected and visible, no buying (account holder).
+  polymarket: { enabled: true, trading: "off", shortSide: "auto" },
 
   // IN-GAME SWING TRADING (2026-09-29, account holder's plan) - swingEngine.js.
   // Buy the dip (price under what the score and clock say the team is worth),
@@ -415,8 +428,9 @@ export const DEFAULTS = {
   //   dailyGoalPct: the daily profit goal, % of start-of-day equity (Pacific
   //     day), shown on the Trading Desk - tracked, it never stops trading
   //   enabled: false = the old behaviour (hold to settlement)
+  // 2026-09-30: enabled false - hold to settlement, as originally.
   swing: {
-    enabled: true,
+    enabled: false,
     halfAtFair: true,
     targetPct: 65,
     blowoutBelowPct: 10,
@@ -471,6 +485,26 @@ const ONE_TIME_UPDATES = [
     id: "2026-09-29-min-return-10-at-ask",
     apply: (c) => { c.minExpectedReturnPct = 10; },
     note: "minimum expected return -> 10% after fees; the order never pays above the price that still returns 10%",
+  },
+  {
+    // RESTORE THE ORIGINAL KALSHI RULES (2026-09-30, account holder's call).
+    // The Kalshi-only record before Polymarket and the swing exits: Sep 20-26,
+    // 89 closed trades, +$51 net. Runs last, so it wins on a fresh volume too.
+    id: "2026-09-30-restore-original-kalshi",
+    apply: (c) => {
+      c.minExpectedReturnPct = 30;
+      c.liveBandMinCents = 35;
+      c.liveBandMaxCents = 70;
+      c.modeledSportsOnly = false;
+      c.swing = { ...DEFAULTS.swing, ...(c.swing || {}), enabled: false };
+      c.polymarket = { ...DEFAULTS.polymarket, ...(c.polymarket || {}), trading: "off" };
+    },
+    note: "original Kalshi rules restored: 30% minimum return, 35-70c live band, hold to settlement (swing off), Polymarket buying off",
+  },
+  {
+    id: "2026-09-30-football-only",
+    apply: (c) => { c.entrySports = ["americanfootball_nfl", "americanfootball_ncaaf"]; },
+    note: "new buys only in NFL and NCAAF, the sports with a proven record on this account",
   },
 ];
 
