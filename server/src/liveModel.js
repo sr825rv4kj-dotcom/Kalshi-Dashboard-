@@ -105,6 +105,23 @@ export function paramsFor(sportKey, { allowGeneric = true } = {}) {
 }
 
 /**
+ * MODELLED SPORTS ONLY (2026-09-30). New live entries are taken only in sports
+ * with calibrated numbers above. On the real ledger the calibrated sports
+ * earned +25.6% over 49 trades; the generic-model sports (tennis, preseason
+ * and minor leagues) produced the string of losing entries. Held positions in
+ * any sport are still managed and sold - this gates BUYING only.
+ * Set config.modeledSportsOnly to false to allow every sport again.
+ */
+export function modeledSportsOnly(config = {}) {
+  return config.modeledSportsOnly !== false;
+}
+
+/** True when a new entry in this sport is allowed under the current config. */
+export function entryAllowedForSport(sportKey, config = {}) {
+  return !modeledSportsOnly(config) || !!SPORT_PARAMS[sportKey];
+}
+
+/**
  * Fraction of the game still to play, estimated from wall clock since kickoff.
  *
  * The scores endpoint does not publish a game clock, so this is deliberately
