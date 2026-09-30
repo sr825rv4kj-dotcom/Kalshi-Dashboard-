@@ -79,7 +79,7 @@ export const DEFAULTS = {
   // the real work; this one now only rejects quotes so old they are obviously
   // abandoned.
   maxLineAgeSecondsLive: 900,        // 15 minutes
-  maxLineAgeSecondsPregame: 7200,    // 2 hours
+  maxLineAgeSecondsPregame: 900,     // 15 minutes (2026-09-30: same as in play)
 
   // Hold to settlement. Kalshi charges a fee on every trade and nothing at
   // settlement, so a flip costs two fees and a hold costs one. Worth +4 to
@@ -91,7 +91,7 @@ export const DEFAULTS = {
   // EV floor already decide whether it is worth taking. The window was refusing
   // markets before any of those ever got to run - your logs showed tennis
   // dropping 2 of 10 lines on this alone.
-  entryWindowHours: 0,
+  entryWindowHours: 1 / 6,      // 10 minutes: pre-game buys only this close to the start
   minMinutesBeforeStart: 0,     // raise this to stop entering right on the whistle
 
   // --- Price band --------------------------------------------------------
@@ -123,13 +123,13 @@ export const DEFAULTS = {
   // error is the same size as the edge being measured. Opening 1-11c needs a
   // book-quality gate (how many sharp books priced it, and how far apart they
   // were) that the entry gate does not read yet. Until then, 12c.
-  minEntryPriceCents: 12,
+  minEntryPriceCents: 35,
   // 95, not 97. ceilingExitAtCents is 97 and the take-out test is `bid >= 97`,
   // so a position entered at a 97c ask was eligible for its own exit the moment
   // the bid ticked up one cent. Demonstrated end to end: buy 97c x3, bid moves
   // 96 -> 97, sold at 96c, round trip -9c against -3c for simply holding. The
   // entry band now stops two cents clear of the exit trigger.
-  maxEntryPriceCents: 95,
+  maxEntryPriceCents: 70,
 
   maxPlausibleEdge: 0.18,       // a wider gap than this is a stale feed, not an edge
 
@@ -333,7 +333,11 @@ export const DEFAULTS = {
   // Pre-game Kalshi prices sit at the sharp line; the edge is Kalshi lagging
   // the sharp books DURING play. Pre-game buys and pre-game resting bids are
   // off. Set to false to allow pre-game entries again.
-  liveOnly: true,
+  // 2026-09-30: ALL SPORTS, LIVE OR WITHIN 10 MINUTES OF START. liveOnly false
+  // lets a game that has not started be bought, but entryWindowHours (below)
+  // limits that to the last 10 minutes before the start, when the sharp line
+  // is at its most accurate. Earlier pre-game entries lost (-28% over 21).
+  liveOnly: false,
 
   // MODELLED SPORTS ONLY (2026-09-30): new live buys only in sports with a
   // calibrated in-game model (liveModel.js SPORT_PARAMS). Tennis, preseason and
@@ -348,8 +352,10 @@ export const DEFAULTS = {
   // ROI, 55% win rate); every other sport together 95 trades -$23.97 (-10%,
   // 41% win rate) - MLB 35 trades -$10.37, tennis -$20.6, preseason NHL
   // -$9.70, Euroleague -$11.97. Held positions in any sport are still managed.
-  // Empty list = every sport (subject to modeledSportsOnly).
-  entrySports: ["americanfootball_nfl", "americanfootball_ncaaf"],
+  // Empty list = every sport (subject to modeledSportsOnly). Left EMPTY from
+  // 2026-09-30 (account holder: all sports on the odds feed trade); fill it to
+  // restrict buying to those sports again.
+  entrySports: [],
 
   // Live buys under this price are refused - see scanner.js (all three live
   // buys at 13-16c lost; the fee is 20-40% of the stake down there).
@@ -430,7 +436,7 @@ export const DEFAULTS = {
   //   enabled: false = the old behaviour (hold to settlement)
   // 2026-09-30: enabled false - hold to settlement, as originally.
   swing: {
-    enabled: false,
+    enabled: true,
     halfAtFair: true,
     targetPct: 65,
     blowoutBelowPct: 10,
@@ -505,6 +511,25 @@ const ONE_TIME_UPDATES = [
     id: "2026-09-30-football-only",
     apply: (c) => { c.entrySports = ["americanfootball_nfl", "americanfootball_ncaaf"]; },
     note: "new buys only in NFL and NCAAF, the sports with a proven record on this account",
+  },
+  {
+    // 2026-09-30, account holder's call: every sport on the odds feed trades;
+    // pre-game only in the last 10 minutes before the start; early exits on.
+    // The account's settled record: held to settlement +2.0% over 91 trades,
+    // exited early +24.0% over 37; in play +10.2% over 107, pre-game -28.4%
+    // over 21 (all of it earlier than 10 minutes out).
+    id: "2026-09-30-all-sports-pregame-10min",
+    apply: (c) => {
+      c.entrySports = [];
+      c.modeledSportsOnly = false;
+      c.liveOnly = false;
+      c.entryWindowHours = 1 / 6;
+      c.maxLineAgeSecondsPregame = 900;
+      c.minEntryPriceCents = 35;
+      c.maxEntryPriceCents = 70;
+      c.swing = { ...DEFAULTS.swing, ...(c.swing || {}), enabled: true };
+    },
+    note: "all sports; pre-game buys only in the last 10 minutes before the start; price band 35-70c; early exits (swing) on",
   },
 ];
 
