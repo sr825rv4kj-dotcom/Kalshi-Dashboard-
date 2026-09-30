@@ -28,7 +28,7 @@ import crypto from "crypto";
 import fs from "fs";
 import { ENV_PATH } from "../paths.js";
 
-export const PM_CLIENT_VERSION = "2026-09-27-polymarket-us";
+export const PM_CLIENT_VERSION = "2026-09-29-rate-limit-backoff";
 
 const GATEWAY = "https://gateway.polymarket.us";
 const API = "https://api.polymarket.us";
@@ -36,6 +36,36 @@ const TIMEOUT_MS = 15_000;
 // The retail API allows 20 requests a second. One request every 70ms keeps
 // the bot comfortably under it without a queue library.
 const MIN_GAP_MS = 70;
+const MAX_GAP_MS = 1000;
+const MAX_COOL_MS = 30_000;
+
+/*
+ * RATE LIMITS (2026-09-29). Production counted 1,036 HTTP 429s in 11,889
+ * requests, every one from Cloudflare (error 1015) on the PUBLIC gateway -
+ * and every retry one second later was refused again, so each one cost a
+ * price read. Polymarket's docs: 20 requests a second per API key, enforced
+ * at Cloudflare; public endpoints are limited per IP address, and Railway's
+ * outbound IP is shared with other apps, so the bot can be limited while
+ * sending well under the limit itself.
+ *
+ * Each host (gateway = public, per IP; api = signed, per key) now keeps its
+ * own pace. A 429 starts a cool-off for that host: the Retry-After header's
+ * wait when Cloudflare sends one, otherwise 1s, 2s, 4s ... up to 30s (the
+ * backoff the docs prescribe), and the gap between requests doubles (up to
+ * 1s), easing back to 70ms as requests succeed again.
+ *
+ *   - Signed requests (balance, orders) WAIT out the cool-off and retry, up
+ *     to 3 tries - an order is never dropped because of a 429.
+ *   - Public reads during a cool-off fail at once with kind "rate-limited";
+ *     pmMarkets.js then prices from the game listing it read seconds ago
+ *     (the same best bid/ask, verified field-for-field against the price
+ *     endpoint on real data), so the scan is not held up and no game is
+ *     skipped because of the limit.
+ */
+const hosts = {
+  gateway: { last: 0, gap: MIN_GAP_MS, coolUntil: 0, streak: 0, okRun: 0, limited: 0, skipped: 0, last429At: null },
+  api: { last: 0, gap: MIN_GAP_MS, coolUntil: 0, streak: 0, okRun: 0, limited: 0, skipped: 0, last429At: null },
+};
 
 const stats = { requests: 0, errors: 0, rateLimited: 0, lastError: null, lastOkAt: null };
 
@@ -184,17 +214,50 @@ function tag(err, kind, status = null) {
   return err;
 }
 
-let lastRequestAt = 0;
-async function pace() {
-  const wait = lastRequestAt + MIN_GAP_MS - Date.now();
-  lastRequestAt = Math.max(Date.now(), lastRequestAt + MIN_GAP_MS);
-  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Waits for this host's turn (its gap and any cool-off). */
+async function pace(h) {
+  const now = Date.now();
+  const at = Math.max(now, h.last + h.gap, h.coolUntil);
+  h.last = at;
+  if (at > now) await sleep(at - now);
+}
+
+/** Seconds from a Retry-After header (seconds or an HTTP date), or null. */
+function retryAfterMs(res) {
+  const v = res.headers?.get?.("retry-after");
+  if (!v) return null;
+  const n = Number(v);
+  if (Number.isFinite(n) && n >= 0) return n * 1000;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? Math.max(0, t - Date.now()) : null;
+}
+
+function noteLimited(h, res) {
+  stats.rateLimited++;
+  h.limited++;
+  h.streak++;
+  h.okRun = 0;
+  h.last429At = new Date().toISOString();
+  const wait = retryAfterMs(res) ?? Math.min(MAX_COOL_MS, 1000 * 2 ** (h.streak - 1));
+  h.coolUntil = Math.max(h.coolUntil, Date.now() + Math.min(MAX_COOL_MS, wait));
+  h.gap = Math.min(MAX_GAP_MS, h.gap * 2);
+}
+
+function noteOk(h) {
+  h.streak = 0;
+  if (++h.okRun >= 20 && h.gap > MIN_GAP_MS) {
+    h.gap = Math.max(MIN_GAP_MS, h.gap - 10);
+    h.okRun = 0;
+  }
+  stats.lastOkAt = new Date().toISOString();
 }
 
 /**
  * One request. `auth: true` signs it and sends it to api.polymarket.us;
- * otherwise it goes to the public gateway. A 429 is retried once after a
- * second; every other failure throws with .status and .kind set.
+ * otherwise it goes to the public gateway. A 429 cools the host off (see
+ * RATE LIMITS above); every other failure throws with .status and .kind set.
  */
 export async function pmRequest(method, path, { query, body, auth = false } = {}) {
   const url = new URL(path, auth ? API : GATEWAY);
@@ -205,9 +268,17 @@ export async function pmRequest(method, path, { query, body, auth = false } = {}
       else url.searchParams.set(k, String(v));
     }
   }
+  const h = auth ? hosts.api : hosts.gateway;
+  const tries = auth ? 3 : 1;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    await pace();
+  for (let attempt = 0; attempt < tries; attempt++) {
+    // A public read during a cool-off is answered from the game listing by
+    // the caller instead of waiting (or adding to the limit).
+    if (!auth && h.coolUntil > Date.now()) {
+      h.skipped++;
+      throw tag(new Error(`Polymarket rate limit - public reads paused for ${Math.ceil((h.coolUntil - Date.now()) / 1000)}s`), "rate-limited", 429);
+    }
+    await pace(h);
     const headers = { "Content-Type": "application/json", Accept: "application/json" };
     if (auth) Object.assign(headers, authHeaders(method, url.pathname));
     const controller = new AbortController();
@@ -227,10 +298,12 @@ export async function pmRequest(method, path, { query, body, auth = false } = {}
     clearTimeout(timer);
 
     const text = await res.text().catch(() => "");
-    if (res.status === 429 && attempt === 0) {
-      stats.rateLimited++;
-      await new Promise((r) => setTimeout(r, 1000));
-      continue;
+    if (res.status === 429) {
+      noteLimited(h, res);
+      stats.lastError = `${method} ${url.pathname}: HTTP 429 rate limited (${auth ? "signed API" : "public gateway"}, cool-off ${Math.ceil((h.coolUntil - Date.now()) / 1000)}s)`;
+      if (attempt < tries - 1) continue;          // signed: pace() waits out the cool-off
+      stats.errors++;
+      throw tag(new Error(`Polymarket rate limit (${auth ? "signed API" : "public gateway"}) - retry later`), "rate-limited", 429);
     }
     if (!res.ok) {
       stats.errors++;
@@ -240,18 +313,25 @@ export async function pmRequest(method, path, { query, body, auth = false } = {}
       const kind = res.status === 401 ? "auth" : res.status === 403 ? "forbidden" : res.status === 404 ? "not-found" : "http";
       throw tag(new Error(`Polymarket ${res.status}: ${msg}`), kind, res.status);
     }
-    stats.lastOkAt = new Date().toISOString();
+    noteOk(h);
     if (!text) return {};
     try { return JSON.parse(text); } catch { throw tag(new Error(`Polymarket returned non-JSON from ${url.pathname}`), "http", res.status); }
   }
-  throw tag(new Error("Polymarket rate limit - retry later"), "http", 429);
+  throw tag(new Error("Polymarket rate limit - retry later"), "rate-limited", 429);
 }
 
 export const pmGet = (path, opts = {}) => pmRequest("GET", path, opts);
 export const pmPost = (path, body, opts = {}) => pmRequest("POST", path, { ...opts, body });
 
 export function pmClientStats() {
-  return { ...stats, configured: pmConfigured() };
+  const view = (h) => ({
+    gapMs: h.gap,
+    coolingForSeconds: h.coolUntil > Date.now() ? Math.ceil((h.coolUntil - Date.now()) / 1000) : 0,
+    rateLimited: h.limited,
+    publicReadsSkippedWhileCooling: h.skipped,
+    last429At: h.last429At,
+  });
+  return { ...stats, configured: pmConfigured(), gateway: view(hosts.gateway), signedApi: view(hosts.api) };
 }
 
 // --- Field readers -------------------------------------------------------------
