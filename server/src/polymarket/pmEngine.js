@@ -56,7 +56,7 @@ import { recordTrade } from "../tradeLedgerStore.js";
 import { entryTiming, getRecentLines, rememberLines } from "../scanner.js";
 import { getSharpProbabilities } from "../scraper.js";
 import { getLiveScores, findLiveGameForTeam } from "../scoresFetcher.js";
-import { corroboratedProbability, fractionRemaining, paramsFor, pregamePrior, rememberPregame, flushPregamePriors } from "../liveModel.js";
+import { corroboratedProbability, fractionRemaining, paramsFor, entryAllowedForSport, pregamePrior, rememberPregame, flushPregamePriors } from "../liveModel.js";
 import { allActiveSportKeys } from "../sportsDiscovery.js";
 import { schedulePlan, shouldScanSport, openTradeCap } from "../liveSchedule.js";
 import { noteDecision, noteScan } from "../scanFeed.js";
@@ -734,6 +734,13 @@ export async function scanPolymarket(config, settings, active) {
       const timing = entryTiming(commenceTime, { entryWindowHours: config.entryWindowHours ?? 0, minMinutesBeforeStart: config.minMinutesBeforeStart ?? 0 });
       if (!timing.live && config.liveOnly !== false) { bump("pm-pregame"); continue; }
       if (!timing.live && !timing.ok) { bump("pm-window"); continue; }
+      // MODELLED SPORTS ONLY: no calibrated in-game model, no new buy (held
+      // positions are still managed and sold by the swing engine).
+      if (timing.live && !entryAllowedForSport(sportKey, config)) {
+        bump("pm-no-model", `${teamNames.join(" vs ")} (${sportKey})`);
+        for (const n of teamNames) feed({ sportKey, team: n, opponent: teamNames.find((x) => x !== n), commenceTime, code: "pm-no-model", why: "No calibrated in-game model for this sport - only modelled sports are bought" });
+        continue;
+      }
       seen += 2;
 
       // SAME TRADES ON BOTH: a game Kalshi holds is still priced here, but only
@@ -805,7 +812,7 @@ export async function scanPolymarket(config, settings, active) {
 
         // In-game model, exactly as the Kalshi scan does it.
         if (timing.live) {
-          if (!paramsFor(sportKey)) { skip("pm-no-model", "No in-game model for this sport, so a stale line can't be detected"); continue; }
+          if (!paramsFor(sportKey, { allowGeneric: !!entryAllowedForSport(sportKey, config) })) { skip("pm-no-model", "No in-game model for this sport, so a stale line can't be detected"); continue; }
           try { scores ??= (await getLiveScores(sportKey)).events || []; } catch { scores = []; }
           const game = findLiveGameForTeam(scores, t.name);
           if (!game) {
