@@ -2,7 +2,13 @@
  * Bot control, trade history and the original diagnostic scan.
  */
 import { kalshiGet } from "../kalshiClient.js";
-import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker } from "../botController.js";
+import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker, kalshiOpenTradeCap } from "../botController.js";
+import { scheduleReport, schedulePlan, refreshSchedule } from "../liveSchedule.js";
+import { pmStatus } from "../polymarket/pmEngine.js";
+import { scanFeedReport } from "../scanFeed.js";
+import { deskReport } from "../swingEngine.js";
+import { getSeriesMap } from "../tickerResolver.js";
+import { mappedSports } from "../polymarket/pmMarkets.js";
 import { loadConfig, saveConfig, setEnvironment } from "../configStore.js";
 import { loadState, getRecentLog } from "../stateStore.js";
 import { getRecentTrades, getTradeStats, getTradeLifecycles, loadLedger, filterByVenue, venueOf } from "../tradeLedgerStore.js";
@@ -39,6 +45,92 @@ export function registerBotRoutes(app) {
       res.json(setEnvironment(environment, confirmed));
     } catch (err) {
       res.status(400).json({ error: err.message });
+    }
+  });
+
+  // --- Live schedule (liveSchedule.js) --------------------------------------
+  // What is live now, what starts next, which sports are being scanned because
+  // of it, and the open-trade cap on each exchange. If the calendar is not
+  // built (bot stopped, or just started) it is built here first - the odds
+  // feed's events list is free, so this costs no credits.
+  app.get("/api/schedule", async (_req, res) => {
+    try {
+      const config = loadConfig();
+      if (!schedulePlan().ready) await refreshSchedule(config);
+      const pm = (() => { try { return pmStatus(config); } catch { return null; } })();
+      res.json({
+        ...scheduleReport(),
+        botRunning: isRunning(),
+        openTradeCap: {
+          kalshi: kalshiOpenTradeCap(config),
+          polymarket: pm?.lastScan
+            ? { cap: pm.lastScan.openCap ?? null, equity: pm.lastScan.equity ?? null, open: (pm.positions || []).length }
+            : null,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // --- Scanner tab (scanFeed.js) ---------------------------------------------
+  // One exchange at a time: every team its scanner priced in the last 15
+  // minutes and the verdict in plain words, plus any game the live schedule
+  // has in play that this exchange did NOT look at, and why.
+  app.get("/api/scanner", (req, res) => {
+    try {
+      const venue = req.query.venue === "polymarket" ? "polymarket" : "kalshi";
+      const feed = scanFeedReport(venue);
+      const norm = (x) => String(x ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+      const seen = new Set(feed.rows.map((r) => `${r.sportKey}|${norm(r.team)}`));
+      const sched = scheduleReport();
+      const off = new Set((loadConfig().disabledSports || []).map(String));
+      let series = {};
+      try { series = getSeriesMap() || {}; } catch { series = {}; }
+      let pmLeagues = {};
+      try { pmLeagues = mappedSports() || {}; } catch { pmLeagues = {}; }
+      const notLooked = [];
+      for (const g of sched.live || []) {
+        if (seen.has(`${g.sportKey}|${norm(g.home)}`) || seen.has(`${g.sportKey}|${norm(g.away)}`)) continue;
+        let why;
+        if (off.has(g.sportKey)) why = "Sport switched off in Bot Settings";
+        else if (venue === "kalshi" && !series[g.sportKey]) why = "Kalshi does not list this league";
+        else if (venue === "polymarket" && !pmLeagues[g.sportKey] && !/^tennis_(atp|wta)/.test(g.sportKey)) why = "Polymarket does not list this league";
+        else why = "Not priced yet - the scanner reaches it on its next pass (or the betting feed has no line for it right now)";
+        notLooked.push({ sportKey: g.sportKey, home: g.home, away: g.away, commence: g.commence, minutesIn: g.minutesIn, why });
+      }
+      res.json({ ...feed, schedule: { ready: sched.ready, liveGames: sched.counts?.liveGames ?? 0 }, notLooked });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // --- Trading Desk (swingEngine.js) ------------------------------------------
+  // Every open position on both exchanges with its live bid, fair value (score
+  // + clock, seconded by the sharp line), profit so far and the exact price of
+  // the next sale; today's round trips and profit against the daily goal.
+  // Read from what the bot saw on its last check - no exchange call here.
+  app.get("/api/desk", (_req, res) => {
+    try {
+      const config = loadConfig();
+      const desk = deskReport(config);
+      const sched = (() => { try { return scheduleReport(); } catch { return null; } })();
+      const pm = (() => { try { return pmStatus(config); } catch { return null; } })();
+      const k = (() => { try { return kalshiOpenTradeCap(config); } catch { return null; } })();
+      res.json({
+        ...desk,
+        botRunning: isRunning(),
+        liveGames: sched?.counts?.liveGames ?? null,
+        nextGame: sched?.next ?? null,
+        caps: {
+          kalshi: k ? { open: k.open, cap: k.cap } : null,
+          polymarket: pm?.lastScan ? { open: pm.lastScan.open, cap: pm.lastScan.openCap } : null,
+        },
+        polymarketSelling: pm?.sellCheck ?? null,
+        polymarketTrading: pm?.tradingActive ?? null,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
   });
 
