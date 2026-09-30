@@ -335,6 +335,12 @@ export const DEFAULTS = {
   // off. Set to false to allow pre-game entries again.
   liveOnly: true,
 
+  // MODELLED SPORTS ONLY (2026-09-30): new live buys only in sports with a
+  // calibrated in-game model (liveModel.js SPORT_PARAMS). Tennis, preseason and
+  // minor leagues ran on a generic model and lost. Held positions in any sport
+  // are still managed and sold. Set false to allow every sport again.
+  modeledSportsOnly: true,
+
   // Live buys under this price are refused - see scanner.js (all three live
   // buys at 13-16c lost; the fee is 20-40% of the stake down there).
   minLiveEntryPriceCents: 20,
