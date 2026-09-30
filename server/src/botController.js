@@ -26,12 +26,14 @@ import {
 } from "./fairValue.js";
 import { registerOpenPositions, markDue, needsBackfill, backfillFromLedger } from "./clvTracker.js";
 import { runPolymarketCycle } from "./polymarket/pmEngine.js";
+import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "./swingEngine.js";
+import { feePerContractCents } from "./riskManager.js";
 
 const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-09-28-live-schedule";
+export const CONTROLLER_VERSION = "2026-09-29-swing";
 
 /**
  * 2026-09-24 - four changes in this file:
@@ -297,7 +299,11 @@ const MISSING_GRACE_MS = 30 * 60 * 1000;
 
 /** Games exited within the cooldown, which this cycle must leave alone. */
 function cooledDownEventKeys(config) {
-  const minutes = config.reentryCooldownMinutes ?? 60;
+  // SWING TRADING: a fully sold game can be bought again on the next dip after
+  // a short cool-off (swing.reentryMinutes, 3 by default). With swing off, the
+  // old rest-of-the-game cool-off applies.
+  const sw = swingSettings(config);
+  const minutes = sw.enabled ? sw.reentryMinutes : (config.reentryCooldownMinutes ?? 60);
   if (!minutes) return new Set();
   const cutoff = Date.now() - minutes * 60 * 1000;
   const recent = loadState().recentExits || {};
@@ -407,6 +413,7 @@ export async function reconcileSettledPositions() {
           sportKey: position.sportKey ?? null,
           commenceTime: position.commenceTime ?? null,
           source: position.source ?? "taker",
+          lotId: position.openedAt ?? undefined,
         });
         appendLog(
           `${position.ticker} is no longer held but the market is still ${marketStatus || "open"} - ` +
@@ -437,6 +444,7 @@ export async function reconcileSettledPositions() {
         commenceTime: position.commenceTime ?? null,
         // Maker vs taker, so resting-bid fills can be scored on their own.
         source: position.source ?? "taker",
+        lotId: position.openedAt ?? undefined,
       });
 
       // Net AFTER the entry fee - what actually reached the account.
@@ -857,6 +865,15 @@ async function checkOpenPositionsOnce(config) {
         continue;
       }
 
+      // SWING TRADING (swingEngine.js): sell half on the rally back to fair
+      // value, the rest at +65%, everything on a blowout. Replaces the
+      // fair-value and blowout exits below while it is on.
+      const sw = swingSettings(config);
+      if (sw.enabled) {
+        await swingKalshiPosition(position, quote, config, sw);
+        continue;
+      }
+
       // FAIR-VALUE EXIT. Shadow by default - see fairValue.js.
       const fv = fairValueExitDecision(position, quote, config);
       if (fv.action === "sell") {
@@ -890,6 +907,98 @@ async function checkOpenPositionsOnce(config) {
       appendLog(`Error checking ${position.ticker}: ${err.message}`, "error");
     }
   }
+}
+
+/**
+ * One Kalshi position through the swing rules. Sells go through exitPosition
+ * (reduce-only IOC, the same path every Kalshi exit has used), never below
+ * the price the decision was made at.
+ */
+async function swingKalshiPosition(position, quote, config, sw) {
+  const key = `${position.ticker}|${position.openedAt}`;
+  const feeMult = config.feeMultiplier ?? 0.07;
+
+  // A PARTIAL sale whose order failed with an unknown result (executor.js):
+  // re-read what Kalshi says is held before selling any more of it.
+  if (position.exitUncertainAt) {
+    await resyncUncertainPosition(position);
+    return;
+  }
+
+  // The fee actually paid on the buy when it was recorded; otherwise the
+  // published taker schedule (never less than a maker fill paid).
+  const entryFee = Number.isFinite(Number(position.entryFeePerContractCents))
+    ? Number(position.entryFeePerContractCents)
+    : feePerContractCents(position.entryPriceCents, position.contracts, feeMult);
+  const lf = await liveFair({ sportKey: position.sportKey, teamName: position.teamName, commenceTime: position.commenceTime }, config);
+  const d = swingDecision({
+    contracts: position.contracts, soldHalf: position.soldHalf === true,
+    entryCents: position.entryPriceCents, entryFeeCents: entryFee,
+    bidCents: quote.bid, askCents: quote.ask, fair: lf.fair, model: lf.model, feeMult, settings: sw,
+  });
+  noteView("kalshi", key, viewFor({
+    venue: "kalshi", ticker: position.ticker, teamName: position.teamName, sportKey: position.sportKey, side: "YES",
+    contracts: position.contracts, soldHalf: position.soldHalf, entryCents: position.entryPriceCents, entryFeeCents: entryFee,
+    openedAt: position.openedAt, bidCents: quote.bid, askCents: quote.ask, lf, d,
+  }));
+  if (d.action === "hold") return;
+
+  appendLog(`${position.ticker} (${position.teamName}) - SWING ${d.code}: ${d.why}${lf.score ? ` | ${lf.score}` : ""}`);
+  const res = await exitPosition(position, `swing-${d.code}`, {
+    count: d.count,
+    keep: d.action === "sell-half" ? { soldHalf: true } : null,
+    floorCents: d.floorCents,
+  });
+  if (res.closed > 0 && res.remaining === 0) {
+    recordExit(position.ticker);
+    dropView("kalshi", key);
+  } else if (res.closed > 0) {
+    dropView("kalshi", key);   // re-read next check with the smaller count
+  }
+}
+
+/**
+ * After a partial sale with an unknown outcome: Kalshi's own position count
+ * decides. If Kalshi holds fewer contracts than recorded, the difference was
+ * sold - the local count is lowered (the ledger row for that fill could not
+ * be written, and the log says so). Only ever LOWERS a count; a count Kalshi
+ * cannot confirm is left alone and re-checked next time.
+ */
+async function resyncUncertainPosition(position) {
+  let live;
+  try {
+    const data = await kalshiGet(`${V2}/portfolio/positions`);
+    live = data.market_positions ?? [];
+  } catch (err) {
+    appendLog(`${position.ticker}: could not re-read the Kalshi position after an uncertain sale (${err.message}) - no sale until it can be.`, "warn");
+    return;
+  }
+  const row = live.find((p) => p.ticker === position.ticker);
+  const exchange = row ? Math.abs(Number(row.position_fp != null ? row.position_fp : (row.position ?? 0))) : null;
+  const st = loadState();
+  const same = st.positions.filter((p) => p.ticker === position.ticker);
+  const localTotal = same.reduce((t, p) => t + (Number(p.contracts) || 0), 0);
+  const i = st.positions.findIndex((p) => p.ticker === position.ticker && p.openedAt === position.openedAt);
+  if (i < 0) return;
+  if (exchange == null || !(exchange > 0)) {
+    // Not in the portfolio: settlement reconciliation decides (it waits out
+    // a lagging portfolio before writing anything off).
+    appendLog(`${position.ticker}: not in the Kalshi portfolio after an uncertain sale - left to the settlement check.`, "warn");
+    return;
+  }
+  const cur = st.positions[i];
+  if (exchange < localTotal) {
+    const cut = Math.min(Number(cur.contracts) || 0, localTotal - exchange);
+    appendLog(`${position.ticker}: Kalshi holds ${exchange}, the bot had ${localTotal} - ${cut} sold in the uncertain order. Count corrected; check the Kalshi app for that fill's price.`, "warn");
+    const left = (Number(cur.contracts) || 0) - cut;
+    if (left <= 0) st.positions.splice(i, 1);
+    else { const { exitUncertainAt, ...rest } = cur; st.positions[i] = { ...rest, contracts: left }; }
+  } else {
+    const { exitUncertainAt, ...rest } = cur;
+    st.positions[i] = rest;
+    appendLog(`${position.ticker}: Kalshi confirms ${exchange} held - the uncertain order did not fill. Selling resumes.`);
+  }
+  saveState(st);
 }
 
 export async function runCycle() {
@@ -997,6 +1106,7 @@ export async function runCycle() {
     const bankroll = (balanceData.balance ?? 0) / 100;
     lastEquity = ((balanceData.balance ?? 0) + (balanceData.portfolio_value ?? 0)) / 100;
     lastCash = bankroll;
+    noteEquity("kalshi", lastEquity);
     await checkMilestones(config, bankroll);
     await checkDailySummary(config, bankroll);
 
