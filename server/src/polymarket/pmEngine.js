@@ -9,13 +9,20 @@
  *   - the same sharp lines (read from the Kalshi scan of the same cycle, so
  *     the odds API is not paid twice)
  *   - live games only, with the same in-game model check (pre-game prior)
- *   - the same 35-70c live band, 25c spread limit, 18% plausibility ceiling
- *   - the same 30% minimum expected return AFTER Polymarket's own fee
+ *   - the same live price band, 25c spread limit, 18% plausibility ceiling
+ *   - the same minimum expected return AFTER Polymarket's own fee
  *     (0.0695 x C x p x (1-p), a little under Kalshi's 0.07)
  *   - the same stake tiers, read from the POLYMARKET account's equity
  *   - the same losing-streak brake and learned sport/band blocks, fed by one
  *     shared trade ledger, so both exchanges learn from all results
- *   - held to settlement, like Kalshi
+ *   - the same swing trading as Kalshi (swingEngine.js, 2026-09-29): half
+ *     sold when the price climbs back to fair value, the rest at +65%,
+ *     everything on a blowout, and the game bought again on the next dip.
+ *     Sells are SELL_LONG / SELL_SHORT (docs: "Sell YES contracts (close long
+ *     Yes position)" / "Sell NO contracts (close long No position)"), with
+ *     price.value the YES-side price as always - so selling NO at q or better
+ *     is SELL_SHORT at 1 - q. Polymarket must accept a PREVIEW of each sell
+ *     intent (validated, never executed) before the first real sell.
  *
  * SAME TRADES ON BOTH EXCHANGES (2026-09-28, account holder's rule - replaces
  * "one bet per game across both exchanges", which gave every game to Kalshi
@@ -63,8 +70,10 @@ import { getTelegramCredentials } from "../telegramStore.js";
 import { pmGet, pmPost, pmConfigured, pmClientStats, pmCredentialReport, dollarsOf, centsOf, numberOf, PM_CLIENT_VERSION } from "./pmClient.js";
 import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues, getLeagueEvents, matchEvent, winnerSideFor, sidePrice, pmMarketsReport } from "./pmMarkets.js";
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, kalshiTeamOnGame, normName } from "./pmState.js";
+import { recordFairFromProbabilities } from "../fairValue.js";
+import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "../swingEngine.js";
 
-export const PM_ENGINE_VERSION = "2026-09-29-no-score-fresh-line";
+export const PM_ENGINE_VERSION = "2026-09-29-swing";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -96,7 +105,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -404,6 +413,7 @@ export async function reconcilePolymarket() {
           action: "exit", ticker: p.ticker, side: p.long ? "yes" : "no", contracts: p.contracts,
           priceCents: p.entryPriceCents, exitPriceCents: null, filled: p.contracts, reason: "closed-externally",
           environment: "production", teamName: p.teamName, sportKey: p.sportKey, commenceTime: p.commenceTime, feeCents: 0,
+          lotId: p.openedAt ?? undefined,
         });
         appendLog(`Polymarket ${p.slug}: no longer held and not settled - closed outside the bot. Check the Polymarket app for the exit price.`, "warn");
         settled++;
@@ -416,6 +426,7 @@ export async function reconcilePolymarket() {
         action: "exit", ticker: p.ticker, side: p.long ? "yes" : "no", contracts: p.contracts,
         priceCents: p.entryPriceCents, exitPriceCents: ours, filled: p.contracts, reason,
         environment: "production", teamName: p.teamName, sportKey: p.sportKey, commenceTime: p.commenceTime, feeCents: 0,
+        lotId: p.openedAt ?? undefined,
       });
       const pnl = ((ours - p.entryPriceCents) * p.contracts - (p.entryFeeCents || 0)) / 100;
       appendLog(`Polymarket ${p.teamName} settled ${reason === "settled-win" ? "WON" : reason === "settled-loss" ? "LOST" : `at ${ours}c`}: ${p.contracts} @ ${p.entryPriceCents}c, net ${pnl < 0 ? "-" : "+"}$${Math.abs(pnl).toFixed(2)}.`);
@@ -586,6 +597,8 @@ async function linesForCycle(config) {
         else { rememberPregame({ sportKey, teamName, commenceTime: info.commenceTime, probability: info.trueProbability }); priorsSeen = true; }
       }
       const entry = { at: now, probabilities, provider: r.provider, source: "polymarket" };
+      // Fair values for the swing exits on sports only this engine reads.
+      recordFairFromProbabilities(sportKey, probabilities);
       pmLineCache.set(sportKey, { at: now, entry, hasLive, hasGames });
       out.set(sportKey, entry);
     } catch { /* this sport sits out one cycle */ }
@@ -682,6 +695,7 @@ export async function scanPolymarket(config, settings, active) {
   const paused = meta.pausedUntil && Date.parse(meta.pausedUntil) > Date.now();
   if (paused) bump("pm-paused-after-failures", `until ${meta.pausedUntil}`);
 
+  if (account) noteEquity("polymarket", equity);
   const stakeDecision = tieredStake(config, equity);
   const brake = streakStakeFactor(config);
   const stake = Number(stakeDecision.stake) * brake.factor;
@@ -733,6 +747,18 @@ export async function scanPolymarket(config, settings, active) {
 
       try { events ??= await getSportEvents(sportKey); } catch (err) { bump("pm-events-failed", err.message); break; }
       const ev = matchEvent(events, teamNames, commenceTime);
+      // SWING: a game fully sold minutes ago is bought again only after the
+      // cool-off (swing.reentryMinutes), so a sale is not bought straight back.
+      {
+        const sw = swingSettings(config);
+        const soldAt = ev && !ev.ambiguous && ev.slug ? (pmMeta().recentExits || {})[ev.slug] : null;
+        if (sw.enabled && soldAt && Date.now() - Date.parse(soldAt) < sw.reentryMinutes * 60 * 1000) {
+          const mins = Math.ceil((sw.reentryMinutes * 60 * 1000 - (Date.now() - Date.parse(soldAt))) / 60000);
+          bump("pm-cooldown", `${teamNames.join(" vs ")}: sold at ${soldAt}, buyable again in ${mins}m`);
+          for (const n of teamNames) feed({ sportKey, team: n, opponent: teamNames.find((x) => x !== n), commenceTime, code: "pm-cooldown", why: `Sold this game moments ago - buyable again on the next dip in ${mins} minute(s)` });
+          continue;
+        }
+      }
       if (!ev || ev.ambiguous) {
         const code = ev?.ambiguous ? "pm-game-ambiguous" : "pm-game-not-listed";
         bump(code, `${teamNames.join(" vs ")} (${slug})`);
@@ -904,9 +930,10 @@ export async function scanPolymarket(config, settings, active) {
           ? result.feeCents
           : Math.round(feePerContractCents(result.fillCents, filled, PM_FEE) * filled);
         const list = pmPositions();
+        const openedAt = new Date().toISOString();   // also the ledger lot id
         list.push({
           ticker, slug: side.slug, long: side.long, teamName: t.name, opponent, sportKey, commenceTime,
-          contracts: filled, entryPriceCents: result.fillCents, entryFeeCents, openedAt: new Date().toISOString(),
+          contracts: filled, entryPriceCents: result.fillCents, entryFeeCents, openedAt,
           orderId: result.orderId, eventSlug: ev.slug ?? null,
         });
         savePmPositions(list);
@@ -914,6 +941,7 @@ export async function scanPolymarket(config, settings, active) {
           action: "enter", ticker, side: side.long ? "yes" : "no", contracts, priceCents: result.fillCents, filled,
           reason, edgePct: assessment.edgeCheck?.observedEdge != null ? assessment.edgeCheck.observedEdge * 100 : null,
           environment: "production", teamName: t.name, sportKey, commenceTime, feeCents: entryFeeCents,
+          lotId: openedAt,
         });
         appendLog(`Polymarket filled ${filled}x ${t.name} @ ${result.fillCents}c (fee ${(entryFeeCents / 100).toFixed(2)}).`);
         feed({ sportKey, team: t.name, opponent: opp, commenceTime, verdict: "bought", code: "bought", market: side.slug, priceCents: result.fillCents, fairPct: c.prob * 100,
@@ -944,6 +972,302 @@ export async function scanPolymarket(config, settings, active) {
     }
   }
   return lastScan;
+}
+
+// --- Swing trading: selling -------------------------------------------------------------
+
+const SELL_INTENT = { long: "ORDER_INTENT_SELL_LONG", short: "ORDER_INTENT_SELL_SHORT" };
+const SELL_CHECK_RETRY_MS = 5 * 60 * 1000;
+
+/** price.value for a sell at `floorCents` or better on our side (always the YES price). */
+function sellPriceValue(long, floorCents) {
+  const q = Math.max(1, Math.min(99, Math.ceil(floorCents)));
+  return (long ? q : 100 - q) / 100;
+}
+
+/**
+ * SELL FORMAT, CONFIRMED BY POLYMARKET BEFORE THE FIRST REAL SELL. A PREVIEW
+ * (validated, never executed) of a 1-contract sell on a position the bot
+ * holds, priced where it could not trade even if it were executed. The side
+ * turns on once Polymarket echoes the sell intent at the price sent.
+ */
+async function confirmSellFormat(p, px) {
+  const long = p.long === true;
+  const which = long ? "long" : "short";
+  const intent = SELL_INTENT[which];
+  // Our side's sell limit well above its ask: could never fill.
+  const ourAsk = px?.askCents != null ? px.askCents : 95;
+  const q = Math.min(99, Math.ceil(ourAsk) + 5);
+  const value = sellPriceValue(long, q);
+  const body = {
+    request: {
+      marketSlug: p.slug, type: "ORDER_TYPE_LIMIT", intent,
+      price: { value: value.toFixed(2), currency: "USD" }, quantity: 1,
+      tif: "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", manualOrderIndicator: "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+    },
+  };
+  let ok = false;
+  let detail;
+  try {
+    const res = await pmPost("/v1/order/preview", body, { auth: true });
+    const o = res.order || res;
+    const echo = dollarsOf(o.price);
+    const echoIntent = String(o.intent || "");
+    const side = String(o.side || "");
+    const rejected = /REJECT/.test(String(o.state || ""));
+    const intentOk = echoIntent === intent || (!echoIntent && (long ? /SELL/.test(side) : /BUY/.test(side)));
+    const priceOk = echo != null && (Math.abs(echo - value) < 0.006 || Math.abs(echo - (1 - value)) < 0.006);
+    ok = !rejected && intentOk && priceOk;
+    detail = `sent ${intent} @ ${value.toFixed(2)} (${long ? "YES" : "NO"} at ${q}c or better) on ${p.slug} -> ${echoIntent || side || "?"} @ ${echo ?? "?"}, ${o.state || "?"}` +
+      (ok ? ": accepted - selling on" : `: not accepted${o.rejectReason || o.text ? ` (${o.rejectReason || o.text})` : ""}`);
+  } catch (err) {
+    detail = `preview of ${intent} on ${p.slug} failed: ${err.message}`;
+  }
+  const prev = pmMeta().sellCheck || {};
+  updatePmMeta({ sellCheck: { ...prev, [which]: { ok, detail, at: new Date().toISOString(), version: PM_ENGINE_VERSION } } });
+  appendLog(`Polymarket sell check (${which === "long" ? "YES" : "NO"} side): ${detail}`, ok ? "info" : "warn");
+  return ok;
+}
+
+function sellConfirmed(long) {
+  const c = (pmMeta().sellCheck || {})[long ? "long" : "short"];
+  return c?.ok === true;
+}
+
+/** One sell: IOC at `floorCents` or better, reading back what filled. */
+async function placeExit({ p, count, floorCents, seenBidCents }) {
+  const long = p.long === true;
+  const body = {
+    marketSlug: p.slug,
+    type: "ORDER_TYPE_LIMIT",
+    intent: SELL_INTENT[long ? "long" : "short"],
+    price: { value: sellPriceValue(long, floorCents).toFixed(2), currency: "USD" },
+    quantity: count,
+    tif: "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+    manualOrderIndicator: "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+    synchronousExecution: true,
+    maxBlockTime: "5",
+  };
+  const res = await pmPost("/v1/orders", body, { auth: true });
+  let fill = fillFrom(res);
+  if ((!fill.known || (fill.shares === 0 && !fill.rejected)) && res.id) {
+    await new Promise((r) => setTimeout(r, 800));
+    try {
+      const o = await pmGet(`/v1/order/${encodeURIComponent(res.id)}`, { auth: true });
+      const f2 = fillFromOrder(o.order || o);
+      if (f2.known) fill = f2;
+    } catch { /* keep what the create response said */ }
+  }
+  // A NO sale's price: Polymarket quotes on the YES side, so the NO price is
+  // 100 - reported. A sale only fills at or ABOVE our floor, so the reading
+  // at or above it is taken; if both are, the one nearest the NO bid seen.
+  let fillCents = fill.avgPx != null ? fill.avgPx * 100 : null;
+  if (!long && fillCents != null) {
+    const asYes = 100 - fillCents;
+    const asNo = fillCents;
+    const fits = (v) => v > 0 && v < 100 && v >= Math.floor(floorCents) - 0.5;
+    if (fits(asYes) && fits(asNo) && Number.isFinite(seenBidCents)) {
+      fillCents = Math.abs(asNo - seenBidCents) < Math.abs(asYes - seenBidCents) ? asNo : asYes;
+    } else if (fits(asNo) && !fits(asYes)) {
+      fillCents = asNo;
+    } else {
+      fillCents = asYes;
+    }
+  }
+  return {
+    orderId: res.id ?? null, filled: Math.floor(fill.shares || 0), known: fill.known === true,
+    fillCents: fillCents != null ? Math.round(fillCents * 10) / 10 : null,
+    feeCents: fill.commission > 0 ? Math.round(fill.commission * 100) : null, rejected: fill.rejected,
+  };
+}
+
+let lastSellCheckTry = { long: 0, short: 0 };
+
+/** Updates one Polymarket position in state (by ticker + openedAt). */
+function patchPmPosition(p, patchFn) {
+  const fresh = pmPositions();
+  const i = fresh.findIndex((x) => x.ticker === p.ticker && x.openedAt === p.openedAt);
+  if (i < 0) return null;
+  const next = patchFn(fresh[i]);
+  if (next) fresh[i] = next; else fresh.splice(i, 1);
+  savePmPositions(fresh);
+  return next;
+}
+
+/**
+ * After a sell whose result could not be read (transport error, or no
+ * executions and the order lookup failed): Polymarket's own position count
+ * decides. Fewer held than recorded -> that many sold, booked at the sell's
+ * floor price (an immediate-or-cancel sell fills only at or above it - the
+ * log says to check the app for the exact price). Equal -> nothing sold.
+ * Anything else is left for the next cycle / the settlement check.
+ */
+async function resyncUncertainPm(p, heldCache) {
+  if (!heldCache.value) {
+    try { heldCache.value = await readPmPositions(); } catch (err) {
+      appendLog(`Polymarket: could not re-read positions after an uncertain sell (${err.message}) - no sale until it can be.`, "warn");
+      return;
+    }
+  }
+  const h = heldCache.value[p.slug];
+  const net = h ? Math.abs(netOf(h)) : 0;
+  if (!(net > 0)) {
+    appendLog(`Polymarket ${p.slug}: not in the portfolio after an uncertain sell - left to the settlement check.`, "warn");
+    return;
+  }
+  if (net >= p.contracts) {
+    patchPmPosition(p, (cur) => { const { exitUncertainAt, exitUncertainFloor, exitUncertainReason, ...rest } = cur; return rest; });
+    appendLog(`Polymarket ${p.teamName}: ${net} still held - the uncertain sell did not fill. Selling resumes.`);
+    return;
+  }
+  const sold = p.contracts - Math.floor(net);
+  const floor = Number(p.exitUncertainFloor) || null;
+  patchPmPosition(p, (cur) => {
+    const { exitUncertainAt, exitUncertainFloor, exitUncertainReason, ...rest } = cur;
+    const left = (Number(cur.contracts) || 0) - sold;
+    if (left <= 0) return null;
+    return { ...rest, contracts: left, entryFeeCents: Math.round((Number(cur.entryFeeCents) || 0) * (left / cur.contracts) * 100) / 100 };
+  });
+  try {
+    recordTrade({
+      action: "exit", ticker: p.ticker, side: p.long ? "yes" : "no", contracts: p.contracts,
+      priceCents: p.entryPriceCents, exitPriceCents: floor, filled: sold, reason: p.exitUncertainReason || "swing-unconfirmed",
+      environment: "production", teamName: p.teamName, sportKey: p.sportKey, commenceTime: p.commenceTime,
+      feeCents: floor != null ? Math.round(feePerContractCents(floor, sold, PM_FEE) * sold) : null,
+      lotId: p.openedAt ?? undefined,
+    });
+  } catch (err) { appendLog(`LEDGER WRITE FAILED for Polymarket ${p.teamName}: ${err.message}`, "error"); }
+  appendLog(`Polymarket ${p.teamName}: ${sold} sold in an order whose fill could not be read - booked at its ${floor ?? "?"}c floor (the lowest it could fill at). Check the Polymarket app for the exact price.`, "warn");
+}
+
+/**
+ * Every open Polymarket position through the swing rules (swingEngine.js):
+ * half on the rally back to fair value, the rest at +65%, all on a blowout.
+ * Each position is handled on its own - one failure never stops the others.
+ */
+async function managePmPositions(config, settings) {
+  const sw = swingSettings(config);
+  const list = pmPositions();
+  if (!list.length) return;
+  const active = tradingActive(settings, pmMeta());
+  const heldCache = { value: null };
+
+  for (const p0 of list) {
+    const key = `${p0.ticker}|${p0.openedAt}`;
+    try {
+      // Re-read: an earlier sale this cycle may have changed the list.
+      const p = pmPositions().find((x) => x.ticker === p0.ticker && x.openedAt === p0.openedAt);
+      if (!p) continue;
+      if (p.exitUncertainAt) { await resyncUncertainPm(p, heldCache); dropView("polymarket", key); continue; }
+
+      let px;
+      try { px = await sidePrice(p.slug, p.long === true); } catch (err) {
+        noteView("polymarket", key, { venue: "polymarket", ticker: p.ticker, teamName: p.teamName, sportKey: p.sportKey, side: p.long ? "YES" : "NO", contracts: p.contracts, entryCents: p.entryPriceCents, openedAt: p.openedAt, action: "hold", code: "no-price", why: `price unreadable this cycle (${err.message})` });
+        continue;
+      }
+      const feePer = p.contracts > 0 ? (Number(p.entryFeeCents) || 0) / p.contracts : 0;
+      const lf = await liveFair({ sportKey: p.sportKey, teamName: p.teamName, commenceTime: p.commenceTime }, config);
+      const d = swingDecision({
+        contracts: p.contracts, soldHalf: p.soldHalf === true,
+        entryCents: p.entryPriceCents, entryFeeCents: feePer,
+        bidCents: px.open ? px.bidCents : null, askCents: px.askCents, fair: lf.fair, model: lf.model,
+        feeMult: PM_FEE, settings: sw,
+      });
+      const view = viewFor({
+        venue: "polymarket", ticker: p.ticker, teamName: p.teamName, sportKey: p.sportKey, side: p.long ? "YES" : "NO",
+        contracts: p.contracts, soldHalf: p.soldHalf, entryCents: p.entryPriceCents, entryFeeCents: feePer,
+        openedAt: p.openedAt, bidCents: px.bidCents, askCents: px.askCents, lf, d,
+      });
+      if (!sw.enabled || d.action === "hold") { noteView("polymarket", key, view); continue; }
+
+      const long = p.long === true;
+      if (!sellConfirmed(long)) {
+        const which = long ? "long" : "short";
+        if (Date.now() - lastSellCheckTry[which] > SELL_CHECK_RETRY_MS) {
+          lastSellCheckTry[which] = Date.now();
+          await confirmSellFormat(p, px);
+        }
+        if (!sellConfirmed(long)) {
+          const c = (pmMeta().sellCheck || {})[which];
+          noteView("polymarket", key, { ...view, action: "hold", code: "sell-not-confirmed", why: `would sell (${d.why}) - waiting for Polymarket to accept the ${long ? "YES" : "NO"}-side sell preview${c?.detail ? `: ${c.detail}` : ""}` });
+          continue;
+        }
+      }
+      if (!active) { noteView("polymarket", key, { ...view, action: "hold", code: "trading-off", why: `would sell (${d.why}) - Polymarket trading is not active` }); continue; }
+
+      appendLog(`Polymarket ${p.teamName} (${long ? "YES" : "NO"} ${p.slug}) - SWING ${d.code}: ${d.why}${lf.score ? ` | ${lf.score}` : ""}`);
+      // Blowout: sell into the bid (1c under it, like Kalshi). Otherwise never
+      // below the price the decision was made at.
+      const floor = d.floorCents != null ? Math.max(d.floorCents, px.bidCents - 1) : Math.max(1, px.bidCents - 1);
+      const markUncertain = (why) => {
+        patchPmPosition(p, (cur) => ({ ...cur, exitUncertainAt: new Date().toISOString(), exitUncertainFloor: floor, exitUncertainReason: `swing-${d.code}` }));
+        appendLog(`Polymarket sell of ${p.teamName}: ${why} - the result is unknown, so the position is re-read from Polymarket before any further sale.`, "warn");
+        noteView("polymarket", key, { ...view, action: "hold", code: "sell-error", why: `sell result unknown (${why}) - re-checking with Polymarket` });
+      };
+      let r;
+      try {
+        r = await placeExit({ p, count: d.count, floorCents: floor, seenBidCents: px.bidCents });
+      } catch (err) {
+        // A refusal Polymarket answered (4xx - including 429, which its docs
+        // say is enforced at the edge before a request reaches the API) never
+        // executed; anything else (timeout, dropped connection, 5xx) might have.
+        if (err.status >= 400 && err.status < 500) {
+          appendLog(`Polymarket refused the sell of ${p.teamName}: ${err.message} - retried next cycle.`, "warn");
+          noteView("polymarket", key, { ...view, action: "hold", code: "sell-error", why: `sell refused: ${err.message}` });
+        } else {
+          markUncertain(err.message);
+        }
+        continue;
+      }
+      if (r.rejected) { appendLog(`Polymarket rejected the sell of ${p.teamName}: ${r.rejected}`, "warn"); noteView("polymarket", key, view); continue; }
+      if (!r.known) { markUncertain("no fill report and the order could not be looked up"); continue; }
+      if (!(r.filled > 0) || r.fillCents == null) {
+        appendLog(`Polymarket sell of ${p.teamName}: nothing filled at ${floor}c or better - retried next cycle.`);
+        noteView("polymarket", key, view);
+        continue;
+      }
+
+      const sold = Math.min(r.filled, p.contracts);
+      const left = p.contracts - sold;
+      const exitFee = r.feeCents != null ? r.feeCents : Math.round(feePerContractCents(r.fillCents, sold, PM_FEE) * sold);
+
+      // 1. STATE FIRST, from the current record.
+      patchPmPosition(p, (cur) => {
+        const curLeft = (Number(cur.contracts) || 0) - sold;
+        if (curLeft <= 0) return null;
+        return {
+          ...cur, contracts: curLeft,
+          entryFeeCents: Math.round((Number(cur.entryFeeCents) || 0) * (curLeft / cur.contracts) * 100) / 100,
+          // A half sale counts as done only when the whole half sold.
+          soldHalf: cur.soldHalf === true || (d.action === "sell-half" && sold >= d.count),
+        };
+      });
+      if (left <= 0) {
+        const gameKey = p.eventSlug || p.slug;
+        const recent = { ...(pmMeta().recentExits || {}) };
+        recent[gameKey] = new Date().toISOString();
+        for (const [k, iso] of Object.entries(recent)) if (Date.now() - Date.parse(iso) > 48 * 3600 * 1000) delete recent[k];
+        updatePmMeta({ recentExits: recent });
+      }
+      dropView("polymarket", key);
+
+      // 2. THE LEDGER.
+      try {
+        recordTrade({
+          action: "exit", ticker: p.ticker, side: long ? "yes" : "no", contracts: p.contracts,
+          priceCents: p.entryPriceCents, exitPriceCents: r.fillCents, filled: sold, reason: `swing-${d.code}`,
+          environment: "production", teamName: p.teamName, sportKey: p.sportKey, commenceTime: p.commenceTime,
+          feeCents: exitFee, lotId: p.openedAt ?? undefined,
+        });
+      } catch (err) {
+        appendLog(`LEDGER WRITE FAILED for the Polymarket sale of ${sold}x ${p.teamName} @ ${r.fillCents}c: ${err.message} - the position itself is updated.`, "error");
+      }
+      const pnl = ((r.fillCents - p.entryPriceCents) * sold - exitFee - feePer * sold) / 100;
+      appendLog(`Polymarket sold ${sold}x ${p.teamName} @ ${r.fillCents}c (${d.code}), ${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toFixed(2)} on these; ${left} left.`);
+    } catch (err) {
+      appendLog(`Polymarket swing check of ${p0.teamName} contained: ${err.message}`, "warn");
+    }
+  }
 }
 
 // --- The cycle ------------------------------------------------------------------------------
@@ -979,6 +1303,10 @@ export async function runPolymarketCycle(config) {
       const { settled } = await reconcilePolymarket();
       if (settled) appendLog(`Polymarket: ${settled} position(s) settled.`);
     } catch (err) { appendLog(`Polymarket settlement check contained: ${err.message}`, "warn"); }
+
+    // SWING: open positions are managed every cycle - before any halt check,
+    // because selling is how risk comes OFF.
+    try { await managePmPositions(config, settings); } catch (err) { appendLog(`Polymarket swing check contained: ${err.message}`, "warn"); }
 
     let state = {};
     try { state = loadState(); } catch { state = {}; }
@@ -1020,6 +1348,8 @@ export function pmStatus(config = {}) {
     coverage: meta.coverage ?? null,
     haltedForDay: meta.haltedForDay === true,
     pausedUntil: meta.pausedUntil && Date.parse(meta.pausedUntil) > Date.now() ? meta.pausedUntil : null,
+    sellCheck: meta.sellCheck ?? null,
+    recentExits: meta.recentExits ?? {},
   };
 }
 
