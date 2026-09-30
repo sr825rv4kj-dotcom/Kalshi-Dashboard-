@@ -447,7 +447,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // new buy. Checked before the ticker lookup, so it costs no Kalshi call.
     if (timing.live && !entryAllowedForSport(sportKey, config)) {
       drops.unmodeled++;
-      feedHere("no-model-for-sport", "No calibrated in-game model for this sport - only modelled sports are bought");
+      feedHere("no-model-for-sport", "This sport is not on the trade list - only sports with a proven record are bought");
       return null;
     }
     if (!timing.ok) { drops.window++; return null; }
