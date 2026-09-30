@@ -6,6 +6,7 @@ import { startBot, stopBot, isRunning, resumeTrading, resetCircuitBreaker, kalsh
 import { scheduleReport, schedulePlan, refreshSchedule } from "../liveSchedule.js";
 import { pmStatus } from "../polymarket/pmEngine.js";
 import { scanFeedReport } from "../scanFeed.js";
+import { deskReport } from "../swingEngine.js";
 import { getSeriesMap } from "../tickerResolver.js";
 import { mappedSports } from "../polymarket/pmMarkets.js";
 import { loadConfig, saveConfig, setEnvironment } from "../configStore.js";
@@ -99,6 +100,35 @@ export function registerBotRoutes(app) {
         notLooked.push({ sportKey: g.sportKey, home: g.home, away: g.away, commence: g.commence, minutesIn: g.minutesIn, why });
       }
       res.json({ ...feed, schedule: { ready: sched.ready, liveGames: sched.counts?.liveGames ?? 0 }, notLooked });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // --- Trading Desk (swingEngine.js) ------------------------------------------
+  // Every open position on both exchanges with its live bid, fair value (score
+  // + clock, seconded by the sharp line), profit so far and the exact price of
+  // the next sale; today's round trips and profit against the daily goal.
+  // Read from what the bot saw on its last check - no exchange call here.
+  app.get("/api/desk", (_req, res) => {
+    try {
+      const config = loadConfig();
+      const desk = deskReport(config);
+      const sched = (() => { try { return scheduleReport(); } catch { return null; } })();
+      const pm = (() => { try { return pmStatus(config); } catch { return null; } })();
+      const k = (() => { try { return kalshiOpenTradeCap(config); } catch { return null; } })();
+      res.json({
+        ...desk,
+        botRunning: isRunning(),
+        liveGames: sched?.counts?.liveGames ?? null,
+        nextGame: sched?.next ?? null,
+        caps: {
+          kalshi: k ? { open: k.open, cap: k.cap } : null,
+          polymarket: pm?.lastScan ? { open: pm.lastScan.open, cap: pm.lastScan.openCap } : null,
+        },
+        polymarketSelling: pm?.sellCheck ?? null,
+        polymarketTrading: pm?.tradingActive ?? null,
+      });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
