@@ -127,6 +127,7 @@ function safeConfig(cfg) {
     dailyLossHaltPct: cfg.dailyLossHaltPct,
     survivalMode: cfg.survivalMode,
     liveOnly: cfg.liveOnly !== false,
+    modeledSportsOnly: cfg.modeledSportsOnly !== false,
     flatStakeDollars: cfg.flatStakeDollars,
     minExpectedReturnPct: cfg.minExpectedReturnPct,
     liveBandMinCents: cfg.liveBandMinCents,
