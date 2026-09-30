@@ -31,6 +31,7 @@ import { kalshiGet } from "../kalshiClient.js";
 import { loadState, getRecentLog } from "../stateStore.js";
 import { loadConfig } from "../configStore.js";
 import { getTradeStats, getTradeLifecycles } from "../tradeLedgerStore.js";
+import { deskReport, SWING_VERSION } from "../swingEngine.js";
 import { buildStrategyReview } from "../strategyReview.js";
 import { lastDiscovery } from "../seriesDiscovery.js";
 import { getSeriesMap, RESOLVER_VERSION } from "../tickerResolver.js";
@@ -134,6 +135,7 @@ function safeConfig(cfg) {
     stakeMaxDollars: cfg.stakeMaxDollars,
     doubleDown: cfg.doubleDown,
     polymarket: cfg.polymarket,
+    swing: cfg.swing,
     disabledSports: cfg.disabledSports ?? [],
   };
 }
@@ -188,6 +190,7 @@ export function registerMonitorRoutes(app) {
       polymarket: PM_ENGINE_VERSION,
       schedule: LIVE_SCHEDULE_VERSION,
       controller: CONTROLLER_VERSION,
+      swing: SWING_VERSION,
       pregamePriorsRemembered: pregamePriorCount(),
       cadence: describeScheduleCadence(),
     }));
@@ -253,6 +256,8 @@ export function registerMonitorRoutes(app) {
     section("learner", () => learnerReport(loadConfig()));
     // Current stake, the tier it came from, the next step, and any double-downs.
     section("stake", () => stakeReport(loadConfig()));
+    // Trading Desk: swing positions (bid, fair, next sale), today vs the goal.
+    section("desk", () => deskReport(loadConfig()));
     // Polymarket US: keys, self-check with REAL response shapes, positions, last scan.
     section("polymarket", () => pmMonitorReport(loadConfig()));
     section("trades", () => getTradeStats());
