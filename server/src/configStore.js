@@ -91,7 +91,7 @@ export const DEFAULTS = {
   // EV floor already decide whether it is worth taking. The window was refusing
   // markets before any of those ever got to run - your logs showed tennis
   // dropping 2 of 10 lines on this alone.
-  entryWindowHours: 1 / 6,      // 10 minutes: pre-game buys only this close to the start
+  entryWindowHours: 1,          // 60 minutes (2026-10-01): pre-game buys only this close to the start
   minMinutesBeforeStart: 0,     // raise this to stop entering right on the whistle
 
   // --- Price band --------------------------------------------------------
@@ -349,6 +349,12 @@ export const DEFAULTS = {
   // the whole bot still halts at dailyLossHaltPct.
   pregameStop: { maxLossesPerDay: 2, maxOpen: 3 },
 
+  // PRE-GAME WAITING PERIOD (2026-10-01) - pregameConfirm.js. A pre-game edge
+  // is bought only once the same side has qualified on minScans consecutive
+  // reads over minMinutes, and the sharp line has not drifted more than
+  // maxDriftPoints away from that side. Both exchanges. Live games unaffected.
+  pregameConfirm: { enabled: true, minScans: 3, minMinutes: 3, maxGapSeconds: 180, maxDriftPoints: 2 },
+
   // RESTING BIDS (makerEngine.js). allowLive (2026-10-01): in live games too -
   // a bid at the price that returns minExpectedReturnPct, max 2 at once, half
   // stake, 5-minute life, re-confirmed every scan.
@@ -594,6 +600,20 @@ const ONE_TIME_UPDATES = [
     id: "2026-10-01-live-resting-bids",
     apply: (c) => { c.maker = { ...(c.maker || {}), enabled: true, allowLive: true }; },
     note: "Kalshi live resting bids on: bid at the price that returns the 30% minimum, max 2 at once, half stake, 5-minute life",
+  },
+  {
+    // PRE-GAME WINDOW 60 MINUTES (2026-10-01, account holder's call), both
+    // exchanges - they share entryWindowHours. Every other pre-game rule is
+    // unchanged: 30% min return, 35-70c, line under 15 minutes old, the
+    // pre-game hard stop (2 losses a day, 3 open), the 15% daily halt.
+    id: "2026-10-01-pregame-60min",
+    apply: (c) => { c.entryWindowHours = 1; },
+    note: "pre-game buys open 60 minutes before the start, on Kalshi and Polymarket",
+  },
+  {
+    id: "2026-10-01-pregame-waiting-period",
+    apply: (c) => { c.pregameConfirm = { enabled: true, minScans: 3, minMinutes: 3, maxGapSeconds: 180, maxDriftPoints: 2 }; },
+    note: "pre-game waiting period: same side must qualify on 3 reads over 3+ minutes, line not drifting more than 2 pts away",
   },
 ];
 
