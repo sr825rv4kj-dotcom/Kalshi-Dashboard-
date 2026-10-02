@@ -24,13 +24,32 @@
  * affected. Kalshi and Polymarket keep separate watches.
  */
 
-export const PREGAME_CONFIRM_VERSION = "2026-10-01-pregame-confirm";
+export const PREGAME_CONFIRM_VERSION = "2026-10-01-confirm-all";
+
+/*
+ * LIVE TOO (2026-10-01, account holder's call): every entry now waits, live
+ * games included, with their own settings (config.pregameConfirm.live):
+ * 4 qualifying reads over at least 2 minutes, and the fair value - which in
+ * play comes from the score-checked model - may not drop more than 3 points
+ * while it watches (a score against the side restarts the watch). A pre-game
+ * watch never carries into the live game: each phase has its own watch.
+ */
 
 const watches = new Map();   // `${venue}|${gameKey}` -> { team, firstAt, lastAt, scans, firstFair, lastFair }
 
-export function pregameConfirmSettings(config = {}) {
+export function pregameConfirmSettings(config = {}, phase = "pregame") {
   const p = config.pregameConfirm || {};
   const num = (v, d) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
+  if (phase === "live") {
+    const l = p.live || {};
+    return {
+      enabled: p.enabled !== false && l.enabled !== false,
+      minScans: num(l.minScans, 4),
+      minMinutes: num(l.minMinutes, 2),
+      maxGapSeconds: num(l.maxGapSeconds, 90),
+      maxDriftPoints: num(l.maxDriftPoints, 3),
+    };
+  }
   return {
     enabled: p.enabled !== false,
     minScans: num(p.minScans, 3),
@@ -49,10 +68,11 @@ export function pregameConfirmSettings(config = {}) {
  *   team     the side that qualified this scan
  *   fairPct  the sharp fair value for that side, in percent
  */
-export function observePregame({ venue, gameKey, team, fairPct }, config = {}, now = Date.now()) {
-  const s = pregameConfirmSettings(config);
+export function observePregame({ venue, gameKey, team, fairPct, live = false }, config = {}, now = Date.now()) {
+  const phase = live ? "live" : "pregame";
+  const s = pregameConfirmSettings(config, phase);
   if (!s.enabled) return { ready: true, scans: 0, minutes: 0, why: "waiting period off" };
-  const key = `${venue}|${gameKey}`;
+  const key = `${venue}|${phase}|${gameKey}`;
   let w = watches.get(key);
   let restart = null;
   if (!w) restart = "first sighting";
@@ -80,7 +100,8 @@ export function observePregame({ venue, gameKey, team, fairPct }, config = {}, n
 
 /** Forget a game's watch (after a buy, or when the game starts). */
 export function clearPregame(venue, gameKey) {
-  watches.delete(`${venue}|${gameKey}`);
+  watches.delete(`${venue}|pregame|${gameKey}`);
+  watches.delete(`${venue}|live|${gameKey}`);
 }
 
 /** Drop watches untouched for an hour - games that started or went away. */
