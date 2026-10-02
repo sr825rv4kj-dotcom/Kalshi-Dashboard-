@@ -428,7 +428,8 @@ export const DEFAULTS = {
   //   no limit on open Polymarket bets (removed 2026-09-28, account holder's
   //   call) - cash on the account is the only limit, as on Kalshi
   // 2026-09-30: trading "off" - connected and visible, no buying (account holder).
-  polymarket: { enabled: true, trading: "off", shortSide: "auto" },
+  // 2026-10-01: "auto" - same rules as Kalshi (account holder).
+  polymarket: { enabled: true, trading: "auto", shortSide: "auto" },
 
   // IN-GAME SWING TRADING (2026-09-29, account holder's plan) - swingEngine.js.
   // Buy the dip (price under what the score and clock say the team is worth),
@@ -570,6 +571,17 @@ const ONE_TIME_UPDATES = [
       c.dailyLossHaltPct = 0.15;
     },
     note: "pre-Polymarket edge: Kalshi only, hold every position to the end, 30% min return, 35-70c, live buys need a live score, all sports; pre-game in the last 10 min with a hard stop (2 losses/day, 3 open)",
+  },
+  {
+    // POLYMARKET ON THE SAME RULES AS KALSHI (2026-10-01, account holder's
+    // call): every rule above applies to Polymarket too (pmEngine.js) - hold
+    // to the end, 30% min return, 35-70c, live score required, pre-game hard
+    // stop counted on Polymarket's own trades, survival-mode cap, stake tiers
+    // from Polymarket's own equity, its own 15% daily halt. "auto" trades once
+    // the live self-check passes.
+    id: "2026-10-01-polymarket-same-rules",
+    apply: (c) => { c.polymarket = { ...DEFAULTS.polymarket, ...(c.polymarket || {}), trading: "auto" }; },
+    note: "Polymarket trading back on (auto) under the same rules as Kalshi",
   },
 ];
 
