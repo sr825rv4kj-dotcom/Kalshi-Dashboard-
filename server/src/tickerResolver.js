@@ -38,6 +38,29 @@
  * case is re-run against the live MLB board before this shipped.
  *
  * ---------------------------------------------------------------------------
+ * 2026-10-02: THE OTHER SIDE OF THE GAME MUST BE THE OPPONENT
+ * ---------------------------------------------------------------------------
+ * Production 2026-10-02 02:07Z, New Mexico State (vs Western Kentucky):
+ *
+ *   KXNCAAFGAME-26OCT02PSUNW-NW  44c (sharp 86.3%)  -> edge-implausible
+ *
+ * NW is Northwestern. "NW" is a subsequence of "new" (rule 2 below), no code
+ * fit NMSU, and the Oct 2 Penn State game sits inside the +/-1 day window -
+ * so the resolver handed back Northwestern for New Mexico State. Only the 18%
+ * plausibility gate stopped the order.
+ *
+ * The fix needs no guessing: a team's own market sits in an event whose
+ * OTHER side is its opponent. When the opponent is known and the chosen
+ * market's event carries another team code, that code must answer to the
+ * opponent - by code fit, by spelling, by its first letter starting a word
+ * of the opponent's name, or by the opponent's distinctive name on its YES
+ * side. PSU fits none of those for "Western Kentucky Hilltoppers", so the
+ * NW market is refused ("opponent-mismatch") instead of traded.
+ *
+ * Calgary (CAR/CGY, 2026-10-01): the tie-break below keeps the code whose own
+ * event holds the opponent, and this check confirms it.
+ *
+ * ---------------------------------------------------------------------------
  * WHY THIS FILE WAS REPLACED: IT RETURNED LAST WEEK'S GAME
  * ---------------------------------------------------------------------------
  * A scan showed 33 "no matching Kalshi market", 11 "market not tradeable" and
@@ -92,7 +115,7 @@ const CACHE_TTL_MS = 3 * 60 * 1000;
 /** How many days either side of kickoff a ticker's date may sit. */
 const DATE_SLACK_DAYS = 1;
 
-export const RESOLVER_VERSION = "2026-10-01-code-tiebreak";
+export const RESOLVER_VERSION = "2026-10-02-opponent-check";
 
 /**
  * Accent folding. kärpät -> karpat, ässät -> assat, Malmö -> malmo.
@@ -557,6 +580,50 @@ export async function resolveTicker({ sportKey, teamName, commenceTime, opponent
     return s0 == null || !Number.isFinite(commenceMs) ? Infinity : Math.abs(s0 - commenceMs);
   };
 
+  /**
+   * OPPONENT CHECK (2026-10-02). The chosen market's event must hold the
+   * opponent on its other side. Passes when the opponent is unknown, or the
+   * event shows no other team code (nothing to contradict). Refuses only
+   * when another code IS there and answers to the opponent in no way.
+   */
+  const opponentCheck = (market, ourCode) => {
+    const opp = opponentName && !NON_TEAM_OUTCOMES.has(String(opponentName).toLowerCase().trim()) ? opponentName : null;
+    if (!opp) return { ok: true };
+    const NON_TEAM = new Set(["TIE", "DRAW", "DRW", "TIED"]);
+    const evOf = (m) => m.event_ticker || String(m.ticker).slice(0, String(m.ticker).lastIndexOf("-"));
+    const ev = evOf(market);
+    const pool = all.filter((m) => evOf(m) === ev);
+    const others = [...new Set(pool.map((m) => tickerTeamCode(m.ticker)).filter((c) => c && c !== ourCode && !NON_TEAM.has(c.toUpperCase())))];
+    // The event ticker itself names both sides (KXNCAAFGAME-26OCT02PSUNW):
+    // when only our side is listed, read the other code off the event ticker.
+    if (!others.length) {
+      const tail = String(ev).split("-").pop() || "";
+      const pair = tail.replace(/^\d{2}[A-Z]{3}\d{2}(\d{4})?/, "");
+      if (pair && pair !== ourCode && pair.startsWith(ourCode)) others.push(pair.slice(ourCode.length));
+      else if (pair && pair !== ourCode && pair.endsWith(ourCode)) others.push(pair.slice(0, pair.length - ourCode.length));
+    }
+    const real = others.filter((c) => /^[A-Z0-9]{2,6}$/.test(c));
+    if (!real.length) return { ok: true };
+    const oppWords = fold(opp).toLowerCase().replace(/[^a-z ]/g, " ").split(/\s+/).filter(Boolean);
+    const strongOpp = oppWords.filter((w) => !GEO.has(w) && !WEAK.has(w) && w.length > 2);
+    for (const c of real) {
+      const lc = c.toLowerCase();
+      if (codeAffinity(c, opp) > 0) return { ok: true, via: `${c} (code fit)` };
+      if (spelledFromName(c, opp)) return { ok: true, via: `${c} (spelled)` };
+      if (oppWords.some((w) => w[0] === lc[0])) return { ok: true, via: `${c} (initial)` };
+      const yesRow = pool.find((m) => tickerTeamCode(m.ticker) === c);
+      if (yesRow && strongOpp.length) {
+        const yes = new Set(yesSideText(yesRow).split(" ").filter(Boolean));
+        if (strongOpp.some((w) => yes.has(w))) return { ok: true, via: `${c} (YES side)` };
+      }
+    }
+    return {
+      ok: false,
+      reason: `${market.ticker}: the other side of ${ev} is ${real.join("/")}, which does not answer to the opponent ` +
+        `"${opp}" - this is a different game (e.g. NW for New Mexico State on the Penn State-Northwestern board). Refused.`,
+    };
+  };
+
   // --- Gate 3: the name ---------------------------------------------------
   const words = usableWords(teamName);
   if (!words.length) {
@@ -846,10 +913,16 @@ export async function resolveTicker({ sportKey, teamName, commenceTime, opponent
       best = pool.reduce((a, b) => (spreadOf(b) < spreadOf(a) ? b : a));
     }
 
+    const fx = opponentCheck(best.m, best.tcode);
+    if (!fx.ok) {
+      return { ticker: null, code: "opponent-mismatch", reason: fx.reason };
+    }
+
     return {
       ticker: best.m.ticker, code: "ok",
       reason: `ticker code ${best.tcode} identifies "${teamName}" ` +
-        `(${best.m.status}, affinity ${best.aff}${leaders.length > 1 ? `, ${leaders.length} fixtures in window` : ""})`,
+        `(${best.m.status}, affinity ${best.aff}${leaders.length > 1 ? `, ${leaders.length} fixtures in window` : ""}` +
+        `${fx.via ? `, opponent ${fx.via}` : ""})`,
     };
   }
 
