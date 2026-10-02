@@ -51,7 +51,7 @@
  * Every failure is contained: nothing here can stop or slow the Kalshi bot.
  */
 
-import { loadState, appendLog } from "../stateStore.js";
+import { loadState, appendLog, tradingDay } from "../stateStore.js";
 import { recordTrade } from "../tradeLedgerStore.js";
 import { entryTiming, getRecentLines, rememberLines, pregameStopStatus } from "../scanner.js";
 import { observePregame } from "../pregameConfirm.js";
@@ -692,10 +692,21 @@ export async function scanPolymarket(config, settings, active) {
   const equity = (account?.cash ?? 0) + openPm.reduce((t, p) => t + (p.cashValue ?? (p.contracts * p.entryPriceCents) / 100), 0);
 
   // Own daily loss limit, same percentage as Kalshi's.
-  const today = new Date().toDateString();
+  // The Pacific day (stateStore.js tradingDay) - not the server's UTC day.
+  // Re-checked every cycle like Kalshi's (botController checkDailyHalt): it
+  // halts at the limit and resumes once the drawdown is back under 90% of it.
+  const today = tradingDay();
   if (account && meta.dayStartDate !== today) updatePmMeta({ dayStartDate: today, dayStartEquity: equity, haltedForDay: false });
   const dayStart = meta.dayStartDate === today ? Number(meta.dayStartEquity) : equity;
-  const haltPct = Number(config.dailyLossHaltPct ?? 0.15);
+  const rawHalt = Number(config.dailyLossHaltPct);
+  const haltPct = Number.isFinite(rawHalt) && rawHalt > 0 && rawHalt <= 1 ? rawHalt : 0.15;
+  if (account && dayStart > 0 && pmMeta().haltedForDay === true) {
+    const drawdown = (dayStart - equity) / dayStart;
+    if (drawdown < haltPct * 0.9) {
+      updatePmMeta({ haltedForDay: false });
+      appendLog(`Polymarket resuming: drawdown ${(drawdown * 100).toFixed(1)}% is back under the ${(haltPct * 100).toFixed(0)}% limit (resume below ${(haltPct * 90).toFixed(1)}%).`);
+    }
+  }
   if (account && dayStart > 0 && equity < dayStart * (1 - haltPct)) {
     if (!pmMeta().haltedForDay) {
       updatePmMeta({ haltedForDay: true });
