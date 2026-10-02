@@ -54,11 +54,12 @@
 import { loadState, appendLog } from "../stateStore.js";
 import { recordTrade } from "../tradeLedgerStore.js";
 import { entryTiming, getRecentLines, rememberLines, pregameStopStatus } from "../scanner.js";
+import { observePregame } from "../pregameConfirm.js";
 import { getSharpProbabilities } from "../scraper.js";
 import { getLiveScores, findLiveGameForTeam } from "../scoresFetcher.js";
 import { corroboratedProbability, fractionRemaining, paramsFor, entryAllowedForSport, pregamePrior, rememberPregame, flushPregamePriors } from "../liveModel.js";
 import { allActiveSportKeys } from "../sportsDiscovery.js";
-import { schedulePlan, shouldScanSport, openTradeCap, MIN_OPEN_TRADES } from "../liveSchedule.js";
+import { schedulePlan, shouldScanSport, openTradeCap, MIN_OPEN_TRADES, LEAD_MS } from "../liveSchedule.js";
 import { noteDecision, noteScan } from "../scanFeed.js";
 import { getSeriesMap } from "../tickerResolver.js";
 import { assessOpportunity, feePerContractCents, flatBetContracts } from "../riskManager.js";
@@ -577,7 +578,7 @@ async function linesForCycle(config) {
   // re-read every 30 minutes, not skipped).
   for (const sportKey of active) {
     if (out.has(sportKey) || off.has(sportKey)) continue;
-    if (!shouldScanSport(sportKey, plan)) continue;          // nothing live or within 30 minutes
+    if (!shouldScanSport(sportKey, plan)) continue;          // nothing live or within LEAD_MS (65 minutes)
     let slugs = [];
     try { slugs = await leagueSlugsFor(sportKey); } catch { continue; }
     if (!slugs.length) continue;
@@ -629,7 +630,7 @@ export async function buildCoverage(config) {
     if (!plan.ready) return null;
     const liveN = plan.live.get(sportKey)?.length || 0;
     if (liveN) return `${liveN} live - scanning`;
-    if (plan.soon.has(sportKey)) return "starting within 30 min - scanning";
+    if (plan.soon.has(sportKey)) return `starting within ${Math.round(LEAD_MS / 60000)} min - scanning`;
     if (plan.failed.includes(sportKey) || !plan.known.has(sportKey)) return "scanning (no calendar for it)";
     return "no game live - waits for the schedule";
   };
@@ -899,6 +900,12 @@ export async function scanPolymarket(config, settings, active) {
           const r = returnAt(askCents);
           skip("pm-return-too-small", `${askCents}c vs fair ${(c.prob * 100).toFixed(1)}%: ${r.pct.toFixed(1)}% expected return, under the ${minReturnPct}% minimum`);
           continue;
+        }
+        // PRE-GAME WAITING PERIOD (pregameConfirm.js) - same rule as Kalshi,
+        // with Polymarket's own watch.
+        if (!timing.live) {
+          const w = observePregame({ venue: "polymarket", gameKey: `${sportKey}|${commenceTime}|${[...teamNames].map(normName).sort().join("|")}`, team: t.name, fairPct: c.prob * 100 }, config);
+          if (!w.ready) { skip("pm-pregame-watching", w.why); continue; }
         }
         let contracts = countAt(limit);
         const perContract = (limit + feePerContractCents(limit, contracts, PM_FEE)) / 100;
