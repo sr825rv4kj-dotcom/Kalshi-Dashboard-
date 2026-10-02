@@ -71,6 +71,16 @@ export function heldOnPolymarket({ sportKey, commenceTime, teamNames }) {
   );
 }
 
+/** Every Polymarket position held on this game (for the double-down check). */
+export function pmPositionsOnGame({ sportKey, commenceTime, teamNames }) {
+  const names = new Set((teamNames || []).map(normName).filter(Boolean));
+  if (!names.size) return [];
+  return pmPositions().filter((p) =>
+    p.sportKey === sportKey && sameStart(p.commenceTime, commenceTime) &&
+    (names.has(normName(p.teamName)) || names.has(normName(p.opponent)))
+  );
+}
+
 /** The mirror check: a Kalshi position (or resting bid) already on this game. */
 export function heldOnKalshi({ sportKey, commenceTime, teamNames, restingOrders = [] }) {
   return kalshiTeamOnGame({ sportKey, commenceTime, teamNames, restingOrders }) != null;
