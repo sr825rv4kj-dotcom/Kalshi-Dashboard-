@@ -90,6 +90,7 @@ import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, f
 import { polymarketTeamOnGame, normName } from "./polymarket/pmState.js";
 import { noteDecision, noteScan } from "./scanFeed.js";
 import { getTradeLifecycles, filterByVenue } from "./tradeLedgerStore.js";
+import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
@@ -774,6 +775,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   const tierLine = noteStake(stakeDecision, equity);
   if (tierLine) appendLog(tierLine);
   const ddConfig = doubleDownConfig(config);
+  prunePregame();
 
   for (const c of viable) {
     // An add-on is re-checked here: a fill earlier in this scan may have
@@ -968,6 +970,19 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         if (flat) assessment.sizing.contracts = countAt(limit);
         assessment.edgeCheck.evTradeCents = r.ev * assessment.sizing.contracts;
         assessment.sizing.dollarsAtRisk = assessment.sizing.contracts * (limit + feePerContractCents(limit, assessment.sizing.contracts, config.feeMultiplier ?? 0.07)) / 100;
+      }
+    }
+
+    // PRE-GAME WAITING PERIOD (pregameConfirm.js): a pre-game edge is bought
+    // only after the same side has qualified on consecutive scans over a few
+    // minutes without the sharp line drifting away from it.
+    if (!c.timing.live && !c.addOn) {
+      const w = observePregame({ venue: "kalshi", gameKey: eventKeyOf(c.ticker), team: c.teamName, fairPct: c.trueProbability * 100 }, config);
+      if (!w.ready) {
+        bump("pregame-watching", `${c.ticker}: ${w.why}`);
+        feedC("pregame-watching", w.why);
+        rejected.push(`${c.ticker}: ${w.why}`);
+        continue;
       }
     }
 
