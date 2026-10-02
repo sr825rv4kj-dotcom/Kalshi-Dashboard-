@@ -55,7 +55,24 @@ import { notifyEntry } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 import { currentCadenceSeconds } from "./cadence.js";
 
-export const MAKER_VERSION = "2026-09-22-fill-or-toss";
+export const MAKER_VERSION = "2026-10-01-live-bids";
+
+/*
+ * LIVE RESTING BIDS (2026-10-01, account holder's call). In a live game that
+ * is fairly priced right now, a buy order rests at the price that returns
+ * config.minExpectedReturnPct (30%) against the score-checked fair value, and
+ * the market fills it if it dips there. Rules on top of the ones above:
+ *   - only games that passed the in-play score check this scan (a game with
+ *     no live score never gets a bid)
+ *   - inside the live price band (liveBandMinCents-liveBandMaxCents)
+ *   - re-priced or cancelled every scan as the fair value moves; cancelled if
+ *     no scan re-confirms it within liveStaleSeconds (60s)
+ *   - expires on the exchange after liveMaxRestMinutes even if the bot is down
+ *   - at most liveMaxBids live bids at once, staked at liveStakeFactor of the
+ *     normal stake while it proves itself
+ *   - every fill is recorded "In-play resting bid filled", so its results can
+ *     be read on their own
+ */
 
 const V2 = "/trade-api/v2";
 const ORDERS_V2 = `${V2}/portfolio/events/orders`;
@@ -107,6 +124,13 @@ export function makerSettings(config = {}) {
     // HIGHER bid. No bid sits on the book for hours waiting on a dip.
     maxRestMinutes: m.maxRestMinutes ?? 10,
     tossCooldownMinutes: m.tossCooldownMinutes ?? 30,
+    // Live bids (see LIVE RESTING BIDS above).
+    liveMaxRestMinutes: m.liveMaxRestMinutes ?? 5,
+    liveTossCooldownMinutes: m.liveTossCooldownMinutes ?? 3,
+    liveStaleSeconds: m.liveStaleSeconds ?? 60,
+    liveMaxLineAgeSeconds: m.liveMaxLineAgeSeconds ?? 120,
+    liveMaxBids: m.liveMaxBids ?? 2,
+    liveStakeFactor: m.liveStakeFactor ?? 0.5,
   };
 }
 
@@ -147,7 +171,8 @@ function writeResting(mutator) {
 /** Pure: has this bid used up its time on the book? */
 export function bidExpired(order, now = Date.now(), s = makerSettings()) {
   const placed = Date.parse(order && order.placedAt);
-  return Number.isFinite(placed) && now - placed > s.maxRestMinutes * 60_000;
+  const mins = order && order.live ? s.liveMaxRestMinutes : s.maxRestMinutes;
+  return Number.isFinite(placed) && now - placed > mins * 60_000;
 }
 
 /**
@@ -159,7 +184,8 @@ export function bidExpired(order, now = Date.now(), s = makerSettings()) {
 export function tossBlocks(tossed, priceCents, now = Date.now(), s = makerSettings()) {
   if (!tossed) return false;
   const at = Date.parse(tossed.at);
-  if (!Number.isFinite(at) || now - at > s.tossCooldownMinutes * 60_000) return false;
+  const cool = tossed.live ? s.liveTossCooldownMinutes : s.tossCooldownMinutes;
+  if (!Number.isFinite(at) || now - at > cool * 60_000) return false;
   return priceCents <= tossed.priceCents;
 }
 
@@ -171,7 +197,7 @@ function readTossed(state = loadState()) {
 function recordToss(order) {
   const state = loadState();
   const tossed = readTossed(state);
-  tossed[order.ticker] = { at: new Date().toISOString(), priceCents: order.priceCents };
+  tossed[order.ticker] = { at: new Date().toISOString(), priceCents: order.priceCents, live: order.live === true };
   const cutoff = Date.now() - 24 * 3600_000;
   for (const [k, v] of Object.entries(tossed)) if (Date.parse(v.at) < cutoff) delete tossed[k];
   state.makerTossed = tossed;
@@ -200,13 +226,16 @@ export function restingEventKeys() {
  * plus the buffer. Strictly below the ask, so a post-only order is accepted.
  * Returns null when no price in the band qualifies.
  */
-export function maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents = 12, maxEntryPriceCents = 95, multiplier = MAKER_FEE_MULTIPLIER, contractsAt = () => 1 }) {
+export function maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents = 12, maxEntryPriceCents = 95, multiplier = MAKER_FEE_MULTIPLIER, contractsAt = () => 1, minReturnPct = 0 }) {
   const ceiling = Math.min(maxEntryPriceCents || 99, 99, askCents > 0 ? askCents - 1 : 99);
   const floor = Math.max(1, minEntryPriceCents || 1);
   for (let c = ceiling; c >= floor; c--) {
     const edge = trueProbability - c / 100;
     const required = requiredEdgeThreshold({ price: c / 100, multiplier, expectRoundTrip: false, contracts: contractsAt(c) });
-    if (edge > required) return c;
+    if (!(edge > required)) continue;
+    // The same minimum expected return as a taker entry (config.minExpectedReturnPct).
+    if (minReturnPct > 0 && (makerEvCents(trueProbability, c, multiplier, contractsAt(c)) / c) * 100 < minReturnPct) continue;
+    return c;
   }
   return null;
 }
@@ -227,9 +256,9 @@ export function makerEvCents(trueProbability, priceCents, multiplier = MAKER_FEE
  *
  * Pure, so it can be checked against real book numbers.
  */
-export function planBid({ trueProbability, bidCents, askCents, existingPriceCents = null, minEntryPriceCents, maxEntryPriceCents, multiplier = MAKER_FEE_MULTIPLIER, contractsAt = () => 1 }) {
-  const maxBid = maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents, maxEntryPriceCents, multiplier, contractsAt });
-  if (maxBid == null) return { priceCents: null, maxBid: null, reason: "no price below the ask clears the maker fee" };
+export function planBid({ trueProbability, bidCents, askCents, existingPriceCents = null, minEntryPriceCents, maxEntryPriceCents, multiplier = MAKER_FEE_MULTIPLIER, contractsAt = () => 1, minReturnPct = 0 }) {
+  const maxBid = maxMakerBidCents({ trueProbability, askCents, minEntryPriceCents, maxEntryPriceCents, multiplier, contractsAt, minReturnPct });
+  if (maxBid == null) return { priceCents: null, maxBid: null, reason: minReturnPct > 0 ? `no price in the band returns ${minReturnPct}% after the maker fee` : "no price below the ask clears the maker fee" };
 
   if (existingPriceCents != null && existingPriceCents <= maxBid && existingPriceCents < askCents
       && (bidCents == null || bidCents <= existingPriceCents)) {
@@ -357,7 +386,7 @@ function bookFill(order, contracts, priceCents, feeCentsReported = null, feesToD
 
   const ev = makerEvCents(order.trueProbability ?? 0, priceCents, mult, contracts);
   const reason =
-    `Resting bid filled on "${order.teamName}" (sharp ${((order.trueProbability ?? 0) * 100).toFixed(1)}% vs ${priceCents}c bid, ` +
+    `${order.live ? "In-play resting bid filled" : "Resting bid filled"} on "${order.teamName}" (sharp ${((order.trueProbability ?? 0) * 100).toFixed(1)}% vs ${priceCents}c bid, ` +
     `maker fee ${feeCents}c for ${contracts}, EV ${ev.toFixed(1)}c/contract, held to settlement)`;
   appendLog(`Filled ${contracts}x ${order.ticker} @ ${priceCents}c as MAKER - ${reason}`);
   recordTrade({
@@ -463,7 +492,8 @@ export async function syncResting({ cap = null } = {}) {
         }
         continue;
       }
-      if (now - Date.parse(order.refreshedAt || order.placedAt) > staleMs) {
+      const staleLimit = order.live ? Math.max(45, makerSettings().liveStaleSeconds) * 1000 : staleMs;
+      if (now - Date.parse(order.refreshedAt || order.placedAt) > staleLimit) {
         if (await cancelResting(order.ticker, "no scan has re-confirmed its price recently")) out.stale++;
       }
     } catch (err) {
@@ -496,7 +526,7 @@ export async function syncResting({ cap = null } = {}) {
  * Rests, re-prices, keeps or cancels the bid for one candidate the taker path
  * refused as too tight. Returns { action, line } for the scan log. Never throws.
  */
-export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
+export async function workCandidate({ c, config, bankroll, cap, heldEvents, stakeDollars = null }) {
   const s = makerSettings(config);
   const existing = readResting()[c.ticker] || null;
 
@@ -510,16 +540,22 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
       return { action: "none", line: `${c.ticker}: waiting for the previous bid's cancel to clear` };
     }
     if (!s.enabled) return refuse("resting bids switched off");
-    if (c.timing.live && !s.allowLive) return refuse("game is live - resting bids are pre-game only");
+    const live = c.timing.live === true;
+    if (live && !s.allowLive) return refuse("game is live - resting bids are pre-game only");
 
     const startMs = Date.parse(c.commenceTime);
     const minutesToStart = (startMs - Date.now()) / 60000;
-    if (!Number.isFinite(startMs) || minutesToStart < s.minMinutesBeforeStart) {
+    if (!live && (!Number.isFinite(startMs) || minutesToStart < s.minMinutesBeforeStart)) {
       return refuse(`starts in ${Number.isFinite(minutesToStart) ? minutesToStart.toFixed(0) : "?"}m - too close to rest a bid`);
     }
+    const lineLimit = live ? s.liveMaxLineAgeSeconds : s.maxLineAgeSeconds;
     if (c.lineAgeSeconds == null) return refuse("sharp quote has no timestamp - a resting bid needs a known-fresh line");
-    if (c.lineAgeSeconds > s.maxLineAgeSeconds) {
-      return refuse(`sharp quote is ${Math.round(c.lineAgeSeconds)}s old, past the ${s.maxLineAgeSeconds}s limit for a resting bid`);
+    if (c.lineAgeSeconds > lineLimit) {
+      return refuse(`sharp quote is ${Math.round(c.lineAgeSeconds)}s old, past the ${lineLimit}s limit for a ${live ? "live " : ""}resting bid`);
+    }
+    if (live && !existing) {
+      const liveBids = Object.values(readResting()).filter((o) => o.live && !o.cancelPendingAt).length;
+      if (liveBids >= s.liveMaxBids) return { action: "none", line: `${c.ticker}: ${liveBids} live bid(s) already resting (limit ${s.liveMaxBids})` };
     }
 
     const ev = eventKeyOf(c.ticker);
@@ -530,9 +566,13 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
 
     const mult = makerMultiplierFor(c.ticker);
     const sm = config.survivalMode;
-    const contractsAt = sm && bankroll < sm.balanceThreshold
-      ? (px) => flatBetContracts(sm.flatBetDollars || 1, px, mult)
-      : () => 1;
+    // LIVE bids are staked at liveStakeFactor of the normal (tiered) stake.
+    const liveStake = live && Number(stakeDollars) > 0 ? Number(stakeDollars) * s.liveStakeFactor : null;
+    const contractsAt = liveStake
+      ? (px) => flatBetContracts(liveStake, px, mult)
+      : sm && bankroll < sm.balanceThreshold
+        ? (px) => flatBetContracts(sm.flatBetDollars || 1, px, mult)
+        : () => 1;
     const plan = planBid({
       multiplier: mult,
       contractsAt,
@@ -540,8 +580,9 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
       bidCents: c.pricing.bidCents,
       askCents: c.pricing.askCents,
       existingPriceCents: existing ? existing.priceCents : null,
-      minEntryPriceCents: config.minEntryPriceCents ?? 12,
-      maxEntryPriceCents: config.maxEntryPriceCents ?? 95,
+      minEntryPriceCents: live ? Math.max(config.minEntryPriceCents ?? 12, config.liveBandMinCents ?? 35) : (config.minEntryPriceCents ?? 12),
+      maxEntryPriceCents: live ? Math.min(config.maxEntryPriceCents ?? 95, config.liveBandMaxCents ?? 70) : (config.maxEntryPriceCents ?? 95),
+      minReturnPct: Number(config.minExpectedReturnPct ?? 0),
     });
     if (plan.priceCents == null) return refuse(plan.reason);
 
@@ -560,7 +601,13 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
       if (cap && positions + restingCount() >= cap) return { action: "none", line: `no free slot (${positions} held + ${restingCount()} bids, cap ${cap})` };
     }
 
-    const contracts = sizeFor({ bankroll, trueProbability: c.trueProbability, priceCents: plan.priceCents, config, multiplier: mult });
+    let contracts = liveStake
+      ? contractsAt(plan.priceCents)
+      : sizeFor({ bankroll, trueProbability: c.trueProbability, priceCents: plan.priceCents, config, multiplier: mult });
+    if (liveStake) {
+      const per = (plan.priceCents + feeCentsAt(plan.priceCents, mult)) / 100;
+      if (contracts * per > bankroll) contracts = Math.floor(bankroll / per);
+    }
     if (contracts < 1) return refuse("bankroll cannot fund one contract");
     const evCents = makerEvCents(c.trueProbability, plan.priceCents, mult, contracts);
     if (evCents * contracts < s.minEvCentsPerTrade) {
@@ -574,7 +621,11 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
       return { action: ok ? "repriced" : "none", line: ok ? `${c.ticker}: re-pricing ${existing.priceCents}c -> ${plan.priceCents}c (new bid after the cancel clears)` : "cancel failed - left as is" };
     }
 
-    const expireSec = Math.floor(startMs / 1000) - s.expireBeforeStartSeconds;
+    // Pre-game: expires before the start. Live: expires on the exchange after
+    // liveMaxRestMinutes, so a crash or a stopped bot cannot leave it resting.
+    const expireSec = live
+      ? Math.floor(Date.now() / 1000) + s.liveMaxRestMinutes * 60 + 30
+      : Math.floor(startMs / 1000) - s.expireBeforeStartSeconds;
     const body = {
       ticker: c.ticker,
       client_order_id: `mk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -611,6 +662,7 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
       filledSeen: 0, exchangeIndex: idx ?? null, placedAt: nowIso, refreshedAt: nowIso,
       commenceTime: c.commenceTime, teamName: c.teamName, sportKey: c.sportKey ?? null,
       trueProbability: c.trueProbability, environment: config.environment ?? null,
+      live,
     };
     writeResting((r) => { r[c.ticker] = order; });
 
@@ -626,7 +678,7 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents }) {
       `[book ${c.pricing.bidCents ?? "-"}/${c.pricing.askCents}c, sharp ${(c.trueProbability * 100).toFixed(1)}%, ` +
       `max ${plan.maxBid}c], EV ${evCents.toFixed(1)}c/contract after ` +
       (mult > 0 ? `the <=${feeCentsAt(plan.priceCents, mult)}c maker fee` : `no maker fee (series not on Kalshi's maker-fee list)`) + `, ` +
-      `expires ${Math.round(minutesToStart - s.expireBeforeStartSeconds / 60)}m from now`;
+      (live ? `live bid, expires in ${s.liveMaxRestMinutes}m unless re-confirmed` : `expires ${Math.round(minutesToStart - s.expireBeforeStartSeconds / 60)}m from now`);
     appendLog(line);
     return { action: existing ? "repriced" : "rested", line };
   } catch (err) {
