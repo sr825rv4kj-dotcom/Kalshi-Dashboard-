@@ -5,7 +5,7 @@ import React, { useEffect, useState } from "react";
  *
  * Built by the server from the odds feed's free events list (every sport the
  * feed has in season, rebuilt every 10 minutes). A sport is scanned on Kalshi
- * and Polymarket only while one of its games is live or starts within 30
+ * and Polymarket only while one of its games is live or starts within 65
  * minutes; the countdown shows when the next one begins. The open-trade cap
  * on each exchange (5-10, by balance) is shown alongside.
  */
@@ -63,7 +63,7 @@ const HEAD = { display: "flex", justifyContent: "space-between", alignItems: "ba
 
 const STATUS_LABEL = {
   live: "Live - scanning",
-  "starting-soon": "Starting within 30 min - scanning",
+  "starting-soon": "Starting within 65 min - scanning",
   later: "Later today - waits",
   "none-24h": "No games in the next 24h",
   "calendar-error": "Calendar read failed - scanned anyway",
@@ -110,7 +110,7 @@ export default function LiveSchedulePanel({ apiBase }) {
       <h2>Live Schedule</h2>
       <p className="setup-copy">
         The bot scans a sport on Kalshi and Polymarket only while one of its games
-        is live or starts within 30 minutes. The calendar comes from the odds feed
+        is live or starts within 65 minutes (pre-game buys open 60 minutes out). The calendar comes from the odds feed
         the bot prices against and rebuilds itself every 10 minutes.
       </p>
 
