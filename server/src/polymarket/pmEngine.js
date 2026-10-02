@@ -903,9 +903,10 @@ export async function scanPolymarket(config, settings, active) {
         }
         // PRE-GAME WAITING PERIOD (pregameConfirm.js) - same rule as Kalshi,
         // with Polymarket's own watch.
-        if (!timing.live) {
-          const w = observePregame({ venue: "polymarket", gameKey: `${sportKey}|${commenceTime}|${[...teamNames].map(normName).sort().join("|")}`, team: t.name, fairPct: c.prob * 100 }, config);
-          if (!w.ready) { skip("pm-pregame-watching", w.why); continue; }
+        // Live games too since 2026-10-01 (pregameConfirm.js, its own settings).
+        {
+          const w = observePregame({ venue: "polymarket", gameKey: `${sportKey}|${commenceTime}|${[...teamNames].map(normName).sort().join("|")}`, team: t.name, fairPct: c.prob * 100, live: timing.live === true }, config);
+          if (!w.ready) { skip(timing.live ? "pm-live-watching" : "pm-pregame-watching", w.why); continue; }
         }
         let contracts = countAt(limit);
         const perContract = (limit + feePerContractCents(limit, contracts, PM_FEE)) / 100;
