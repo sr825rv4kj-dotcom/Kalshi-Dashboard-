@@ -173,6 +173,7 @@ const CODE_GUIDE = {
   "return-too-small": { severity: "info", healthy: true, title: "Expected return under the minimum (minExpectedReturnPct) - skipped", fix: "Healthy. Thin-edge trades are refused by design." },
   "dropped:unmodeled": { severity: "info", healthy: true, title: "Sport not on the trade list (entrySports) - no new buys there", fix: "Healthy. Set by design: only sports with a proven record are bought." },
   "dropped:pregameStop": { severity: "info", healthy: true, title: "Pre-game hard stop or pre-game open limit reached - pre-game buys paused", fix: "Healthy. Set by design (pregameStop); live buys continue, pre-game resumes tomorrow or when a pre-game position settles." },
+  "pregame-watching": { severity: "info", healthy: true, title: "Pre-game edge being watched before buying (waiting period)", fix: "Healthy. Bought once the same side qualifies on 3 reads over 3+ minutes without the line drifting away." },
   "pregame-stopped": { severity: "info", healthy: true, title: "Pre-game hard stop - pre-game losses today hit the limit", fix: "Healthy. Pre-game buys resume tomorrow; live buys continue." },
   "pregame-max-open": { severity: "info", healthy: true, title: "Pre-game open limit reached", fix: "Healthy. The next pre-game buy waits for one to settle." },
   "dropped:pregame": { severity: "info", healthy: true, title: "Game not started yet - the bot trades live games only", fix: "Healthy. It becomes eligible at first pitch / kickoff." },
