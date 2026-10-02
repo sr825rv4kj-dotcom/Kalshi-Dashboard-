@@ -71,9 +71,11 @@
  * ---------------------------------------------------------------------------
  */
 
+import { shrinkFair } from "./sportRules.js";
+
 const DEFAULT_FEE_MULTIPLIER = 0.07;
 
-export const RISK_VERSION = "2026-09-22-exact-fee-quarter-cent";
+export const RISK_VERSION = "2026-10-02-fair-shrink";
 
 /**
  * ---------------------------------------------------------------------------
@@ -318,6 +320,9 @@ export function assessOpportunity({
   maxLineAgeSecondsLive = 180,
   maxLineAgeSecondsPregame = 1800,
   survivalMode = null,
+  // FAIR SHRINK (2026-10-02, sportRules.js): share of the model's edge treated
+  // as real once the plausibility gate has run on the RAW edge. 1 = off.
+  fairShrink = 1,
 }) {
   const askCents = Math.round(price * 100);
 
@@ -396,6 +401,14 @@ export function assessOpportunity({
       reason: `edge ${(askEdge * 100).toFixed(1)}% exceeds the ${(maxPlausibleEdge * 100).toFixed(0)}% plausibility ceiling - a gap that size is a stale or mismatched line, not a mispricing`,
     };
   }
+
+  // --- Fair shrink (2026-10-02) ---
+  // The plausibility gate above reads the RAW model edge, so a mismatched or
+  // stale line is still caught at full size. Everything below - the walk-up
+  // limit, the fee gate, sizing and expected value - uses the edge the account
+  // has actually realized: price + fairShrink x (fair - price).
+  const rawProbability = trueProbability;
+  trueProbability = shrinkFair(trueProbability, askCents, fairShrink);
 
   const inSurvivalMode = survivalMode && bankroll < survivalMode.balanceThreshold;
   const edgeMultiplier = inSurvivalMode ? survivalMode.edgeMultiplier || 1 : 1;
@@ -522,5 +535,7 @@ export function assessOpportunity({
     limitCents,
     walkupCents: limitCents - askCents,
     survivalMode: inSurvivalMode,
+    fairUsed: trueProbability,
+    rawProbability,
   };
 }
