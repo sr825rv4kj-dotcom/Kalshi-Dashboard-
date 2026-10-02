@@ -18,9 +18,9 @@
  * HOW IT DRIVES THE BOT, per sport:
  *   LIVE   a listed game has started (and is inside its sport's longest
  *          running time) - scanned every cycle, 20 seconds.
- *   SOON   a game starts within 30 minutes - scanned, so the last pre-game
+ *   SOON   a game starts within 65 minutes - scanned, so the last pre-game
  *          line is on record for the in-game check the moment it kicks off.
- *   QUIET  nothing live or within 30 minutes - not scanned, 0 credits.
+ *   QUIET  nothing live or within 65 minutes - not scanned, 0 credits.
  * With nothing live or soon anywhere, the cycle slows to 60 seconds (held
  * positions are still checked, settlements still booked).
  *
@@ -41,12 +41,15 @@ import { getSeriesMap } from "./tickerResolver.js";
 import { mappedSports } from "./polymarket/pmMarkets.js";
 import { currentCadenceSeconds, describeCadence } from "./cadence.js";
 
-export const LIVE_SCHEDULE_VERSION = "2026-09-28-live-schedule";
+export const LIVE_SCHEDULE_VERSION = "2026-10-01-lead-65m";
 
 const ODDS_API_BASE = "https://api.the-odds-api.com/v4";
 const REFRESH_MS = 10 * 60 * 1000;
 const STALE_MS = 35 * 60 * 1000;
-export const LEAD_MS = 30 * 60 * 1000;
+// 2026-10-01: 30 -> 65 minutes. Pre-game buys open 60 minutes before the
+// start (config.entryWindowHours = 1), so a sport must already be scanned by
+// then; the extra 5 minutes has its line on record when the window opens.
+export const LEAD_MS = 65 * 60 * 1000;
 const AHEAD_MS = 24 * 60 * 60 * 1000;
 const LIVE_CADENCE_SECONDS = 20;
 const IDLE_CADENCE_SECONDS = 60;
