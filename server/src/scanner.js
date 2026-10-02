@@ -89,7 +89,7 @@ import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame, normName } from "./polymarket/pmState.js";
 import { noteDecision, noteScan } from "./scanFeed.js";
-import { getTradeLifecycles } from "./tradeLedgerStore.js";
+import { getTradeLifecycles, filterByVenue } from "./tradeLedgerStore.js";
 
 const V2 = "/trade-api/v2";
 
@@ -120,15 +120,19 @@ function freshLineOk(lineAgeSeconds, config = {}) {
  * A trade is pre-game when its entry reason is not an in-play entry. Live
  * buys are untouched; the whole bot still stops at dailyLossHaltPct.
  */
-let pregameStopCache = { at: 0, value: null };
-export function pregameStopStatus(config = {}, fresh = false) {
+const pregameStopCache = {};   // venue -> { at, value }
+export function pregameStopStatus(config = {}, fresh = false, venue = "kalshi") {
   const ps = config.pregameStop || {};
   const maxLosses = Number.isFinite(Number(ps.maxLossesPerDay)) ? Number(ps.maxLossesPerDay) : 2;
   const maxOpen = Number.isFinite(Number(ps.maxOpen)) ? Number(ps.maxOpen) : 3;
-  if (!fresh && pregameStopCache.value && Date.now() - pregameStopCache.at < 30_000) return pregameStopCache.value;
+  const cached = pregameStopCache[venue];
+  if (!fresh && cached && Date.now() - cached.at < 30_000) return cached.value;
   let value;
   try {
-    const { completed, open } = getTradeLifecycles();
+    // Each exchange is counted on its own trades (Polymarket rows carry a PM: ticker).
+    const all = getTradeLifecycles();
+    const completed = filterByVenue(all.completed, venue);
+    const open = filterByVenue(all.open, venue);
     const isPre = (t) => !/In-play/i.test(String(t.entryReason ?? t.reason ?? ""));
     const day = (iso) => new Date(iso).toLocaleDateString("en-US", { timeZone: "America/Los_Angeles" });
     const today = day(Date.now());
@@ -145,7 +149,7 @@ export function pregameStopStatus(config = {}, fresh = false) {
     // The ledger could not be read: refuse pre-game rather than trade blind.
     value = { stopped: true, code: "pregame-stopped", why: `Pre-game hard stop: trade record unreadable (${err.message})` };
   }
-  pregameStopCache = { at: Date.now(), value };
+  pregameStopCache[venue] = { at: Date.now(), value };
   return value;
 }
 
