@@ -38,6 +38,7 @@
 import { appendLog } from "./stateStore.js";
 import { allActiveSportKeys } from "./sportsDiscovery.js";
 import { getSeriesMap } from "./tickerResolver.js";
+import { sportDisabled } from "./sportRules.js";
 import { mappedSports } from "./polymarket/pmMarkets.js";
 import { currentCadenceSeconds, describeCadence } from "./cadence.js";
 
@@ -135,8 +136,8 @@ export async function refreshSchedule(config = {}) {
       if (!apiKey) { lastError = "THE_ODDS_API_KEY is not set"; return; }
       const keys = await allActiveSportKeys();
       if (!keys.length) { lastError = "the odds feed returned no active sports"; return; }
-      const off = new Set(Array.isArray(config.disabledSports) ? config.disabledSports.map(String) : []);
-      const list = keys.filter((k) => !off.has(k));
+      // "tennis_*"-style prefixes switch off whole families (sportRules.js).
+      const list = keys.filter((k) => !sportDisabled(k, config));
       const now = Date.now();
       const sports = {};
       let next = 0;
