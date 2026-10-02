@@ -87,14 +87,15 @@ import { recordFairFromProbabilities } from "./fairValue.js";
 import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
-import { polymarketTeamOnGame, normName } from "./polymarket/pmState.js";
+import { polymarketTeamOnGame } from "./polymarket/pmState.js";
+import { fairShrinkOf, shrinkFair } from "./sportRules.js";
 import { noteDecision, noteScan } from "./scanFeed.js";
 import { getTradeLifecycles, filterByVenue } from "./tradeLedgerStore.js";
 import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-01-pre-polymarket-edge";
+export const SCANNER_VERSION = "2026-10-02-one-venue-per-game";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -503,14 +504,15 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       if (ps.stopped) { drops.pregameStop++; feedHere(ps.code, ps.why); if (!sampleReason) sampleReason = `${teamName}: ${ps.why}`; return null; }
     }
 
-    // SAME TRADES ON BOTH EXCHANGES (2026-09-28): a game Polymarket holds may
-    // be bought here too, but only on the team Polymarket holds - never the
-    // other side. (It used to drop the whole game.)
+    // ONE VENUE PER GAME (2026-10-02, replaces "same trades on both"). The
+    // same side bought on both exchanges lost TOR, Auger-Aliassime and McNally
+    // twice each - -$26.96, more than the bot's whole lifetime profit. A game
+    // Polymarket holds (either team) is not bought on Kalshi at all.
     const pmTeam = polymarketTeamOnGame({ sportKey, commenceTime, teamNames: gameTeams.get(info.eventId || commenceTime) || [teamName] });
-    if (pmTeam && pmTeam !== normName(teamName)) {
+    if (pmTeam) {
       drops.duplicate++;
-      feedHere("opposite-of-polymarket", `Polymarket holds ${pmTeam} in this game - only the same team is bought on Kalshi`);
-      if (!sampleReason) sampleReason = `${teamName}: Polymarket holds ${pmTeam} in this game - only the same team is bought on Kalshi`;
+      feedHere("held-on-polymarket", `Polymarket already holds ${pmTeam} in this game - one exchange per game`);
+      if (!sampleReason) sampleReason = `${teamName}: Polymarket already holds ${pmTeam} in this game - one exchange per game`;
       return null;
     }
 
@@ -908,7 +910,12 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       maxLineAgeSecondsLive: config.maxLineAgeSecondsLive ?? 900,
       maxLineAgeSecondsPregame: config.maxLineAgeSecondsPregame ?? 7200,
       survivalMode: sizingSurvival,
+      fairShrink: fairShrinkOf(config),
     });
+
+    // The candidate as the resting-bid engine prices it: shrunk fair value,
+    // the same edge the taker entry uses (sportRules.js fairShrink).
+    const cMaker = { ...c, trueProbability: shrinkFair(c.trueProbability, askCents, fairShrinkOf(config)) };
 
     if (assessment.action === "skip") {
       const line = `${c.ticker} ${askCents}c [${c.pricing.source}] (sharp ${(c.trueProbability * 100).toFixed(1)}%): ${assessment.reason}`;
@@ -920,7 +927,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         // Fairly priced (or priced above the band) right now: rest a bid at
         // the price that returns the minimum and let the market come to it.
         // Live games too since 2026-10-01 (makerEngine.js LIVE RESTING BIDS).
-        const m = await workCandidate({ c, config, bankroll, cap: positionCap, heldEvents, stakeDollars: flatStake });
+        const m = await workCandidate({ c: cMaker, config, bankroll, cap: positionCap, heldEvents, stakeDollars: flatStake });
         maker[m.action] = (maker[m.action] || 0) + 1;
         if (!makerExample || (m.action !== "none" && m.action !== "kept")) makerExample = m.line;
       } else {
@@ -944,8 +951,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     if (minReturnPct > 0) {
       const flat = Number.isFinite(flatStake) && flatStake > 0 ? flatStake : null;
       const countAt = (px) => (flat ? flatBetContracts(flat, px, config.feeMultiplier ?? 0.07) : assessment.sizing.contracts);
+      // Expected return on the SHRUNK fair value (sportRules.js fairShrink).
+      const fairP = Number.isFinite(assessment.fairUsed) ? assessment.fairUsed : c.trueProbability;
       const returnAt = (px) => {
-        const ev = c.trueProbability * 100 - px - feePerContractCents(px, countAt(px), config.feeMultiplier ?? 0.07);
+        const ev = fairP * 100 - px - feePerContractCents(px, countAt(px), config.feeMultiplier ?? 0.07);
         return { ev, pct: (ev / px) * 100 };
       };
       let limit = null;
@@ -961,7 +970,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         // LIVE: an edge too thin at the ask can still return the minimum a few
         // cents lower - rest a bid there (makerEngine.js LIVE RESTING BIDS).
         if (c.timing.live && !c.addOn) {
-          const m = await workCandidate({ c, config, bankroll, cap: positionCap, heldEvents, stakeDollars: flatStake });
+          const m = await workCandidate({ c: cMaker, config, bankroll, cap: positionCap, heldEvents, stakeDollars: flatStake });
           maker[m.action] = (maker[m.action] || 0) + 1;
           if (!makerExample || (m.action !== "none" && m.action !== "kept")) makerExample = m.line;
         } else {
@@ -974,7 +983,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         assessment.limitCents = limit;
         assessment.walkupCents = limit - askCents;
         assessment.edgeCheck.evCents = r.ev;
-        assessment.edgeCheck.observedEdge = c.trueProbability - limit / 100;
+        assessment.edgeCheck.observedEdge = fairP - limit / 100;
         if (flat) assessment.sizing.contracts = countAt(limit);
         assessment.edgeCheck.evTradeCents = r.ev * assessment.sizing.contracts;
         assessment.sizing.dollarsAtRisk = assessment.sizing.contracts * (limit + feePerContractCents(limit, assessment.sizing.contracts, config.feeMultiplier ?? 0.07)) / 100;
