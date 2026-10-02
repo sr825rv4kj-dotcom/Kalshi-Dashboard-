@@ -349,6 +349,11 @@ export const DEFAULTS = {
   // the whole bot still halts at dailyLossHaltPct.
   pregameStop: { maxLossesPerDay: 2, maxOpen: 3 },
 
+  // RESTING BIDS (makerEngine.js). allowLive (2026-10-01): in live games too -
+  // a bid at the price that returns minExpectedReturnPct, max 2 at once, half
+  // stake, 5-minute life, re-confirmed every scan.
+  maker: { enabled: true, allowLive: true },
+
   // MODELLED SPORTS ONLY (2026-09-30): new live buys only in sports with a
   // calibrated in-game model (liveModel.js SPORT_PARAMS). Tennis, preseason and
   // minor leagues ran on a generic model and lost. Held positions in any sport
@@ -582,6 +587,13 @@ const ONE_TIME_UPDATES = [
     id: "2026-10-01-polymarket-same-rules",
     apply: (c) => { c.polymarket = { ...DEFAULTS.polymarket, ...(c.polymarket || {}), trading: "auto" }; },
     note: "Polymarket trading back on (auto) under the same rules as Kalshi",
+  },
+  {
+    // LIVE RESTING BIDS ON KALSHI (2026-10-01, account holder's call) -
+    // makerEngine.js. Settings not named here keep their defaults there.
+    id: "2026-10-01-live-resting-bids",
+    apply: (c) => { c.maker = { ...(c.maker || {}), enabled: true, allowLive: true }; },
+    note: "Kalshi live resting bids on: bid at the price that returns the 30% minimum, max 2 at once, half stake, 5-minute life",
   },
 ];
 
