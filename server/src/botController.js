@@ -28,12 +28,13 @@ import { registerOpenPositions, markDue, needsBackfill, backfillFromLedger } fro
 import { runPolymarketCycle } from "./polymarket/pmEngine.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "./swingEngine.js";
 import { feePerContractCents } from "./riskManager.js";
+import { sportDisabled, withSportRules } from "./sportRules.js";
 
 const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-09-29-swing";
+export const CONTROLLER_VERSION = "2026-10-02-sport-rules";
 
 /**
  * 2026-09-24 - four changes in this file:
@@ -243,9 +244,12 @@ function takerAtCap(config, bankroll) {
   return loadState().positions.length + bids >= cap;
 }
 
-/** Sports switched off by hand (config.disabledSports). */
+/**
+ * Sports switched off by hand (config.disabledSports). Entries ending in "*"
+ * are prefixes: "tennis_*" switches off every tennis tournament key.
+ */
 function disabledSports(config) {
-  return new Set((config.disabledSports || []).map((k) => String(k)));
+  return { has: (k) => sportDisabled(k, config) };
 }
 
 /**
@@ -1190,7 +1194,9 @@ export async function runCycle() {
       const stop = await scanSport({
         sportKey,
         config: {
-          ...config,
+          // Per-sport price floor (sportRules.js) - NHL 45c. Applies to taker
+          // entries and to resting bids, which read the same band.
+          ...withSportRules(config, sportKey),
           kellyFraction: config.kellyFraction ?? tier.kellyFraction,
           maxStakeDollars: tier.maxStakeDollars,
           // STAKE TIERS read EQUITY - cash plus open positions at market, the
