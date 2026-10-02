@@ -353,7 +353,12 @@ export const DEFAULTS = {
   // is bought only once the same side has qualified on minScans consecutive
   // reads over minMinutes, and the sharp line has not drifted more than
   // maxDriftPoints away from that side. Both exchanges. Live games unaffected.
-  pregameConfirm: { enabled: true, minScans: 3, minMinutes: 3, maxGapSeconds: 180, maxDriftPoints: 2 },
+  // live (2026-10-01): the same wait for live games - 4 reads over 2+ minutes,
+  // fair value may not drop 3+ points (a score against the side restarts it).
+  pregameConfirm: {
+    enabled: true, minScans: 3, minMinutes: 3, maxGapSeconds: 180, maxDriftPoints: 2,
+    live: { enabled: true, minScans: 4, minMinutes: 2, maxGapSeconds: 90, maxDriftPoints: 3 },
+  },
 
   // RESTING BIDS (makerEngine.js). allowLive (2026-10-01): in live games too -
   // a bid at the price that returns minExpectedReturnPct, max 2 at once, half
@@ -614,6 +619,13 @@ const ONE_TIME_UPDATES = [
     id: "2026-10-01-pregame-waiting-period",
     apply: (c) => { c.pregameConfirm = { enabled: true, minScans: 3, minMinutes: 3, maxGapSeconds: 180, maxDriftPoints: 2 }; },
     note: "pre-game waiting period: same side must qualify on 3 reads over 3+ minutes, line not drifting more than 2 pts away",
+  },
+  {
+    id: "2026-10-01-live-waiting-period",
+    apply: (c) => {
+      c.pregameConfirm = { ...(c.pregameConfirm || {}), live: { enabled: true, minScans: 4, minMinutes: 2, maxGapSeconds: 90, maxDriftPoints: 3 } };
+    },
+    note: "live waiting period: same side must qualify on 4 reads over 2+ minutes, fair value not dropping 3+ pts; candidates tried best expected return first",
   },
 ];
 
