@@ -906,8 +906,11 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       rejected.push(line);
       if (c.addOn) {
         // An add-on never becomes a resting bid - it is taken now or not at all.
-      } else if (assessment.code === "edge-too-small") {
-        const m = await workCandidate({ c, config, bankroll, cap: positionCap, heldEvents });
+      } else if (assessment.code === "edge-too-small" || (c.timing.live && assessment.code === "price-above-ceiling")) {
+        // Fairly priced (or priced above the band) right now: rest a bid at
+        // the price that returns the minimum and let the market come to it.
+        // Live games too since 2026-10-01 (makerEngine.js LIVE RESTING BIDS).
+        const m = await workCandidate({ c, config, bankroll, cap: positionCap, heldEvents, stakeDollars: flatStake });
         maker[m.action] = (maker[m.action] || 0) + 1;
         if (!makerExample || (m.action !== "none" && m.action !== "kept")) makerExample = m.line;
       } else {
@@ -945,6 +948,15 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
           `${r.pct.toFixed(1)}% at the ask (EV ${r.ev.toFixed(1)}c) is under the ${minReturnPct}% minimum`;
         ddBump("return-too-small", line);
         rejected.push(line);
+        // LIVE: an edge too thin at the ask can still return the minimum a few
+        // cents lower - rest a bid there (makerEngine.js LIVE RESTING BIDS).
+        if (c.timing.live && !c.addOn) {
+          const m = await workCandidate({ c, config, bankroll, cap: positionCap, heldEvents, stakeDollars: flatStake });
+          maker[m.action] = (maker[m.action] || 0) + 1;
+          if (!makerExample || (m.action !== "none" && m.action !== "kept")) makerExample = m.line;
+        } else {
+          await dropResting(c.ticker, "expected return under the minimum");
+        }
         continue;
       }
       if (limit !== assessment.limitCents) {
