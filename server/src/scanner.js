@@ -89,10 +89,11 @@ import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame, normName } from "./polymarket/pmState.js";
 import { noteDecision, noteScan } from "./scanFeed.js";
+import { getTradeLifecycles } from "./tradeLedgerStore.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-09-29-no-score-fresh-line";
+export const SCANNER_VERSION = "2026-10-01-pre-polymarket-edge";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -104,7 +105,48 @@ function noScoreMaxAge(config = {}) {
 function freshLineOk(lineAgeSeconds, config = {}) {
   const max = noScoreMaxAge(config);
   const age = Number.isFinite(Number(lineAgeSeconds)) && lineAgeSeconds != null ? Math.round(Number(lineAgeSeconds)) : null;
+  // PRE-POLYMARKET RULE (2026-10-01): config.tradeWithoutLiveScore false means
+  // a live game with no live score is never bought - as before 2026-09-29.
+  if (config.tradeWithoutLiveScore === false) return { ok: false, age, max, off: true };
   return { ok: age != null && age <= max, age, max };
+}
+
+/**
+ * PRE-GAME HARD STOP (2026-10-01, account holder's call). Pre-game buys are
+ * allowed (in the last entryWindowHours before the start), but:
+ *   - once pregameStop.maxLossesPerDay pre-game trades have LOST today
+ *     (Pacific day, settled), no more pre-game buys until tomorrow;
+ *   - no more than pregameStop.maxOpen pre-game positions open at once.
+ * A trade is pre-game when its entry reason is not an in-play entry. Live
+ * buys are untouched; the whole bot still stops at dailyLossHaltPct.
+ */
+let pregameStopCache = { at: 0, value: null };
+export function pregameStopStatus(config = {}, fresh = false) {
+  const ps = config.pregameStop || {};
+  const maxLosses = Number.isFinite(Number(ps.maxLossesPerDay)) ? Number(ps.maxLossesPerDay) : 2;
+  const maxOpen = Number.isFinite(Number(ps.maxOpen)) ? Number(ps.maxOpen) : 3;
+  if (!fresh && pregameStopCache.value && Date.now() - pregameStopCache.at < 30_000) return pregameStopCache.value;
+  let value;
+  try {
+    const { completed, open } = getTradeLifecycles();
+    const isPre = (t) => !/In-play/i.test(String(t.entryReason ?? t.reason ?? ""));
+    const day = (iso) => new Date(iso).toLocaleDateString("en-US", { timeZone: "America/Los_Angeles" });
+    const today = day(Date.now());
+    const lostToday = completed.filter((t) => isPre(t) && t.exitTimestamp && day(t.exitTimestamp) === today && t.netDollars < 0);
+    const openPre = open.filter(isPre);
+    if (lostToday.length >= maxLosses) {
+      value = { stopped: true, code: "pregame-stopped", why: `Pre-game hard stop: ${lostToday.length} pre-game loss(es) today (limit ${maxLosses}) - pre-game buys resume tomorrow; live buys continue` };
+    } else if (openPre.length >= maxOpen) {
+      value = { stopped: true, code: "pregame-max-open", why: `Pre-game limit: ${openPre.length} pre-game position(s) open (limit ${maxOpen}) - the next pre-game buy waits for one to settle` };
+    } else {
+      value = { stopped: false, lossesToday: lostToday.length, open: openPre.length, maxLosses, maxOpen };
+    }
+  } catch (err) {
+    // The ledger could not be read: refuse pre-game rather than trade blind.
+    value = { stopped: true, code: "pregame-stopped", why: `Pre-game hard stop: trade record unreadable (${err.message})` };
+  }
+  pregameStopCache = { at: Date.now(), value };
+  return value;
 }
 
 /**
@@ -403,7 +445,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     return false;
   }
 
-  const drops = { live: 0, pregame: 0, window: 0, unresolved: 0, closed: 0, error: 0, duplicate: 0, unmodeled: 0 };
+  const drops = { live: 0, pregame: 0, window: 0, unresolved: 0, closed: 0, error: 0, duplicate: 0, unmodeled: 0, pregameStop: 0 };
   // "8 not-tradeable" told us nothing actionable. Counting the actual status
   // strings turns it into "status=finalized x8", which is a fixable fact.
   const statusCounts = {};
@@ -451,6 +493,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       return null;
     }
     if (!timing.ok) { drops.window++; return null; }
+    if (!timing.live) {
+      const ps = pregameStopStatus(config);
+      if (ps.stopped) { drops.pregameStop++; feedHere(ps.code, ps.why); if (!sampleReason) sampleReason = `${teamName}: ${ps.why}`; return null; }
+    }
 
     // SAME TRADES ON BOTH EXCHANGES (2026-09-28): a game Polymarket holds may
     // be bought here too, but only on the team Polymarket holds - never the
@@ -561,7 +607,9 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       // the line itself (freshLineOk below); a score read that failed this
       // cycle is handled the same way instead of vetoing every live market.
       if (scoresError && !events.length) {
-        appendLog(`${sportKey}: live scores unavailable (${scoresError}) - in-play markets need a sharp line updated within ${noScoreMaxAge(config)}s this cycle.`, "warn");
+        appendLog(config.tradeWithoutLiveScore === false
+          ? `${sportKey}: live scores unavailable (${scoresError}) - in-play markets skipped this cycle.`
+          : `${sportKey}: live scores unavailable (${scoresError}) - in-play markets need a sharp line updated within ${noScoreMaxAge(config)}s this cycle.`, "warn");
       }
       {
         const vetoed = [];
@@ -582,8 +630,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
               c.liveContext = `no live score feed for this game - sharp line updated ${fresh.age}s ago`;
               return true;
             }
-            const why = `In play with no live score, and the sharp line is ${fresh.age == null ? "of unknown age" : `${fresh.age}s old`} - ` +
-              `trading without a score needs a line updated within ${fresh.max}s`;
+            const why = fresh.off
+              ? "In play, but no live score for this game - live buys need a real score (tradeWithoutLiveScore is off)"
+              : `In play with no live score, and the sharp line is ${fresh.age == null ? "of unknown age" : `${fresh.age}s old`} - ` +
+                `trading without a score needs a line updated within ${fresh.max}s`;
             vetoed.push(`${c.teamName}: ${why}`);
             bump("no-live-score-match", `${c.teamName}: ${why}`);
             feed(c.teamName, "no-live-score-match", why, { opponent: null, commenceTime: c.commenceTime, market: c.ticker, priceCents: c.pricing?.askCents, fairPct: c.trueProbability * 100 });
@@ -656,7 +706,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   appendLog(
     `${sportKey}: ${teamEntries.length} lines -> ${viable.length} tradeable ` +
     `(dropped: ${drops.pregame} not started yet (live-only), ${drops.live} live-disabled, ${drops.unresolved} unresolved, ${drops.window} out-of-window, ` +
-    `${drops.closed} not-tradeable, ${drops.duplicate} already held, ${drops.unmodeled} sport not modelled, ${drops.error} fetch error)` +
+    `${drops.closed} not-tradeable, ${drops.duplicate} already held, ${drops.unmodeled} sport not modelled, ${drops.pregameStop} pre-game stop, ${drops.error} fetch error)` +
     (sampleReason ? ` | e.g. ${sampleReason}` : "")
   );
 
@@ -732,6 +782,12 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       bump(c.addOn ? `double-down:${code}` : code, example);
       feedC(code, example, code === "no-fill" ? "tried" : "skipped");
     };
+
+    // Pre-game hard stop, re-read fresh: an earlier buy in this scan counts.
+    if (!c.timing.live && !c.addOn) {
+      const ps = pregameStopStatus(config, true);
+      if (ps.stopped) { ddBump(ps.code, `${c.ticker}: ${ps.why}`); rejected.push(`${c.ticker}: ${ps.why}`); continue; }
+    }
 
     const askCents = c.pricing.askCents;
     if (askCents <= 0 || askCents >= 100) {
