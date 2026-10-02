@@ -339,6 +339,16 @@ export const DEFAULTS = {
   // is at its most accurate. Earlier pre-game entries lost (-28% over 21).
   liveOnly: false,
 
+  // PRE-POLYMARKET RULE (2026-10-01): a live game with no live score is not
+  // bought, as before 2026-09-29. true = trade it on a fresh sharp line.
+  tradeWithoutLiveScore: false,
+
+  // PRE-GAME HARD STOP (2026-10-01) - scanner.js pregameStopStatus. After this
+  // many pre-game LOSSES in a day (Pacific), no more pre-game buys that day;
+  // never more than maxOpen pre-game positions at once. Live buys unaffected;
+  // the whole bot still halts at dailyLossHaltPct.
+  pregameStop: { maxLossesPerDay: 2, maxOpen: 3 },
+
   // MODELLED SPORTS ONLY (2026-09-30): new live buys only in sports with a
   // calibrated in-game model (liveModel.js SPORT_PARAMS). Tennis, preseason and
   // minor leagues ran on a generic model and lost. Held positions in any sport
@@ -435,8 +445,10 @@ export const DEFAULTS = {
   //     day), shown on the Trading Desk - tracked, it never stops trading
   //   enabled: false = the old behaviour (hold to settlement)
   // 2026-09-30: enabled false - hold to settlement, as originally.
+  // 2026-10-01: OFF (account holder) - every position is held to the end of
+  // the game, win or loss.
   swing: {
-    enabled: true,
+    enabled: false,
     halfAtFair: true,
     targetPct: 65,
     blowoutBelowPct: 10,
@@ -530,6 +542,34 @@ const ONE_TIME_UPDATES = [
       c.swing = { ...DEFAULTS.swing, ...(c.swing || {}), enabled: true };
     },
     note: "all sports; pre-game buys only in the last 10 minutes before the start; price band 35-70c; early exits (swing) on",
+  },
+  {
+    // BACK TO THE PRE-POLYMARKET EDGE (2026-10-01, account holder's call):
+    // Kalshi only, buy and hold to the end of the game (no swing selling),
+    // 30% minimum expected return, 35-70c, no live buy without a live score,
+    // every sport. Pre-game buys open in the last 10 minutes, behind the
+    // pre-game hard stop. Daily halt stays at 15%.
+    id: "2026-10-01-pre-polymarket-edge",
+    apply: (c) => {
+      c.swing = { ...DEFAULTS.swing, ...(c.swing || {}), enabled: false };
+      c.polymarket = { ...DEFAULTS.polymarket, ...(c.polymarket || {}), trading: "off" };
+      c.minExpectedReturnPct = 30;
+      c.liveBandMinCents = 35;
+      c.liveBandMaxCents = 70;
+      c.minEntryPriceCents = 35;
+      c.maxEntryPriceCents = 70;
+      c.entrySports = [];
+      c.modeledSportsOnly = false;
+      c.liveOnly = false;
+      c.entryWindowHours = 1 / 6;
+      c.tradeWithoutLiveScore = false;
+      c.pregameStop = { maxLossesPerDay: 2, maxOpen: 3 };
+      c.holdToSettlement = true;
+      c.blowoutExit = false;
+      c.fairValueExit = "shadow";
+      c.dailyLossHaltPct = 0.15;
+    },
+    note: "pre-Polymarket edge: Kalshi only, hold every position to the end, 30% min return, 35-70c, live buys need a live score, all sports; pre-game in the last 10 min with a hard stop (2 losses/day, 3 open)",
   },
 ];
 
