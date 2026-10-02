@@ -750,6 +750,14 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   //
   // Sorting costs nothing and changes the outcome: the fundable trades happen
   // this scan, and the others are requested and picked up on the next one.
+  // BEST RETURN FIRST (2026-10-01). Candidates are tried in order of expected
+  // return at the ask (sharp fair value vs price), so when slots or cash run
+  // short the strongest edge is the one bought. Funded shards still go first.
+  const expectedReturnOf = (c) => {
+    const ask = Number(c.pricing?.askCents);
+    return ask > 0 && ask < 100 ? (c.trueProbability * 100 - ask) / ask : -Infinity;
+  };
+  viable.sort((a, b) => expectedReturnOf(b) - expectedReturnOf(a));
   let balances = null;
   try { balances = await fundedShards(); } catch { /* unknown - keep book order */ }
   if (balances) {
@@ -758,7 +766,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       if (idx == null) return 1;                       // unknown shard - do not penalise
       return (balances[Number(idx)] ?? 0) > 0 ? 1 : 0;
     };
-    viable.sort((a, b) => fundedFor(b) - fundedFor(a));
+    viable.sort((a, b) => fundedFor(b) - fundedFor(a) || expectedReturnOf(b) - expectedReturnOf(a));
     const unfunded = viable.filter((c) => fundedFor(c) === 0).length;
     if (unfunded) {
       appendLog(
@@ -976,11 +984,13 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // PRE-GAME WAITING PERIOD (pregameConfirm.js): a pre-game edge is bought
     // only after the same side has qualified on consecutive scans over a few
     // minutes without the sharp line drifting away from it.
-    if (!c.timing.live && !c.addOn) {
-      const w = observePregame({ venue: "kalshi", gameKey: eventKeyOf(c.ticker), team: c.teamName, fairPct: c.trueProbability * 100 }, config);
+    // Live games too since 2026-10-01 (pregameConfirm.js, its own settings).
+    if (!c.addOn) {
+      const w = observePregame({ venue: "kalshi", gameKey: eventKeyOf(c.ticker), team: c.teamName, fairPct: c.trueProbability * 100, live: c.timing.live === true }, config);
       if (!w.ready) {
-        bump("pregame-watching", `${c.ticker}: ${w.why}`);
-        feedC("pregame-watching", w.why);
+        const code = c.timing.live ? "live-watching" : "pregame-watching";
+        bump(code, `${c.ticker}: ${w.why}`);
+        feedC(code, w.why);
         rejected.push(`${c.ticker}: ${w.why}`);
         continue;
       }
