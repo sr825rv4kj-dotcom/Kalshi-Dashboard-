@@ -325,7 +325,24 @@ export const DEFAULTS = {
 
   // Sports never scanned. MMA is off until the UFC side inversion is fixed:
   // KXUFCFIGHT-...AMAMAC-MAC priced at 68c against a 27.8% sharp line.
-  disabledSports: ["mma_mixed_martial_arts"],
+  // 2026-10-02 (account holder's call): tennis and EuroLeague off. Tennis at
+  // the China/Japan Opens went 1-9 (-$30.6), EuroLeague 1-5 (-$11.97).
+  // An entry ending in "*" is a prefix (sportRules.js): "tennis_*" covers
+  // every tournament key. Delete an entry to turn that sport back on.
+  disabledSports: ["mma_mixed_martial_arts", "tennis_*", "basketball_euroleague"],
+
+  // PER-SPORT PRICE FLOOR (2026-10-02, sportRules.js). Raised over the normal
+  // band for that sport only, pre-game and live, both exchanges, resting bids
+  // included. NHL (regular + preseason, Kalshi): entries under 45c won 2 of
+  // 13; at 45c and up, 4 of 5.
+  sportMinEntryCents: { icehockey_nhl: 45, icehockey_nhl_preseason: 45 },
+
+  // FAIR SHRINK (2026-10-02, sportRules.js). Share of the model's edge
+  // (fair - price) treated as real for limits, sizing and expected return.
+  // Kalshi realized 48% of the edge it claimed over the 44 trades that
+  // recorded one, so 0.5. The 18% plausibility gate still reads the RAW edge.
+  // 1 = off.
+  fairShrink: 0.5,
 
   // LIVE GAMES ONLY (2026-09-23). The account's own record, 59 closed trades:
   //   live      32 trades, 18 won, +$12.99
@@ -416,7 +433,10 @@ export const DEFAULTS = {
   // The 30% floor refused the 10-30% trades and cut entries to 1-2 a day.
   // 2026-09-30: RESTORED to 30% - the original Kalshi rule (see the one-time
   // update "2026-09-30-restore-original-kalshi" below).
-  minExpectedReturnPct: 30,
+  // 2026-10-02: 12.5% on the SHRUNK fair value (fairShrink 0.5) - the same
+  // trades the 30% raw rule took (worked through at 35, 40 and 60c), now
+  // priced on the edge the account actually realizes.
+  minExpectedReturnPct: 12.5,
 
   // STAKE TIERS + DOUBLE-DOWN (2026-09-26, account holder's call) - scaling.js
   //   stakeTiers: equity thresholds. x = multiple of flatStakeDollars,
@@ -435,7 +455,7 @@ export const DEFAULTS = {
     { at: 1000, pct: 0.03 },// 3% of equity: $30 at $1,000, $60 at $2,000
   ],
   stakeMaxDollars: 500,
-  doubleDown: { enabled: true, minReturnPct: 35, leadScans: 3, leadMinutes: 5 },
+  doubleDown: { enabled: true, minReturnPct: 15, leadScans: 3, leadMinutes: 5 },   // 15% shrunk = 35% raw
 
   // POLYMARKET US (2026-09-27) - polymarket/pmEngine.js. Same strategy as
   // Kalshi on a second exchange, one bet per game across both.
@@ -445,7 +465,10 @@ export const DEFAULTS = {
   //   call) - cash on the account is the only limit, as on Kalshi
   // 2026-09-30: trading "off" - connected and visible, no buying (account holder).
   // 2026-10-01: "auto" - same rules as Kalshi (account holder).
-  polymarket: { enabled: true, trading: "auto", shortSide: "auto" },
+  // 2026-10-02: entrySports - new Polymarket buys only in these sports
+  // (Kalshi's settled winners: NFL 13-6 +$31.64, NCAAF +$14.33). [] = all.
+  // A game held on one exchange is never bought on the other.
+  polymarket: { enabled: true, trading: "auto", shortSide: "auto", entrySports: ["americanfootball_nfl", "americanfootball_ncaaf"] },
 
   // IN-GAME SWING TRADING (2026-09-29, account holder's plan) - swingEngine.js.
   // Buy the dip (price under what the score and clock say the team is worth),
@@ -626,6 +649,26 @@ const ONE_TIME_UPDATES = [
       c.pregameConfirm = { ...(c.pregameConfirm || {}), live: { enabled: true, minScans: 4, minMinutes: 2, maxGapSeconds: 90, maxDriftPoints: 3 } };
     },
     note: "live waiting period: same side must qualify on 4 reads over 2+ minutes, fair value not dropping 3+ pts; candidates tried best expected return first",
+  },
+  {
+    // FIX ORDER 1-5 (2026-10-02, account holder's call), from the 138-trade
+    // export: one exchange per game (code: scanner.js / pmEngine.js),
+    // Polymarket buys only NFL + NCAAF, tennis and EuroLeague off, NHL floor
+    // 45c, fair value shrunk to the realized 50% with the return floors
+    // re-set so the same trades qualify. Every other setting is untouched.
+    id: "2026-10-02-fix-order-1-5",
+    apply: (c) => {
+      const off = new Set(Array.isArray(c.disabledSports) ? c.disabledSports.map(String) : ["mma_mixed_martial_arts"]);
+      off.add("tennis_*");
+      off.add("basketball_euroleague");
+      c.disabledSports = [...off];
+      c.polymarket = { ...DEFAULTS.polymarket, ...(c.polymarket || {}), entrySports: ["americanfootball_nfl", "americanfootball_ncaaf"] };
+      c.sportMinEntryCents = { ...(c.sportMinEntryCents || {}), icehockey_nhl: 45, icehockey_nhl_preseason: 45 };
+      c.fairShrink = 0.5;
+      c.minExpectedReturnPct = 12.5;
+      if (c.doubleDown !== false) c.doubleDown = { ...DEFAULTS.doubleDown, ...(c.doubleDown || {}), minReturnPct: 15 };
+    },
+    note: "one exchange per game; Polymarket buys NFL + NCAAF only; tennis + EuroLeague off; NHL floor 45c; fair value shrunk 50% (min return 12.5% shrunk = 30% raw, double-down 15% = 35% raw)",
   },
 ];
 
