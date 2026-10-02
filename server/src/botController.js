@@ -3,7 +3,7 @@ import path from "path";
 import { CONFIG_DIR } from "./paths.js";
 import { kalshiGet } from "./kalshiClient.js";
 import { exitPosition } from "./executor.js";
-import { loadState, saveState, appendLog } from "./stateStore.js";
+import { loadState, saveState, appendLog, tradingDay } from "./stateStore.js";
 import { loadConfig } from "./configStore.js";
 import { discoverActiveSports, allActiveSportKeys } from "./sportsDiscovery.js";
 import { discoverSeriesMap } from "./seriesDiscovery.js";
@@ -181,10 +181,10 @@ async function checkMilestones(config, currentBalance) {
 
 async function checkDailySummary(config, currentBalance) {
   const state = loadState();
-  const today = new Date().toDateString();
+  const today = tradingDay();
   if (state.lastDailySummaryDate === today) return;
 
-  const todays = getRecentTrades(500).filter((t) => new Date(t.timestamp).toDateString() === today);
+  const todays = getRecentTrades(500).filter((t) => tradingDay(new Date(t.timestamp)) === today);
   const { botToken, chatId } = getTelegramCredentials();
   await notifyDailySummary({
     botToken, chatId,
@@ -512,7 +512,7 @@ async function readEquity() {
 
 async function checkDailyHalt(config) {
   const state = loadState();
-  const today = new Date().toDateString();
+  const today = tradingDay();
   const { cash, positions, equity } = await readEquity();
 
   if (state.dayStartDate !== today) {
@@ -1268,7 +1268,7 @@ export async function resumeTrading() {
   state.haltReason = null;
   state.dayStartEquity = equity;
   state.dayStartBalance = equity;
-  state.dayStartDate = new Date().toDateString();
+  state.dayStartDate = tradingDay();
   saveState(state);
 
   appendLog(
