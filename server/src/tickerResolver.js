@@ -92,7 +92,7 @@ const CACHE_TTL_MS = 3 * 60 * 1000;
 /** How many days either side of kickoff a ticker's date may sit. */
 const DATE_SLACK_DAYS = 1;
 
-export const RESOLVER_VERSION = "2026-09-27-opponent-elimination";
+export const RESOLVER_VERSION = "2026-10-01-code-tiebreak";
 
 /**
  * Accent folding. kärpät -> karpat, ässät -> assat, Malmö -> malmo.
@@ -789,6 +789,36 @@ export async function resolveTicker({ sportKey, teamName, commenceTime, opponent
     // Two DIFFERENT team codes fitting this name equally well means the codes
     // cannot identify the team. Refuse - this is the case the whole gate
     // exists to prevent.
+    // TIE-BREAK (2026-10-01). Production refused every Calgary Flames line:
+    // "calgary flames" fits CAR and CGY equally (KXNHLGAME). Two certain
+    // facts settle it without guessing: (1) the team's own game holds the
+    // OPPONENT - keep only codes whose Kalshi event also carries a code the
+    // opponent fits strongly (affinity >= 60) and which the opponent does not
+    // fit itself; (2) failing that, a code whose fixture is strictly the
+    // nearest to the scheduled start. Anything still tied is refused below.
+    if (distinctCodes.length > 1) {
+      const evOf = (m) => m.event_ticker || String(m.ticker).slice(0, String(m.ticker).lastIndexOf("-"));
+      let kept = null;
+      if (opponentName && !NON_TEAM_OUTCOMES.has(String(opponentName).toLowerCase().trim())) {
+        const byOpp = leaders.filter((x) => {
+          if (codeAffinity(x.tcode, opponentName) >= 60) return false;
+          const others = [...new Set(dated.filter((m) => evOf(m) === evOf(x.m)).map((m) => tickerTeamCode(m.ticker)).filter((c) => c && c !== x.tcode))];
+          return others.some((c) => codeAffinity(c, opponentName) >= 60);
+        });
+        if (byOpp.length && new Set(byOpp.map((x) => x.tcode)).size === 1) kept = byOpp;
+      }
+      if (!kept) {
+        const gapOf = (code) => Math.min(...leaders.filter((x) => x.tcode === code).map((x) => startGap(x.m)));
+        const gaps = distinctCodes.map((c) => ({ c, g: gapOf(c) })).filter((x) => Number.isFinite(x.g)).sort((a, b) => a.g - b.g);
+        if (gaps.length === distinctCodes.length && gaps[0].g < gaps[1].g) kept = leaders.filter((x) => x.tcode === gaps[0].c);
+      }
+      if (kept) {
+        leaders.length = 0;
+        leaders.push(...kept);
+        distinctCodes.length = 0;
+        distinctCodes.push(kept[0].tcode);
+      }
+    }
     if (distinctCodes.length > 1) {
       return {
         ticker: null, code: "ambiguous-code",
