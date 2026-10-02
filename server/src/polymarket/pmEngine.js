@@ -53,16 +53,16 @@
 
 import { loadState, appendLog } from "../stateStore.js";
 import { recordTrade } from "../tradeLedgerStore.js";
-import { entryTiming, getRecentLines, rememberLines } from "../scanner.js";
+import { entryTiming, getRecentLines, rememberLines, pregameStopStatus } from "../scanner.js";
 import { getSharpProbabilities } from "../scraper.js";
 import { getLiveScores, findLiveGameForTeam } from "../scoresFetcher.js";
 import { corroboratedProbability, fractionRemaining, paramsFor, entryAllowedForSport, pregamePrior, rememberPregame, flushPregamePriors } from "../liveModel.js";
 import { allActiveSportKeys } from "../sportsDiscovery.js";
-import { schedulePlan, shouldScanSport, openTradeCap } from "../liveSchedule.js";
+import { schedulePlan, shouldScanSport, openTradeCap, MIN_OPEN_TRADES } from "../liveSchedule.js";
 import { noteDecision, noteScan } from "../scanFeed.js";
 import { getSeriesMap } from "../tickerResolver.js";
 import { assessOpportunity, feePerContractCents, flatBetContracts } from "../riskManager.js";
-import { learnedBlock, streakStakeFactor } from "../outcomeLearner.js";
+import { learnedBlock, streakStakeFactor, earnedPositionCap } from "../outcomeLearner.js";
 import { tieredStake } from "../scaling.js";
 import { getRestingOrders } from "../makerEngine.js";
 import { notifyEntry } from "../notifier.js";
@@ -73,7 +73,7 @@ import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, k
 import { recordFairFromProbabilities } from "../fairValue.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "../swingEngine.js";
 
-export const PM_ENGINE_VERSION = "2026-09-29-swing";
+export const PM_ENGINE_VERSION = "2026-10-01-kalshi-rules";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -122,6 +122,9 @@ function freshLineOk(lineAgeSeconds, config = {}) {
   const n = Number(config.noScoreMaxLineAgeSeconds);
   const max = Number.isFinite(n) && n > 0 ? n : 120;
   const age = Number.isFinite(Number(lineAgeSeconds)) && lineAgeSeconds != null ? Math.round(Number(lineAgeSeconds)) : null;
+  // Same rule as Kalshi (scanner.js): tradeWithoutLiveScore false = a live
+  // game with no live score is never bought.
+  if (config.tradeWithoutLiveScore === false) return { ok: false, age, max, off: true };
   return { ok: age != null && age <= max, age, max };
 }
 
@@ -701,7 +704,18 @@ export async function scanPolymarket(config, settings, active) {
   const stake = Number(stakeDecision.stake) * brake.factor;
   // OPEN-TRADE CAP BY BALANCE (2026-09-28): the same rule as Kalshi, read from
   // the POLYMARKET account - stakes that fit in 75% of its equity, 5 to 10.
-  const openCap = openTradeCap({ equity, stake: Number(stakeDecision.stake) || Number(config.flatStakeDollars) || 5 });
+  // SURVIVAL MODE (2026-10-01): the same cap rule as Kalshi (botController
+  // positionCapFor) - under survivalMode.balanceThreshold the cap is also
+  // limited by the slots the bot has EARNED from its own closed trades.
+  const byBalanceCap = openTradeCap({ equity, stake: Number(stakeDecision.stake) || Number(config.flatStakeDollars) || 5 });
+  const fixedCap = Number(config.maxConcurrentPositions);
+  const sm = config.survivalMode;
+  const pmCash = Number(account?.buyingPower ?? equity);
+  const openCap = Number.isFinite(fixedCap) && fixedCap > 0
+    ? fixedCap
+    : sm && pmCash < Number(sm.balanceThreshold)
+      ? Math.max(MIN_OPEN_TRADES, Math.min(byBalanceCap, earnedPositionCap(sm.maxConcurrentPositions, config)))
+      : byBalanceCap;
   const shortOn = shortSideActive(settings, meta);
   const convention = meta.selfCheck?.shortConvention;
   let resting = [];
@@ -823,7 +837,9 @@ export async function scanPolymarket(config, settings, active) {
             // price. Same rule as the Kalshi scanner.
             const fresh = freshLineOk(c.lineAgeSeconds, config);
             if (!fresh.ok) {
-              skip("pm-no-live-score", `In play with no live score, and the sharp line is ${fresh.age == null ? "of unknown age" : `${fresh.age}s old`} - trading without a score needs a line updated within ${fresh.max}s`);
+              skip("pm-no-live-score", fresh.off
+                ? "In play, but no live score for this game - live buys need a real score (tradeWithoutLiveScore is off)"
+                : `In play with no live score, and the sharp line is ${fresh.age == null ? "of unknown age" : `${fresh.age}s old`} - trading without a score needs a line updated within ${fresh.max}s`);
               continue;
             }
             c.liveContext = `no live score feed for this game - sharp line updated ${fresh.age}s ago`;
@@ -903,6 +919,12 @@ export async function scanPolymarket(config, settings, active) {
         // OPEN-TRADE CAP BY BALANCE (2026-09-28, account holder's rule): 5 to 10
         // open bets depending on the Polymarket balance - see openCap above.
         // One bet per game across both exchanges still applies.
+        // PRE-GAME HARD STOP: the same rule as Kalshi, counted on Polymarket's
+        // own trades (2 pre-game losses today, or 3 pre-game positions open).
+        if (!timing.live) {
+          const ps = pregameStopStatus(config, true, "polymarket");
+          if (ps.stopped) { skip(`pm-${ps.code}`, ps.why); continue; }
+        }
         const openNow = pmPositions().length;
         if (openNow >= openCap) {
           skip("pm-at-cap", `${openNow} open of ${openCap} allowed at $${equity.toFixed(2)} equity - waiting for a game to settle`);
