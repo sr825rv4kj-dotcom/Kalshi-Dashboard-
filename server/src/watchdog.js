@@ -8,7 +8,7 @@
  * trades would cost money faster than no guard at all.
  */
 import { loadConfig } from "./configStore.js";
-import { saveState, loadState, appendLog } from "./stateStore.js";
+import { saveState, loadState, appendLog, tradingDay } from "./stateStore.js";
 
 const CHECK_INTERVAL_MS = 2 * 60 * 1000;
 const BREAKER_COOLDOWN_MS = 15 * 60 * 1000;
@@ -43,7 +43,7 @@ async function tick() {
     // A halt is a limit for ONE DAY. If the day has turned over, clear it and
     // let the bot start; checkDailyHalt will re-halt within one cycle if the
     // drawdown is genuinely still there.
-    const today = new Date().toDateString();
+    const today = tradingDay();
     if (state.haltedForDay && state.haltDate && state.haltDate !== today) {
       appendLog(
         `Watchdog: clearing a halt from ${state.haltDate} - it is now ${today}. ` +
