@@ -76,9 +76,9 @@ import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, kalshiTeamOnGame, normName, pmPositionsOnGame } from "./pmState.js";
 import { recordFairFromProbabilities } from "../fairValue.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "../swingEngine.js";
-import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, modelPricingAllowed, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
+import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, modelPricingAllowed, laneFor, laneMiss, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
 
-export const PM_ENGINE_VERSION = "2026-10-02-model-when-stale";
+export const PM_ENGINE_VERSION = "2026-10-03-three-lanes";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -111,7 +111,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", "2026-10-02-model-when-stale", "2026-10-03-two-lanes", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -935,6 +935,10 @@ export async function scanPolymarket(config, settings, active) {
           }
         }
 
+        // THREE LANES (2026-10-03, same rules as Kalshi, sportRules.js).
+        const lane = laneFor({ winProbability: c.prob, askCents }, config);
+        if (!lane) { skip("pm-no-lane", laneMiss({ winProbability: c.prob, askCents }, config)); continue; }
+
         const learned = learnedBlock({ sportKey, priceCents: askCents }, config);
         if (learned.blocked) { skip("pm-learned-block", learned.reason); continue; }
 
@@ -947,9 +951,12 @@ export async function scanPolymarket(config, settings, active) {
           minEntryPriceCents: timing.live
             ? Math.max(config.minEntryPriceCents ?? 25, config.liveBandMinCents ?? config.minLiveEntryPriceCents ?? 20)
             : (config.minEntryPriceCents ?? 25),
-          maxEntryPriceCents: timing.live
-            ? Math.min(config.maxEntryPriceCents ?? 88, config.liveBandMaxCents ?? config.maxLiveEntryPriceCents ?? 80)
-            : (config.maxEntryPriceCents ?? 88),
+          maxEntryPriceCents: Math.min(
+            timing.live
+              ? Math.min(config.maxEntryPriceCents ?? 88, config.liveBandMaxCents ?? config.maxLiveEntryPriceCents ?? 80)
+              : (config.maxEntryPriceCents ?? 88),
+            lane.maxCents,
+          ),
           minEvCentsPerContract: config.minEvCentsPerContract ?? 0,
           minEvCentsPerTrade: config.minEvCentsPerTrade ?? 1,
           maxWalkupCents: config.maxWalkupCents ?? 4,
@@ -964,8 +971,8 @@ export async function scanPolymarket(config, settings, active) {
 
         // Same minimum expected return as Kalshi, with Polymarket's fee.
         const minReturnPct = addOnHeld
-          ? Math.max(Number(config.minExpectedReturnPct ?? 10), Number(doubleDownConfig(config).minReturnPct ?? 35))
-          : Number(config.minExpectedReturnPct ?? 10);
+          ? Math.max(Number(lane.minReturnPct), Number(doubleDownConfig(config).minReturnPct ?? 35))
+          : Number(lane.minReturnPct);
         const countAt = (p) => flatBetContracts(stake, p, PM_FEE);
         // Expected return on the SHRUNK fair value (sportRules.js fairShrink).
         const fairP = Number.isFinite(assessment.fairUsed) ? assessment.fairUsed : c.prob;
@@ -975,6 +982,11 @@ export async function scanPolymarket(config, settings, active) {
         };
         let limit = null;
         for (let p = assessment.limitCents; p >= askCents; p--) if (returnAt(p).pct >= minReturnPct) { limit = p; break; }
+        // MIDDLE LANE CEILING (same rule as Kalshi, sportRules.js).
+        if (limit != null && Number.isFinite(lane.maxReturnPct) && returnAt(askCents).pct > lane.maxReturnPct) {
+          skip("pm-middle-edge-too-good", `${askCents}c vs fair ${(c.prob * 100).toFixed(1)}%: middle lane - ${returnAt(askCents).pct.toFixed(1)}% expected return is above the ${lane.maxReturnPct}% ceiling (a bad line at this price)`);
+          continue;
+        }
         if (limit == null) {
           const r = returnAt(askCents);
           skip("pm-return-too-small", `${askCents}c vs fair ${(c.prob * 100).toFixed(1)}%: ${r.pct.toFixed(1)}% expected return, under the ${minReturnPct}% minimum`);
