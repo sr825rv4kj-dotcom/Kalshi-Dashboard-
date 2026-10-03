@@ -88,14 +88,14 @@ import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame } from "./polymarket/pmState.js";
-import { fairShrinkOf, shrinkFair } from "./sportRules.js";
+import { fairShrinkOf, shrinkFair, modelPricingAllowed } from "./sportRules.js";
 import { noteDecision, noteScan } from "./scanFeed.js";
 import { getTradeLifecycles, filterByVenue } from "./tradeLedgerStore.js";
 import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-02-price-reader";
+export const SCANNER_VERSION = "2026-10-02-model-when-stale";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -680,6 +680,20 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
                 : `not ahead (${game.homeScore}-${game.awayScore})`}`
             );
             return false;
+          }
+          // MODEL PRICING (2026-10-02 night, sportRules.js): the line is the
+          // stale one - price the game on the score model instead of skipping.
+          // Needs the pre-game close on record (the model's starting point).
+          if (corr.disagreementPoints > maxDisagree && !c.addOn && corr.priorSource === "pre-game close" && modelPricingAllowed(sportKey, config)) {
+            const staleLine = c.trueProbability;
+            c.trueProbability = corr.modelProbability;
+            c.fairSource = "model";
+            c.liveContext =
+              `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ${(frac * 100).toFixed(0)}% left - ` +
+              `betting line ${(staleLine * 100).toFixed(0)}% is stale, priced on the score model ${(corr.modelProbability * 100).toFixed(0)}% ` +
+              `(pre-game ${(corr.prior * 100).toFixed(0)}%, ${priorNote})`;
+            bump("model-priced", `${c.teamName}: ${c.liveContext}`);
+            return true;
           }
           if (corr.disagreementPoints > maxDisagree) {
             vetoed.push(
