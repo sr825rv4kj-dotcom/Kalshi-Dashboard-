@@ -46,6 +46,7 @@ import { learnerReport } from "../outcomeLearner.js";
 import { stakeReport, SCALING_VERSION } from "../scaling.js";
 import { LIVE_MODEL_VERSION, pregamePriorCount } from "../liveModel.js";
 import { pmMonitorReport, PM_ENGINE_VERSION } from "../polymarket/pmEngine.js";
+import { inPlayBookReport } from "../scraper.js";
 
 /**
  * Read MONITOR_TOKEN the way a phone-edited Railway variable actually arrives.
@@ -308,6 +309,10 @@ export function registerMonitorRoutes(app) {
     } catch (err) {
       out.settlements = { error: err.message };
     }
+
+    // IN-PLAY BOOKS (2026-10-02): what each sharp book sent for every live
+    // game - price, last_update, used or dropped (scraper.js).
+    try { out.inPlayBooks = inPlayBookReport(); } catch (err) { out.inPlayBooks = { error: err.message }; }
 
     res.json(out);
   });
