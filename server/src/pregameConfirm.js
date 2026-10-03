@@ -24,7 +24,24 @@
  * affected. Kalshi and Polymarket keep separate watches.
  */
 
-export const PREGAME_CONFIRM_VERSION = "2026-10-01-confirm-all";
+export const PREGAME_CONFIRM_VERSION = "2026-10-02-price-reader";
+
+/*
+ * PRICE READER (2026-10-02, account holder's call): the watch now reads the
+ * PRICE as well as the line. Every qualifying read records the ask. Once the
+ * minimum reads and minutes are met, the side is bought only when the ask is
+ * back within reader.toleranceCents of the LOWEST ask seen during the watch -
+ * buying the dip, not the spike. While the ask sits higher the bot keeps
+ * taking reads (several takes at an entry). After reader.maxWatchMinutes it
+ * stops waiting for the low and buys at the current ask if the side still
+ * passes every rule, so a real edge is never missed just because the price
+ * did not come back. The order limit is capped at low + tolerance while the
+ * reader is waiting, so the walk-up can never pay above the range it read.
+ *
+ *   reader.enabled          default true
+ *   reader.toleranceCents   default 1   (buy at or within 1c of the low)
+ *   reader.maxWatchMinutes  default 5   (stop waiting for the low after this)
+ */
 
 /*
  * LIVE TOO (2026-10-01, account holder's call): every entry now waits, live
@@ -35,7 +52,18 @@ export const PREGAME_CONFIRM_VERSION = "2026-10-01-confirm-all";
  * watch never carries into the live game: each phase has its own watch.
  */
 
-const watches = new Map();   // `${venue}|${gameKey}` -> { team, firstAt, lastAt, scans, firstFair, lastFair }
+const watches = new Map();   // `${venue}|${phase}|${gameKey}` -> { team, firstAt, lastAt, scans, firstFair, lastFair, lowAsk, highAsk, lastAsk, asks }
+
+/** Price-reader settings (config.pregameConfirm.reader). */
+export function readerSettings(config = {}) {
+  const r = (config.pregameConfirm && config.pregameConfirm.reader) || {};
+  const num = (v, d) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
+  return {
+    enabled: r.enabled !== false,
+    toleranceCents: num(r.toleranceCents, 1),
+    maxWatchMinutes: num(r.maxWatchMinutes, 5),
+  };
+}
 
 export function pregameConfirmSettings(config = {}, phase = "pregame") {
   const p = config.pregameConfirm || {};
@@ -68,7 +96,7 @@ export function pregameConfirmSettings(config = {}, phase = "pregame") {
  *   team     the side that qualified this scan
  *   fairPct  the sharp fair value for that side, in percent
  */
-export function observePregame({ venue, gameKey, team, fairPct, live = false }, config = {}, now = Date.now()) {
+export function observePregame({ venue, gameKey, team, fairPct, live = false, askCents = null }, config = {}, now = Date.now()) {
   const phase = live ? "live" : "pregame";
   const s = pregameConfirmSettings(config, phase);
   if (!s.enabled) return { ready: true, scans: 0, minutes: 0, why: "waiting period off" };
@@ -81,21 +109,56 @@ export function observePregame({ venue, gameKey, team, fairPct, live = false }, 
   else if (Number(fairPct) < w.firstFair - s.maxDriftPoints) {
     restart = `sharp line drifted ${(w.firstFair - Number(fairPct)).toFixed(1)} pts away (${w.firstFair.toFixed(1)}% -> ${Number(fairPct).toFixed(1)}%)`;
   }
+  const ask = Number.isFinite(Number(askCents)) && Number(askCents) > 0 ? Math.round(Number(askCents)) : null;
   if (restart) {
-    w = { team, firstAt: now, lastAt: now, scans: 1, firstFair: Number(fairPct), lastFair: Number(fairPct) };
+    w = { team, firstAt: now, lastAt: now, scans: 1, firstFair: Number(fairPct), lastFair: Number(fairPct), lowAsk: ask, highAsk: ask, lastAsk: ask, asks: ask != null ? [ask] : [] };
     watches.set(key, w);
   } else {
     w.scans += 1;
     w.lastAt = now;
     w.lastFair = Number(fairPct);
+    if (ask != null) {
+      w.lastAsk = ask;
+      w.lowAsk = w.lowAsk == null ? ask : Math.min(w.lowAsk, ask);
+      w.highAsk = w.highAsk == null ? ask : Math.max(w.highAsk, ask);
+      w.asks = [...(w.asks || []), ask].slice(-30);
+    }
   }
   const minutes = (now - w.firstAt) / 60000;
-  const ready = w.scans >= s.minScans && minutes >= s.minMinutes;
-  const why = ready
-    ? `confirmed: ${w.scans} qualifying reads over ${minutes.toFixed(1)} min, line ${w.firstFair.toFixed(1)}% -> ${w.lastFair.toFixed(1)}%`
-    : `watching before buying: ${w.scans}/${s.minScans} qualifying reads, ${minutes.toFixed(1)}/${s.minMinutes} min` +
-      (restart && restart !== "first sighting" ? ` (restarted: ${restart})` : "");
-  return { ready, scans: w.scans, minutes, why, restarted: restart };
+  const confirmed = w.scans >= s.minScans && minutes >= s.minMinutes;
+  const restartNote = restart && restart !== "first sighting" ? ` (restarted: ${restart})` : "";
+  if (!confirmed) {
+    return {
+      ready: false, scans: w.scans, minutes, restarted: restart, lowAsk: w.lowAsk, maxPriceCents: null,
+      why: `watching before buying: ${w.scans}/${s.minScans} qualifying reads, ${minutes.toFixed(1)}/${s.minMinutes} min` +
+        (w.lowAsk != null ? `, price ${w.lastAsk}c (low ${w.lowAsk}c, high ${w.highAsk}c)` : "") + restartNote,
+    };
+  }
+
+  const base = `${w.scans} qualifying reads over ${minutes.toFixed(1)} min, line ${w.firstFair.toFixed(1)}% -> ${w.lastFair.toFixed(1)}%`;
+  const r = readerSettings(config);
+  if (!r.enabled || ask == null || w.lowAsk == null) {
+    return { ready: true, scans: w.scans, minutes, restarted: restart, lowAsk: w.lowAsk, maxPriceCents: null, why: `confirmed: ${base}` };
+  }
+  const ceiling = w.lowAsk + r.toleranceCents;
+  if (ask <= ceiling) {
+    return {
+      ready: true, scans: w.scans, minutes, restarted: restart, lowAsk: w.lowAsk, maxPriceCents: ceiling,
+      why: `confirmed at a good price: ${base}; ask ${ask}c is within ${r.toleranceCents}c of the ${w.lowAsk}c low it read (range ${w.lowAsk}-${w.highAsk}c)`,
+    };
+  }
+  if (minutes >= r.maxWatchMinutes) {
+    return {
+      ready: true, scans: w.scans, minutes, restarted: restart, lowAsk: w.lowAsk, maxPriceCents: null,
+      why: `confirmed after ${minutes.toFixed(1)} min of reads: ${base}; ask ${ask}c never came back to the ${w.lowAsk}c low - ` +
+        `still passes every rule, so it is bought rather than missed`,
+    };
+  }
+  return {
+    ready: false, scans: w.scans, minutes, restarted: restart, lowAsk: w.lowAsk, maxPriceCents: ceiling,
+    why: `reading the price: ask ${ask}c is above the ${w.lowAsk}c low it read (range ${w.lowAsk}-${w.highAsk}c) - ` +
+      `waiting for ${ceiling}c or less, up to ${r.maxWatchMinutes} min (${minutes.toFixed(1)} so far)`,
+  };
 }
 
 /** Forget a game's watch (after a buy, or when the game starts). */
@@ -114,5 +177,6 @@ export function pregameWatchReport() {
     key: k, team: w.team, scans: w.scans,
     minutes: Math.round(((w.lastAt - w.firstAt) / 60000) * 10) / 10,
     firstFair: w.firstFair, lastFair: w.lastFair,
+    lowAsk: w.lowAsk ?? null, highAsk: w.highAsk ?? null, lastAsk: w.lastAsk ?? null,
   }));
 }
