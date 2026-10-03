@@ -78,7 +78,7 @@ import { recordFairFromProbabilities } from "../fairValue.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "../swingEngine.js";
 import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
 
-export const PM_ENGINE_VERSION = "2026-10-02-one-venue-per-game";
+export const PM_ENGINE_VERSION = "2026-10-02-price-reader";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -111,7 +111,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -972,8 +972,11 @@ export async function scanPolymarket(config, settings, active) {
         // with Polymarket's own watch.
         // Live games too since 2026-10-01 (pregameConfirm.js, its own settings).
         if (!addOnHeld) {
-          const w = observePregame({ venue: "polymarket", gameKey: `${sportKey}|${commenceTime}|${[...teamNames].map(normName).sort().join("|")}`, team: t.name, fairPct: c.prob * 100, live: timing.live === true }, config);
+          // PRICE READER (2026-10-02, pregameConfirm.js): same as Kalshi - wait
+          // for the ask to come back to the low it read, limit capped there.
+          const w = observePregame({ venue: "polymarket", gameKey: `${sportKey}|${commenceTime}|${[...teamNames].map(normName).sort().join("|")}`, team: t.name, fairPct: c.prob * 100, live: timing.live === true, askCents }, config);
           if (!w.ready) { skip(timing.live ? "pm-live-watching" : "pm-pregame-watching", w.why); continue; }
+          if (w.maxPriceCents != null && w.maxPriceCents < limit) limit = Math.max(askCents, w.maxPriceCents);
         }
         let contracts = countAt(limit);
         const perContract = (limit + feePerContractCents(limit, contracts, PM_FEE)) / 100;
