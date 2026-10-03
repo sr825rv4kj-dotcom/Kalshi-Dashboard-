@@ -91,6 +91,90 @@ export function modelPricingAllowed(sportKey, config = {}) {
   return !excluded.some((p) => String(sportKey || "").startsWith(String(p)));
 }
 
+/**
+ * THREE TRADE LANES (2026-10-03, account holder's call: keep every strategy,
+ * use each where it fits, priority on profit; 50-92c is vital). From the
+ * account's Kalshi record by entry price:
+ *
+ *   35-49c   72 trades  +$35.91  +16%   <- the proven lane, kept
+ *   50-69c   20 trades   -$4.67         <- underdogs/coin flips here lost
+ *   70c+      7 trades   -$2.35         <- favorites: small sample
+ *
+ *   DIP lane       ask 35-49c, any win chance, needs dip.minReturnPct (5%)
+ *                  expected return on the realized edge
+ *   FAVORITE lane  win chance favorite.minWinProbability (65%) or better,
+ *                  ask up to favorite.maxCents (92c), favorite.minReturnPct (0.5%)
+ *   MIDDLE lane    ask 50-92c, under 65% to win, expected return between
+ *                  middle.minReturnPct (0.5%) and middle.maxReturnPct (8%).
+ *                  The account's 27 Kalshi trades at 50-92c, by realized edge
+ *                  at entry:
+ *                    8%+    4 trades  1 won  -$12.49  (a gap that big at these
+ *                                                      prices was a bad line)
+ *                    0-8%  14 trades 11 won   +$6.10
+ *                  So the middle lane takes the modest edges and refuses the
+ *                  "too good" ones.
+ *
+ * Every candidate from all lanes is ranked by expected return and the best
+ * is bought first.
+ * Win chance is read from the fair value BEFORE the realized-edge shrink.
+ */
+export const DEFAULT_LANES = {
+  dip: { enabled: true, minCents: 35, maxCents: 49, minReturnPct: 5 },
+  favorite: { enabled: true, minWinProbability: 0.65, maxCents: 92, minReturnPct: 0.5 },
+  middle: { enabled: true, minCents: 50, maxCents: 92, minReturnPct: 0.5, maxReturnPct: 8 },
+};
+
+export function lanesOf(config = {}) {
+  const l = config.lanes && typeof config.lanes === "object" ? config.lanes : {};
+  return {
+    dip: { ...DEFAULT_LANES.dip, ...(l.dip || {}) },
+    favorite: { ...DEFAULT_LANES.favorite, ...(l.favorite || {}) },
+    middle: { ...DEFAULT_LANES.middle, ...(l.middle || {}) },
+  };
+}
+
+/**
+ * Which lane a candidate trades in, or null. A side that fits both (65%+ to
+ * win at 49c or less) is a favorite bought at a dip price - it takes the
+ * favorite lane, whose wider price range never cuts its order limit short.
+ */
+export function laneFor({ winProbability, askCents }, config = {}) {
+  const L = lanesOf(config);
+  const p = Number(winProbability);
+  const a = Number(askCents);
+  if (L.favorite.enabled !== false && p >= Number(L.favorite.minWinProbability) && a <= Number(L.favorite.maxCents)) {
+    return { name: "favorite", maxCents: Number(L.favorite.maxCents), minReturnPct: Number(L.favorite.minReturnPct) };
+  }
+  if (L.dip.enabled !== false && a >= Number(L.dip.minCents) && a <= Number(L.dip.maxCents)) {
+    return { name: "dip", maxCents: Number(L.dip.maxCents), minReturnPct: Number(L.dip.minReturnPct) };
+  }
+  if (L.middle.enabled !== false && a >= Number(L.middle.minCents) && a <= Number(L.middle.maxCents)) {
+    return { name: "middle", maxCents: Number(L.middle.maxCents), minReturnPct: Number(L.middle.minReturnPct), maxReturnPct: Number(L.middle.maxReturnPct) };
+  }
+  return null;
+}
+
+export function laneMiss({ winProbability, askCents }, config = {}) {
+  const L = lanesOf(config);
+  return `${askCents}c at a ${(Number(winProbability) * 100).toFixed(0)}% win chance fits no lane - ` +
+    `dip lane buys ${L.dip.minCents}-${L.dip.maxCents}c, middle lane ${L.middle.minCents}-${L.middle.maxCents}c, ` +
+    `favorite lane needs ${(L.favorite.minWinProbability * 100).toFixed(0)}%+ to win (up to ${L.favorite.maxCents}c)`;
+}
+
+/**
+ * RETURN TIERS (2026-10-03): every qualifying trade is labelled by its
+ * expected return after fees on the realized edge. Candidates are already
+ * bought best expected return first; the tier makes that visible in the log
+ * and on the Scanner tab. Below the last tier's floor nothing is bought.
+ */
+export const RETURN_TIERS = [65, 30, 15, 5, 2, 0.5];
+export function returnTierOf(pct) {
+  const p = Number(pct);
+  if (!Number.isFinite(p)) return null;
+  for (const t of RETURN_TIERS) if (p >= t) return `${t}%+ tier`;
+  return null;
+}
+
 /** The fair-value shrink factor, clamped to (0, 1]. 1 = no shrink. */
 export function fairShrinkOf(config = {}) {
   const n = Number(config.fairShrink);
