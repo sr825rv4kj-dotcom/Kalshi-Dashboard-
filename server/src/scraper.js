@@ -198,6 +198,54 @@ export function inTradingWindow(iso, now = Date.now()) {
  */
 const IN_PLAY_BOOK_SPREAD_S = 300;
 
+/**
+ * IN-PLAY BOOK RECORD (2026-10-02 night). After the kickoff filter shipped,
+ * live lines still trailed the score: Anaheim up 3-0 with 60% left read 53%
+ * (pre-game 35%) while Kalshi was 85c and the score model 93%. Before any more
+ * trading logic changes, this records exactly what each sharp book sent for
+ * every in-play game - its price, its last_update, and whether it was used -
+ * so the next export shows which book is lagging. Read-only; changes nothing.
+ */
+const inPlayBooks = new Map();   // eventId -> record
+export function inPlayBookReport() {
+  return [...inPlayBooks.values()]
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+    .slice(0, 40);
+}
+function noteInPlayBooks(sportKey, event, sharpBooks, usedKeys, consensusByTeam) {
+  try {
+    const now = Date.now();
+    const books = sharpBooks.map((book) => {
+      const h2h = (book.markets || []).find((m) => m.key === "h2h");
+      const iso = h2h?.last_update ?? book?.last_update ?? null;
+      const ms = Date.parse(iso ?? "");
+      const raw = (h2h?.outcomes || []).map((o) => (o.price > 0 ? 1 / o.price : 0));
+      const fair = raw.length >= 2 && raw.every((r) => r > 0) ? devig(raw) : null;
+      const probs = {};
+      (h2h?.outcomes || []).forEach((o, i) => { probs[o.name] = fair ? Math.round(fair[i] * 1000) / 10 : null; });
+      return {
+        book: book.key,
+        lastUpdate: iso,
+        ageSeconds: Number.isFinite(ms) ? Math.round((now - ms) / 1000) : null,
+        updatedAfterKickoff: Number.isFinite(ms) ? ms > Date.parse(event.commence_time) : null,
+        used: usedKeys.includes(book.key),
+        probs,
+      };
+    });
+    const consensus = {};
+    for (const [name, v] of consensusByTeam) consensus[name] = v == null ? null : Math.round(v * 1000) / 10;
+    inPlayBooks.set(event.id, {
+      at: new Date(now).toISOString(), sportKey, eventId: event.id,
+      game: `${event.away_team} @ ${event.home_team}`, commence: event.commence_time,
+      allBookKeys: (event.bookmakers || []).map((b) => b.key), books, consensus,
+    });
+    if (inPlayBooks.size > 80) {
+      const oldest = [...inPlayBooks.entries()].sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at))[0];
+      if (oldest) inPlayBooks.delete(oldest[0]);
+    }
+  } catch { /* a record must never break a line read */ }
+}
+
 async function fromTheOddsApi(sportKey) {
   const apiKey = process.env.THE_ODDS_API_KEY;
   if (!apiKey) throw tagError(new Error("THE_ODDS_API_KEY not set"), "config");
@@ -268,7 +316,11 @@ async function fromTheOddsApi(sportKey) {
       usable = updatedAfterKickoff
         .filter((x) => freshest - x.ms <= IN_PLAY_BOOK_SPREAD_S * 1000)
         .map((x) => x.book);
-      if (!usable.length) { rejected.noLiveBook++; continue; }
+      if (!usable.length) {
+        rejected.noLiveBook++;
+        noteInPlayBooks(sportKey, event, sharpBooks, [], new Map());
+        continue;
+      }
     }
 
     for (const book of usable) {
@@ -296,6 +348,11 @@ async function fromTheOddsApi(sportKey) {
     // that is the one whose price we are really reading.
     const known = ages.filter((a) => a != null);
     const lineAgeSeconds = known.length ? Math.min(...known) : null;
+    if (isLive) {
+      const cons = new Map();
+      for (const [name, values] of byTeam) cons.set(name, median(values));
+      noteInPlayBooks(sportKey, event, sharpBooks, booksUsed, cons);
+    }
 
     for (const [name, values] of byTeam) {
       const consensus = median(values);
