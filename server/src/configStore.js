@@ -436,7 +436,12 @@ export const DEFAULTS = {
   // 2026-10-02: 12.5% on the SHRUNK fair value (fairShrink 0.5) - the same
   // trades the 30% raw rule took (worked through at 35, 40 and 60c), now
   // priced on the edge the account actually realizes.
-  minExpectedReturnPct: 12.5,
+  // 2026-10-02 (night, account holder's call): 5% on the shrunk fair value =
+  // +5% expected profit after fees on the edge the account actually keeps
+  // (about 13-15% on the raw model edge). The account's settled record by
+  // expected return at entry shows the higher bar bought nothing extra:
+  //   0-5% 28 trades +27% ROI | 5-10% 7 +53% | 10-20% 7 +38% | 20-30% 8 -8% | 30%+ 37 +23%
+  minExpectedReturnPct: 5,
 
   // STAKE TIERS + DOUBLE-DOWN (2026-09-26, account holder's call) - scaling.js
   //   stakeTiers: equity thresholds. x = multiple of flatStakeDollars,
@@ -669,6 +674,15 @@ const ONE_TIME_UPDATES = [
       if (c.doubleDown !== false) c.doubleDown = { ...DEFAULTS.doubleDown, ...(c.doubleDown || {}), minReturnPct: 15 };
     },
     note: "one exchange per game; Polymarket buys NFL + NCAAF only; tennis + EuroLeague off; NHL floor 45c; fair value shrunk 50% (min return 12.5% shrunk = 30% raw, double-down 15% = 35% raw)",
+  },
+  {
+    // MINIMUM RETURN 5% ON THE REALIZED EDGE (2026-10-02 night, account
+    // holder's call). Both exchanges and resting bids read this one key.
+    // Every other filter is unchanged: live score required, price reader,
+    // 35-70c band, NHL 45c floor, plausibility gate, daily halt.
+    id: "2026-10-02-min-return-5-shrunk",
+    apply: (c) => { c.minExpectedReturnPct = 5; },
+    note: "minimum expected return 12.5% -> 5% on the shrunk (realized) fair value - about 13-15% on the raw model edge",
   },
 ];
 
