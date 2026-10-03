@@ -129,7 +129,7 @@ export const DEFAULTS = {
   // the bid ticked up one cent. Demonstrated end to end: buy 97c x3, bid moves
   // 96 -> 97, sold at 96c, round trip -9c against -3c for simply holding. The
   // entry band now stops two cents clear of the exit trigger.
-  maxEntryPriceCents: 70,
+  maxEntryPriceCents: 92,      // 2026-10-03: favorites up to 92c (win chance 65%+ rule)
 
   maxPlausibleEdge: 0.18,       // a wider gap than this is a stale feed, not an edge
 
@@ -372,9 +372,12 @@ export const DEFAULTS = {
   // maxDriftPoints away from that side. Both exchanges. Live games unaffected.
   // live (2026-10-01): the same wait for live games - 4 reads over 2+ minutes,
   // fair value may not drop 3+ points (a score against the side restarts it).
+  // 2026-10-03 (account holder): evaluate for 1 minute, enter within 2 -
+  // 3 reads over 1+ minute, the price reader waits at most 2 minutes for the low.
   pregameConfirm: {
-    enabled: true, minScans: 3, minMinutes: 3, maxGapSeconds: 180, maxDriftPoints: 2,
-    live: { enabled: true, minScans: 4, minMinutes: 2, maxGapSeconds: 90, maxDriftPoints: 3 },
+    enabled: true, minScans: 3, minMinutes: 1, maxGapSeconds: 180, maxDriftPoints: 2,
+    live: { enabled: true, minScans: 3, minMinutes: 1, maxGapSeconds: 90, maxDriftPoints: 3 },
+    reader: { enabled: true, toleranceCents: 1, maxWatchMinutes: 2 },
   },
 
   // RESTING BIDS (makerEngine.js). allowLive (2026-10-01): in live games too -
@@ -415,7 +418,7 @@ export const DEFAULTS = {
   // The account's settled live record: 25-80c 80 trades +$57.97 (+25.1% ROI),
   // 35-70c 62 trades +$54.23 (+26.7%) - same return, 18 more trades.
   liveBandMinCents: 35,          // live buys only between these prices (restored 2026-09-30)
-  liveBandMaxCents: 70,
+  liveBandMaxCents: 92,         // 2026-10-03: live favorites up to 92c
   streakBrakeLosses: 4,          // halve the stake after this many straight losses
   survivalStartingSlots: 3,      // positions at once in survival mode until earned
   learnerMinTrades: 8,           // trades a sport/band needs before it can be cut
@@ -441,7 +444,24 @@ export const DEFAULTS = {
   // (about 13-15% on the raw model edge). The account's settled record by
   // expected return at entry shows the higher bar bought nothing extra:
   //   0-5% 28 trades +27% ROI | 5-10% 7 +53% | 10-20% 7 +38% | 20-30% 8 -8% | 30%+ 37 +23%
+  // 2026-10-03: the dip lane's minimum (see lanes below) and the resting
+  // bids' minimum. Trades are bought best expected return first and labelled
+  // by tier (65% / 30% / 15% / 5% / 2%, sportRules.js RETURN_TIERS).
   minExpectedReturnPct: 5,
+
+  // TWO TRADE LANES (2026-10-03, account holder: keep every strategy, priority
+  // on profit) - sportRules.js. Kalshi record by entry price: 35-49c 72 trades
+  // +$35.91; 50-69c 20 trades -$4.67; 70c+ 7 trades -$2.35.
+  //   dip:      35-49c, any win chance, 5% minimum expected return
+  //   favorite: 65%+ to win, up to 92c, 0.5% minimum expected return (any real profit)
+  //   middle:   50-92c under 65% to win, 0.5-8% expected return (8%+ at these
+  //             prices: 4 trades, 1 won, -$12.49; 0-8%: 14 trades, 11 won, +$6.10)
+  // enabled: false switches a lane off.
+  lanes: {
+    dip: { enabled: true, minCents: 35, maxCents: 49, minReturnPct: 5 },
+    favorite: { enabled: true, minWinProbability: 0.65, maxCents: 92, minReturnPct: 0.5 },
+    middle: { enabled: true, minCents: 50, maxCents: 92, minReturnPct: 0.5, maxReturnPct: 8 },
+  },
 
   // STAKE TIERS + DOUBLE-DOWN (2026-09-26, account holder's call) - scaling.js
   //   stakeTiers: equity thresholds. x = multiple of flatStakeDollars,
@@ -683,6 +703,31 @@ const ONE_TIME_UPDATES = [
     id: "2026-10-02-min-return-5-shrunk",
     apply: (c) => { c.minExpectedReturnPct = 5; },
     note: "minimum expected return 12.5% -> 5% on the shrunk (realized) fair value - about 13-15% on the raw model edge",
+  },
+  {
+    // THREE LANES (2026-10-03, account holder's call): the proven dip lane
+    // (35-49c, 5% min), a middle lane (50-92c, 0.5-8%) and a favorite lane (65%+ to win, up to 92c, 0.5% min),
+    // ranked by expected return - best first; evaluate 1 minute, enter within 2.
+    // Both exchanges. Live score, model pricing, NHL floor, plausibility cap
+    // and daily halt unchanged.
+    id: "2026-10-03-three-lanes",
+    apply: (c) => {
+      c.lanes = {
+        dip: { enabled: true, minCents: 35, maxCents: 49, minReturnPct: 5 },
+        favorite: { enabled: true, minWinProbability: 0.65, maxCents: 92, minReturnPct: 0.5 },
+        middle: { enabled: true, minCents: 50, maxCents: 92, minReturnPct: 0.5, maxReturnPct: 8 },
+      };
+      c.minExpectedReturnPct = 5;
+      c.maxEntryPriceCents = 92;
+      c.liveBandMaxCents = 92;
+      c.pregameConfirm = {
+        ...(c.pregameConfirm || {}),
+        enabled: true, minScans: 3, minMinutes: 1,
+        live: { ...((c.pregameConfirm || {}).live || {}), enabled: true, minScans: 3, minMinutes: 1 },
+        reader: { ...((c.pregameConfirm || {}).reader || {}), enabled: true, toleranceCents: 1, maxWatchMinutes: 2 },
+      };
+    },
+    note: "three lanes: dip 35-49c (5% min), middle 50-92c (0.5-8%), favorite 65%+ to win up to 92c (0.5% min); best expected return first (tiers 65/30/15/5/2/0.5%); evaluate 1 min, enter within 2",
   },
 ];
 
