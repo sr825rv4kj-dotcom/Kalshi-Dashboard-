@@ -42,7 +42,7 @@ import { sportDisabled } from "./sportRules.js";
 import { mappedSports } from "./polymarket/pmMarkets.js";
 import { currentCadenceSeconds, describeCadence } from "./cadence.js";
 
-export const LIVE_SCHEDULE_VERSION = "2026-10-01-lead-65m";
+export const LIVE_SCHEDULE_VERSION = "2026-10-02-schedule-fix";
 
 const ODDS_API_BASE = "https://api.the-odds-api.com/v4";
 const REFRESH_MS = 10 * 60 * 1000;
@@ -167,7 +167,7 @@ export async function refreshSchedule(config = {}) {
         return;
       }
       const before = schedule;
-      schedule = { at: Date.now(), sports, activeCount: keys.length, off: [...off] };
+      schedule = { at: Date.now(), sports, activeCount: keys.length, off: keys.filter((k) => sportDisabled(k, config)) };
       lastError = null;
       if (!before) {
         const p = schedulePlan();
