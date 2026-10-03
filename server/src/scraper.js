@@ -177,6 +177,27 @@ export function inTradingWindow(iso, now = Date.now()) {
  * independently, then takes the median across books. One book can be stale or
  * wrong; the median of three rarely is.
  */
+/**
+ * IN-PLAY STALE BOOKS (2026-10-02). Production 01:58Z, every live US game:
+ *
+ *   pittsburgh panthers  sharp 45% (pre-game 47%)  Kalshi 80c  model 94%  (Pitt up 35-24, 18% left)
+ *   virginia tech        sharp 55% (pre-game 53%)  Kalshi 21c  model  6%
+ *   winnipeg jets        sharp 51% (pre-game 52%)  Kalshi 75c  model 79%  (3-2, 33% left)
+ *   calgary stampeders   sharp 32% (pre-game 33%)  Kalshi 65c  model 57%
+ *
+ * The "sharp line" was the PRE-GAME price. The consensus was the median of
+ * every sharp book on the event, and books that stop quoting at kickoff still
+ * return their last pre-game price - while the line's AGE was taken from the
+ * freshest book. One live book made a stale median look fresh. The in-game
+ * model vetoed all of it (correctly - buying Virginia Tech at 21c on a 55%
+ * line would have been a straight loss), so no live US game could trade.
+ *
+ * In play, a book now counts only if its h2h market was updated AFTER
+ * kickoff, and within IN_PLAY_BOOK_SPREAD_S of the freshest book on the
+ * event. A game with no book quoting in play has no live line and is skipped.
+ */
+const IN_PLAY_BOOK_SPREAD_S = 300;
+
 async function fromTheOddsApi(sportKey) {
   const apiKey = process.env.THE_ODDS_API_KEY;
   if (!apiKey) throw tagError(new Error("THE_ODDS_API_KEY not set"), "config");
@@ -208,7 +229,7 @@ async function fromTheOddsApi(sportKey) {
   const quota = { remaining: res.headers.get("x-requests-remaining"), used: res.headers.get("x-requests-used") };
 
   const probabilities = {};
-  const rejected = { noSharpBook: 0, badOverround: 0, outsideWindow: 0 };
+  const rejected = { noSharpBook: 0, badOverround: 0, outsideWindow: 0, noLiveBook: 0 };
 
   for (const event of events) {
     if (!inTradingWindow(event.commence_time)) { rejected.outsideWindow++; continue; }
@@ -230,8 +251,27 @@ async function fromTheOddsApi(sportKey) {
       return Math.max(0, (Date.now() - ms) / 1000);
     };
     const ages = [];
+    const commenceMs = Date.parse(event.commence_time);
+    const isLive = Number.isFinite(commenceMs) && commenceMs < Date.now();
 
-    for (const book of sharpBooks) {
+    // In play: only books quoting the game AS IT IS NOW (see the header).
+    let usable = sharpBooks;
+    if (isLive) {
+      const updatedAfterKickoff = sharpBooks
+        .map((book) => {
+          const h2h = (book.markets || []).find((m) => m.key === "h2h");
+          const ms = Date.parse(h2h?.last_update ?? book?.last_update ?? "");
+          return { book, ms };
+        })
+        .filter((x) => Number.isFinite(x.ms) && x.ms > commenceMs);
+      const freshest = updatedAfterKickoff.length ? Math.max(...updatedAfterKickoff.map((x) => x.ms)) : null;
+      usable = updatedAfterKickoff
+        .filter((x) => freshest - x.ms <= IN_PLAY_BOOK_SPREAD_S * 1000)
+        .map((x) => x.book);
+      if (!usable.length) { rejected.noLiveBook++; continue; }
+    }
+
+    for (const book of usable) {
       const h2h = (book.markets || []).find((m) => m.key === "h2h");
       if (!h2h || !Array.isArray(h2h.outcomes) || h2h.outcomes.length < 2) continue;
 
@@ -256,7 +296,6 @@ async function fromTheOddsApi(sportKey) {
     // that is the one whose price we are really reading.
     const known = ages.filter((a) => a != null);
     const lineAgeSeconds = known.length ? Math.min(...known) : null;
-    const isLive = Date.parse(event.commence_time) < Date.now();
 
     for (const [name, values] of byTeam) {
       const consensus = median(values);
@@ -359,6 +398,7 @@ function describeRejected(providerName, r = {}) {
   if (r.noSharpBook) parts.push(`${r.noSharpBook} with no sharp book`);
   if (r.badOverround) parts.push(`${r.badOverround} with an implausible overround`);
   if (r.noOdds) parts.push(`${r.noOdds} with no odds posted`);
+  if (r.noLiveBook) parts.push(`${r.noLiveBook} in play with no sharp book quoting since kickoff`);
   return parts.length ? `${providerName}: ${parts.join(", ")}` : `${providerName}: nothing on the board`;
 }
 
