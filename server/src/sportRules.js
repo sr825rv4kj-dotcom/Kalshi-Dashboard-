@@ -68,6 +68,29 @@ export function polymarketSportAllowed(sportKey, config = {}) {
 
 export const DEFAULT_PM_ENTRY_SPORTS = ["americanfootball_nfl", "americanfootball_ncaaf"];
 
+/**
+ * MODEL PRICING WHEN THE LINE IS STALE (2026-10-02 night, account holder's
+ * call: "do not skip trades"). In play, when the sharp line and the score
+ * model are more than maxModelDisagreementPoints apart, the line is the stale
+ * one - the betting feed's books trail the game. Instead of skipping, the game
+ * is priced on the score model (built from the pre-game closing line plus the
+ * live score and clock) and goes through every normal gate: price band, the
+ * realized-edge minimum return, the 18% plausibility cap, the price reader.
+ *
+ * Tonight's vetoed games, checked against final scores: the model's side won
+ * Pittsburgh (35-33) and Golden State (77-73); the stale line's side lost on
+ * Virginia Tech.
+ *
+ * Not for soccer: the model has no draw, so it overrates the trailing side
+ * (Gimnasia down 1-0 read 29%). Off with livePricing.modelWhenStale = false.
+ */
+export function modelPricingAllowed(sportKey, config = {}) {
+  const lp = config.livePricing && typeof config.livePricing === "object" ? config.livePricing : {};
+  if (lp.modelWhenStale === false) return false;
+  const excluded = Array.isArray(lp.excludePrefixes) ? lp.excludePrefixes : ["soccer_"];
+  return !excluded.some((p) => String(sportKey || "").startsWith(String(p)));
+}
+
 /** The fair-value shrink factor, clamped to (0, 1]. 1 = no shrink. */
 export function fairShrinkOf(config = {}) {
   const n = Number(config.fairShrink);
