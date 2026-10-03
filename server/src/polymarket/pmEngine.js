@@ -76,9 +76,9 @@ import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, kalshiTeamOnGame, normName, pmPositionsOnGame } from "./pmState.js";
 import { recordFairFromProbabilities } from "../fairValue.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "../swingEngine.js";
-import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
+import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, modelPricingAllowed, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
 
-export const PM_ENGINE_VERSION = "2026-10-02-price-reader";
+export const PM_ENGINE_VERSION = "2026-10-02-model-when-stale";
 export const PM_FEE = 0.0695;
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
@@ -111,7 +111,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -908,7 +908,17 @@ export async function scanPolymarket(config, settings, active) {
               pregameProbability: pregamePrior({ sportKey, teamName: t.name, commenceTime }),
             });
             if (!corr.usable) { skip("pm-unmodellable", "In play, but the game state could not be modelled"); continue; }
-            if (corr.disagreementPoints > (config.maxModelDisagreementPoints ?? 12)) {
+            // MODEL PRICING (same rule as Kalshi, sportRules.js): a stale line is
+            // priced on the score model instead of skipped.
+            let modelPriced = false;
+            if (corr.disagreementPoints > (config.maxModelDisagreementPoints ?? 12) && !addOnHeld && corr.priorSource === "pre-game close" && modelPricingAllowed(sportKey, config)) {
+              modelPriced = true;
+              const staleLine = c.prob;
+              c.prob = corr.modelProbability;
+              at.fairPct = c.prob * 100;
+              c.liveContext = `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ${(frac * 100).toFixed(0)}% left - betting line ${(staleLine * 100).toFixed(0)}% is stale, priced on the score model ${(corr.modelProbability * 100).toFixed(0)}%`;
+              bump("pm-model-priced", `${t.name}: ${c.liveContext}`);
+            } else if (corr.disagreementPoints > (config.maxModelDisagreementPoints ?? 12)) {
               skip("pm-model-disagrees", `Betting line ${(c.prob * 100).toFixed(0)}% vs in-game model ${(corr.modelProbability * 100).toFixed(0)}% (${game.homeScore}-${game.awayScore}, ${(frac * 100).toFixed(0)}% left) - over ${config.maxModelDisagreementPoints ?? 12} points apart, line treated as stale`);
               continue;
             }
@@ -917,9 +927,11 @@ export async function scanPolymarket(config, settings, active) {
               skip("pm-double-down:lead-not-held", `Double-down waits: ${t.name} ${lead.lead > 0 ? `ahead by ${lead.lead} for ${lead.scans} scan(s) / ${lead.minutes.toFixed(1)}m` : "not ahead"} (needs ${dd.leadScans} scans and ${dd.leadMinutes}m)`);
               continue;
             }
-            c.prob = corr.probability;
-            at.fairPct = c.prob * 100;
-            c.liveContext = `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ${(frac * 100).toFixed(0)}% left, model ${(corr.modelProbability * 100).toFixed(0)}%`;
+            if (!modelPriced) {
+              c.prob = corr.probability;
+              at.fairPct = c.prob * 100;
+              c.liveContext = `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ${(frac * 100).toFixed(0)}% left, model ${(corr.modelProbability * 100).toFixed(0)}%`;
+            }
           }
         }
 
