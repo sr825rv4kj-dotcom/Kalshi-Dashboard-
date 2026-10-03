@@ -95,7 +95,7 @@ import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-02-one-venue-per-game";
+export const SCANNER_VERSION = "2026-10-02-price-reader";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -995,13 +995,31 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // minutes without the sharp line drifting away from it.
     // Live games too since 2026-10-01 (pregameConfirm.js, its own settings).
     if (!c.addOn) {
-      const w = observePregame({ venue: "kalshi", gameKey: eventKeyOf(c.ticker), team: c.teamName, fairPct: c.trueProbability * 100, live: c.timing.live === true }, config);
+      // PRICE READER (2026-10-02, pregameConfirm.js): the ask is read on every
+      // scan of the watch; the buy waits for the ask to come back to the low
+      // it read (several takes), and the limit is capped at that low + 1c.
+      const w = observePregame({ venue: "kalshi", gameKey: eventKeyOf(c.ticker), team: c.teamName, fairPct: c.trueProbability * 100, live: c.timing.live === true, askCents }, config);
       if (!w.ready) {
         const code = c.timing.live ? "live-watching" : "pregame-watching";
         bump(code, `${c.ticker}: ${w.why}`);
         feedC(code, w.why);
         rejected.push(`${c.ticker}: ${w.why}`);
         continue;
+      }
+      if (w.maxPriceCents != null && w.maxPriceCents < assessment.limitCents) {
+        const capped = Math.max(askCents, w.maxPriceCents);
+        const feeMult = config.feeMultiplier ?? 0.07;
+        const flatS = Number.isFinite(flatStake) && flatStake > 0 ? flatStake : null;
+        const fairCap = Number.isFinite(assessment.fairUsed) ? assessment.fairUsed : c.trueProbability;
+        const n = flatS ? flatBetContracts(flatS, capped, feeMult) : assessment.sizing.contracts;
+        const ev = fairCap * 100 - capped - feePerContractCents(capped, n, feeMult);
+        assessment.limitCents = capped;
+        assessment.walkupCents = capped - askCents;
+        assessment.sizing.contracts = n;
+        assessment.edgeCheck.evCents = ev;
+        assessment.edgeCheck.observedEdge = fairCap - capped / 100;
+        assessment.edgeCheck.evTradeCents = ev * n;
+        assessment.sizing.dollarsAtRisk = n * (capped + feePerContractCents(capped, n, feeMult)) / 100;
       }
     }
 
