@@ -88,14 +88,14 @@ import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame } from "./polymarket/pmState.js";
-import { fairShrinkOf, shrinkFair, modelPricingAllowed } from "./sportRules.js";
+import { fairShrinkOf, shrinkFair, modelPricingAllowed, laneFor, laneMiss, returnTierOf } from "./sportRules.js";
 import { noteDecision, noteScan } from "./scanFeed.js";
 import { getTradeLifecycles, filterByVenue } from "./tradeLedgerStore.js";
 import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-02-model-when-stale";
+export const SCANNER_VERSION = "2026-10-03-three-lanes";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -827,6 +827,20 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       continue;
     }
 
+    // THREE LANES (2026-10-03, sportRules.js): dip (35-49c, 5% minimum),
+    // middle (50-92c, 2-8% expected return) and favorite (65%+ to win, up to
+    // 92c, 2% minimum). A side that fits none is not bought. A double-down keeps
+    // the lane rules of an ordinary entry at its own price.
+    const lane = laneFor({ winProbability: c.trueProbability, askCents }, config);
+    if (!lane) {
+      const line = `${c.ticker}: ${laneMiss({ winProbability: c.trueProbability, askCents }, config)}`;
+      ddBump("no-lane", line);
+      rejected.push(line);
+      await dropResting(c.ticker, "fits no trade lane");
+      continue;
+    }
+    c.lane = lane;
+
     // A wide book means the quoted ask is not a price anyone is trading at,
     // and any edge measured against it is measurement error.
     if (maxSpread && c.pricing.spreadCents != null && c.pricing.spreadCents > maxSpread) {
@@ -912,9 +926,13 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       // win 15c, and the in-game model is a few points coarse - the Angels
       // position (85c -> 4c) erased several small wins in one move. Pre-game
       // keeps the full band.
-      maxEntryPriceCents: c.timing.live
-        ? Math.min(config.maxEntryPriceCents ?? 88, config.liveBandMaxCents ?? config.maxLiveEntryPriceCents ?? 80)
-        : (config.maxEntryPriceCents ?? 88),
+      // Capped by the lane too: the dip lane never walks its limit above 49c.
+      maxEntryPriceCents: Math.min(
+        c.timing.live
+          ? Math.min(config.maxEntryPriceCents ?? 88, config.liveBandMaxCents ?? config.maxLiveEntryPriceCents ?? 80)
+          : (config.maxEntryPriceCents ?? 88),
+        c.lane?.maxCents ?? 100,
+      ),
       minEvCentsPerContract: config.minEvCentsPerContract ?? 0,
       minEvCentsPerTrade: config.minEvCentsPerTrade ?? 1,
       maxWalkupCents: config.maxWalkupCents ?? 4,
@@ -959,9 +977,11 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // nearly gone, so the check is applied to the price the order can actually
     // fill at, not just to the ask. If even the ask does not return the
     // minimum, the trade is skipped.
+    // Each lane carries its own minimum (dip 5%, favorite 2%, sportRules.js).
+    const laneMin = Number.isFinite(Number(c.lane?.minReturnPct)) ? Number(c.lane.minReturnPct) : Number(config.minExpectedReturnPct ?? 10);
     const minReturnPct = c.addOn
-      ? Math.max(Number(config.minExpectedReturnPct ?? 10), Number(ddConfig.minReturnPct ?? 35))
-      : Number(config.minExpectedReturnPct ?? 10);
+      ? Math.max(laneMin, Number(ddConfig.minReturnPct ?? 35))
+      : laneMin;
     if (minReturnPct > 0) {
       const flat = Number.isFinite(flatStake) && flatStake > 0 ? flatStake : null;
       const countAt = (px) => (flat ? flatBetContracts(flat, px, config.feeMultiplier ?? 0.07) : assessment.sizing.contracts);
@@ -990,6 +1010,18 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         } else {
           await dropResting(c.ticker, "expected return under the minimum");
         }
+        continue;
+      }
+      // MIDDLE LANE CEILING (sportRules.js): at 50-92c an expected return
+      // above maxReturnPct at the ask has been a bad line on this account
+      // (4 trades, 1 won, -$12.49) - refused, not bought.
+      if (Number.isFinite(c.lane?.maxReturnPct) && returnAt(askCents).pct > c.lane.maxReturnPct) {
+        const r = returnAt(askCents);
+        const line = `${c.ticker} ${askCents}c (sharp ${(c.trueProbability * 100).toFixed(1)}%): middle lane - expected return ` +
+          `${r.pct.toFixed(1)}% is above the ${c.lane.maxReturnPct}% ceiling; at this price a gap that size has been a bad line`;
+        ddBump("middle-edge-too-good", line);
+        rejected.push(line);
+        await dropResting(c.ticker, "middle-lane edge above the ceiling");
         continue;
       }
       if (limit !== assessment.limitCents) {
@@ -1075,7 +1107,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       : `, limit ${assessment.limitCents}c`;
     appendLog(
       (c.addOn ? "DOUBLE-DOWN " : "") +
-      `Candidate ${c.ticker} (${c.teamName}): sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ` +
+      `Candidate ${c.ticker} (${c.teamName}) [${c.lane?.name ?? "?"} lane, ${returnTierOf((assessment.edgeCheck.evCents / assessment.limitCents) * 100) ?? "below tiers"}]: sharp ${(c.trueProbability * 100).toFixed(1)}% vs ${askCents}c ` +
       `[${c.pricing.source}]${walk}, edge ${(assessment.edgeCheck.observedEdge * 100).toFixed(1)}% at the limit, ` +
       `EV ${assessment.edgeCheck.evCents.toFixed(1)}c/contract (${assessment.edgeCheck.evTradeCents.toFixed(1)}c the trade), ` +
       `${assessment.sizing.contracts} contracts (max $${assessment.sizing.dollarsAtRisk.toFixed(2)}, ` +
