@@ -24,6 +24,15 @@
  *     is SELL_SHORT at 1 - q. Polymarket must accept a PREVIEW of each sell
  *     intent (validated, never executed) before the first real sell.
  *
+ * MIRROR KALSHI (2026-10-03, account holder's call - replaces "one venue per
+ * game" below while polymarket.mirrorKalshi is on). Polymarket makes no
+ * decisions of its own: every Kalshi position is copied - the same team in the
+ * same game, any sport Polymarket lists - once, at a price no more than
+ * mirrorMaxExtraCents (2c) above Kalshi's fill, sized by Polymarket's own
+ * stake tiers ($2.50 under $50 equity, $5 at $50 and up from there) and cash, its own open cap
+ * and daily halt. Kalshi's scan, lanes, model and waiting period made the
+ * call; Polymarket only checks that its price is no worse.
+ *
  * ONE VENUE PER GAME (2026-10-02, replaces "same trades on both"). Buying
  * the same side on both exchanges doubled the risk on TOR, Auger-Aliassime
  * and McNally - all three lost twice, -$26.96. A game Kalshi holds (a
@@ -78,8 +87,10 @@ import { recordFairFromProbabilities } from "../fairValue.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "../swingEngine.js";
 import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, modelPricingAllowed, laneFor, laneMiss, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
 
-export const PM_ENGINE_VERSION = "2026-10-03-three-lanes";
+export const PM_ENGINE_VERSION = "2026-10-03-mirror-kalshi";
 export const PM_FEE = 0.0695;
+/** Polymarket's stake tiers on a $2.50 base: $5 at $50, $7.50 at $100 ... 3% from $1,000. */
+export const PM_STAKE_TIERS = [{ at: 0, x: 1 }, { at: 50, x: 2 }, { at: 100, x: 3 }, { at: 150, x: 4 }, { at: 300, x: 6 }, { at: 500, x: 10 }, { at: 1000, pct: 0.03 }];
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
 const SELF_CHECK_RETRY_MS = 5 * 60 * 1000;
@@ -92,8 +103,33 @@ export function pmSettings(config = {}) {
     trading: "auto",        // "auto" | "on" | "off"
     shortSide: "auto",      // "auto" | "on" | "off"
     entrySports: DEFAULT_PM_ENTRY_SPORTS,   // [] = every sport
+    // MIRROR KALSHI (2026-10-03, account holder's call): Polymarket buys only
+    // what Kalshi has bought - the same team in the same game - at a price no
+    // more than mirrorMaxExtraCents above what Kalshi paid. false = Polymarket
+    // runs its own scan again.
+    mirrorKalshi: true,
+    mirrorMaxExtraCents: 2,
     ...(config.polymarket && typeof config.polymarket === "object" ? config.polymarket : {}),
   };
+}
+
+/** The Kalshi position held on this game (filled, not a resting bid), or null. */
+function kalshiPositionOnGame({ sportKey, commenceTime, teamNames }) {
+  const names = new Set((teamNames || []).map(normName).filter(Boolean));
+  if (!names.size) return null;
+  let positions = [];
+  try { positions = loadState().positions || []; } catch { positions = []; }
+  const want = Date.parse(commenceTime);
+  return positions.find((p) => {
+    if (p.sportKey && p.sportKey !== sportKey) return false;
+    if (!names.has(normName(p.teamName))) return false;
+    const at = Date.parse(p.commenceTime);
+    return Number.isFinite(at) && Number.isFinite(want) ? Math.abs(at - want) < 3 * 60 * 60 * 1000 : false;
+  }) || null;
+}
+
+function mirrorOn(config = {}) {
+  return pmSettings(config).mirrorKalshi !== false;
 }
 
 function tradingActive(settings, meta) {
@@ -111,7 +147,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", "2026-10-02-model-when-stale", "2026-10-03-two-lanes", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", "2026-10-02-model-when-stale", "2026-10-03-two-lanes", "2026-10-03-three-lanes", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -572,6 +608,8 @@ async function linesForCycle(config) {
 
   let active = [];
   try { active = await activeOddsSports(); } catch { active = []; }
+  let kalshiHeldSports = new Set();
+  try { kalshiHeldSports = new Set((loadState().positions || []).map((p) => p.sportKey).filter(Boolean)); } catch { kalshiHeldSports = new Set(); }
   const now = Date.now();
   let priorsSeen = false;
   const plan = schedulePlan(now);
@@ -583,8 +621,10 @@ async function linesForCycle(config) {
   for (const sportKey of active) {
     if (out.has(sportKey) || sportDisabled(sportKey, config)) continue;
     // Not on the Polymarket trade list: no odds call and no Polymarket reads
-    // for it (fewer 429s on the reads that matter).
-    if (!polymarketSportAllowed(sportKey, config)) continue;
+    // for it (fewer 429s on the reads that matter). While mirroring Kalshi,
+    // every sport Kalshi holds a position in is read, so it can be copied
+    // even when Kalshi's own scan of that sport is paused (at its cap).
+    if (!polymarketSportAllowed(sportKey, config) && !(mirrorOn(config) && kalshiHeldSports.has(sportKey))) continue;
     if (!shouldScanSport(sportKey, plan)) continue;          // nothing live or within LEAD_MS (65 minutes)
     let slugs = [];
     try { slugs = await leagueSlugsFor(sportKey); } catch { continue; }
@@ -727,7 +767,16 @@ export async function scanPolymarket(config, settings, active) {
   if (paused) bump("pm-paused-after-failures", `until ${meta.pausedUntil}`);
 
   if (account) noteEquity("polymarket", equity);
-  const stakeDecision = tieredStake(config, equity);
+  // Polymarket's own stake tiers (polymarket.flatStakeDollars + stakeTiers):
+  // $2.50 under $50 equity, $5 at $50, $7.50 at $100, $10 at $150, $15 at $300,
+  // $25 at $500, 3% of equity from $1,000. Same losing-streak brake as Kalshi.
+  const pmSet = pmSettings(config);
+  const pmBase = Number(pmSet.flatStakeDollars);
+  const stakeDecision = tieredStake({
+    ...config,
+    flatStakeDollars: pmBase > 0 ? pmBase : 2.5,
+    stakeTiers: Array.isArray(pmSet.stakeTiers) && pmSet.stakeTiers.length ? pmSet.stakeTiers : PM_STAKE_TIERS,
+  }, equity);
   const brake = streakStakeFactor(config);
   const stake = Number(stakeDecision.stake) * brake.factor;
   // OPEN-TRADE CAP BY BALANCE (2026-09-28): the same rule as Kalshi, read from
@@ -758,7 +807,7 @@ export async function scanPolymarket(config, settings, active) {
     // Switched-off sports and sports off the Polymarket trade list get no new
     // buys here (sportRules.js). Held positions are managed elsewhere.
     if (sportDisabled(sportKey, baseConfig)) { bump("pm-sport-off", sportKey); continue; }
-    if (!polymarketSportAllowed(sportKey, baseConfig)) { bump("pm-not-on-trade-list", sportKey); continue; }
+    if (!mirrorOn(baseConfig) && !polymarketSportAllowed(sportKey, baseConfig)) { bump("pm-not-on-trade-list", sportKey); continue; }
     // Per-sport price floor (NHL 45c) - sportRules.js withSportRules.
     const config = withSportRules(baseConfig, sportKey);
     let slugs = [];
@@ -785,7 +834,7 @@ export async function scanPolymarket(config, settings, active) {
       if (!timing.live && !timing.ok) { bump("pm-window"); continue; }
       // MODELLED SPORTS ONLY: no calibrated in-game model, no new buy (held
       // positions are still managed and sold by the swing engine).
-      if (timing.live && !entryAllowedForSport(sportKey, config)) {
+      if (!mirrorOn(config) && timing.live && !entryAllowedForSport(sportKey, config)) {
         bump("pm-no-model", `${teamNames.join(" vs ")} (${sportKey})`);
         for (const n of teamNames) feed({ sportKey, team: n, opponent: teamNames.find((x) => x !== n), commenceTime, code: "pm-no-model", why: "This sport is not on the trade list - only sports with a proven record are bought" });
         continue;
@@ -799,6 +848,11 @@ export async function scanPolymarket(config, settings, active) {
       // on the same team once that team has led for doubleDown.leadScans scans
       // and leadMinutes minutes, at doubleDown.minReturnPct or better.
       let addOnHeld = null;
+      if (mirrorOn(config) && heldOnPolymarket({ sportKey, commenceTime, teamNames })) {
+        bump("pm-already-held", teamNames.join(" vs "));
+        for (const n of teamNames) feed({ sportKey, team: n, opponent: teamNames.find((x) => x !== n), commenceTime, code: "pm-already-held", why: "Already mirrored on Polymarket" });
+        continue;
+      }
       if (heldOnPolymarket({ sportKey, commenceTime, teamNames })) {
         const dd = doubleDownConfig(config);
         const onGame = pmPositionsOnGame({ sportKey, commenceTime, teamNames });
@@ -812,9 +866,17 @@ export async function scanPolymarket(config, settings, active) {
         }
       }
       const kalshiTeam = kalshiTeamOnGame({ sportKey, commenceTime, teamNames, restingOrders: resting });
-      // ONE VENUE PER GAME: Kalshi holds this game (either team) - not bought
-      // here, and no Polymarket double-down on a game Kalshi also holds.
-      if (kalshiTeam) {
+      // MIRROR KALSHI: only a game Kalshi holds a filled position on is bought,
+      // and only on Kalshi's team.
+      const mirrorPos = mirrorOn(config) ? kalshiPositionOnGame({ sportKey, commenceTime, teamNames }) : null;
+      if (mirrorOn(config) && !mirrorPos) {
+        bump("pm-mirror-waiting", teamNames.join(" vs "));
+        for (const n of teamNames) feed({ sportKey, team: n, opponent: teamNames.find((x) => x !== n), commenceTime, code: "pm-mirror-waiting", why: "Mirroring Kalshi - Polymarket buys this game only after Kalshi does" });
+        continue;
+      }
+      // ONE VENUE PER GAME (mirror off): Kalshi holds this game (either team) -
+      // not bought here, and no Polymarket double-down on a game Kalshi holds.
+      if (!mirrorOn(config) && kalshiTeam) {
         bump("pm-held-on-kalshi", teamNames.join(" vs "));
         for (const n of teamNames) feed({ sportKey, team: n, opponent: teamNames.find((x) => x !== n), commenceTime, code: "pm-held-on-kalshi", why: `Kalshi already holds ${kalshiTeam} in this game - one exchange per game` });
         continue;
@@ -854,6 +916,7 @@ export async function scanPolymarket(config, settings, active) {
           feed({ sportKey, team: t.name, opponent: opp, commenceTime, verdict, code, why, ...at });
         };
         if (addOnHeld && normName(t.name) !== normName(addOnHeld.teamName)) continue;   // add-on: the held team only
+        if (mirrorPos && normName(t.name) !== normName(mirrorPos.teamName)) continue;    // mirror: Kalshi's team only
         const side = winnerSideFor(ev, t.name);
         if (!side.ok) { skip(side.code, side.reason); continue; }
         // Add-on: exactly the market and side already held (Kalshi: same ticker).
@@ -880,6 +943,27 @@ export async function scanPolymarket(config, settings, active) {
         const maxSpread = config.maxSpreadCents ?? 25;
         if (maxSpread && px.spreadCents != null && px.spreadCents > maxSpread) { skip("pm-spread-too-wide", `Bid-ask spread ${px.spreadCents}c is over the ${maxSpread}c limit`); continue; }
 
+        let assessment = null;
+        let countAt = null;
+        let returnAt = null;
+        let limit = null;
+        const bankroll = account?.buyingPower ?? 0;
+        if (mirrorPos) {
+          // MIRROR: Kalshi's scan made the decision; only the price is checked.
+          const kEntry = Math.round(Number(mirrorPos.entryPriceCents));
+          const cap = Math.min(kEntry + Number(pmSettings(config).mirrorMaxExtraCents ?? 2), Number(config.maxEntryPriceCents ?? 92), 99);
+          if (!(askCents <= cap)) {
+            skip("pm-mirror-price", `Kalshi bought ${t.name} at ${kEntry}c; Polymarket ask ${askCents}c is above the ${cap}c mirror limit - waiting for the price`);
+            continue;
+          }
+          limit = cap;
+          countAt = (p) => flatBetContracts(stake, p, PM_FEE);
+          returnAt = (p) => {
+            const ev = c.prob * 100 - p - feePerContractCents(p, countAt(p), PM_FEE);
+            return { ev, pct: (ev / p) * 100 };
+          };
+          c.liveContext = `mirroring Kalshi ${mirrorPos.ticker} (${mirrorPos.contracts}x @ ${kEntry}c)`;
+        } else {
         // In-game model, exactly as the Kalshi scan does it.
         if (timing.live) {
           if (!paramsFor(sportKey, { allowGeneric: !!entryAllowedForSport(sportKey, config) })) { skip("pm-no-model", "No in-game model for this sport, so a stale line can't be detected"); continue; }
@@ -942,8 +1026,7 @@ export async function scanPolymarket(config, settings, active) {
         const learned = learnedBlock({ sportKey, priceCents: askCents }, config);
         if (learned.blocked) { skip("pm-learned-block", learned.reason); continue; }
 
-        const bankroll = account?.buyingPower ?? 0;
-        const assessment = assessOpportunity({
+        assessment = assessOpportunity({
           bankroll, trueProbability: c.prob, price: askCents / 100, restingContracts: px.askSize,
           multiplier: PM_FEE, kellyFraction: config.kellyFraction, minLiquidity: config.minLiquidity ?? 0,
           maxRiskPctPerTrade: config.maxRiskPctPerTrade ?? 0.20, maxStakeDollars: null,
@@ -973,14 +1056,13 @@ export async function scanPolymarket(config, settings, active) {
         const minReturnPct = addOnHeld
           ? Math.max(Number(lane.minReturnPct), Number(doubleDownConfig(config).minReturnPct ?? 35))
           : Number(lane.minReturnPct);
-        const countAt = (p) => flatBetContracts(stake, p, PM_FEE);
+        countAt = (p) => flatBetContracts(stake, p, PM_FEE);
         // Expected return on the SHRUNK fair value (sportRules.js fairShrink).
         const fairP = Number.isFinite(assessment.fairUsed) ? assessment.fairUsed : c.prob;
-        const returnAt = (p) => {
+        returnAt = (p) => {
           const ev = fairP * 100 - p - feePerContractCents(p, countAt(p), PM_FEE);
           return { ev, pct: (ev / p) * 100 };
         };
-        let limit = null;
         for (let p = assessment.limitCents; p >= askCents; p--) if (returnAt(p).pct >= minReturnPct) { limit = p; break; }
         // MIDDLE LANE CEILING (same rule as Kalshi, sportRules.js).
         if (limit != null && Number.isFinite(lane.maxReturnPct) && returnAt(askCents).pct > lane.maxReturnPct) {
@@ -1002,6 +1084,7 @@ export async function scanPolymarket(config, settings, active) {
           if (!w.ready) { skip(timing.live ? "pm-live-watching" : "pm-pregame-watching", w.why); continue; }
           if (w.maxPriceCents != null && w.maxPriceCents < limit) limit = Math.max(askCents, w.maxPriceCents);
         }
+        }   // end of Polymarket's own entry rules (skipped while mirroring Kalshi)
         let contracts = countAt(limit);
         const perContract = (limit + feePerContractCents(limit, contracts, PM_FEE)) / 100;
         if (contracts * perContract > bankroll) contracts = Math.floor(bankroll / perContract);
@@ -1010,7 +1093,7 @@ export async function scanPolymarket(config, settings, active) {
         const r = returnAt(limit);
         const dollarsIn = contracts * perContract;
         const reason =
-          `Polymarket: ${addOnHeld ? "DOUBLE-DOWN " : ""}${timing.live ? "In-play" : "Pre-game"} edge on "${t.name}"${kalshiTeam ? " (same trade as Kalshi)" : ""} ` +
+          `Polymarket: ${mirrorPos ? "MIRROR of Kalshi - " : ""}${addOnHeld ? "DOUBLE-DOWN " : ""}${timing.live ? "In-play" : "Pre-game"} ${mirrorPos ? "buy" : "edge"} on "${t.name}"${kalshiTeam && !mirrorPos ? " (same trade as Kalshi)" : ""} ` +
           `(sharp ${(c.prob * 100).toFixed(1)}% vs $${(askCents / 100).toFixed(2)} ask, limit $${(limit / 100).toFixed(2)}, ` +
           `${contracts} contracts, $${dollarsIn.toFixed(2)} in, expected +$${((r.ev * contracts) / 100).toFixed(2)} (${r.pct.toFixed(1)}%))` +
           (c.liveContext ? ` | ${c.liveContext}` : "");
@@ -1092,7 +1175,7 @@ export async function scanPolymarket(config, settings, active) {
           }
           recordTrade({
             action: "enter", ticker, side: side.long ? "yes" : "no", contracts, priceCents: result.fillCents, filled,
-            reason, edgePct: assessment.edgeCheck?.observedEdge != null ? assessment.edgeCheck.observedEdge * 100 : null,
+            reason, edgePct: assessment?.edgeCheck?.observedEdge != null ? assessment.edgeCheck.observedEdge * 100 : null,
             environment: "production", teamName: t.name, sportKey, commenceTime, feeCents: entryFeeCents,
             lotId: openedAt,
           });
