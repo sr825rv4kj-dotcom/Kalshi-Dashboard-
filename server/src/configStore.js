@@ -383,7 +383,7 @@ export const DEFAULTS = {
   // RESTING BIDS (makerEngine.js). allowLive (2026-10-01): in live games too -
   // a bid at the price that returns minExpectedReturnPct, max 2 at once, half
   // stake, 5-minute life, re-confirmed every scan.
-  maker: { enabled: true, allowLive: true },
+  maker: { enabled: true, allowLive: true, liveStakeFactor: 1 },   // 2026-10-03 night: resting bids full stake (was half)
 
   // MODELLED SPORTS ONLY (2026-09-30): new live buys only in sports with a
   // calibrated in-game model (liveModel.js SPORT_PARAMS). Tennis, preseason and
@@ -411,7 +411,7 @@ export const DEFAULTS = {
   //   flatStakeDollars: every entry sized to this stake (null = old sizing)
   //   minExpectedReturnPct: skip any trade expected to return less than this
   //     percent of what it risks, after fees (10%, account holder's call)
-  flatStakeDollars: 5,
+  flatStakeDollars: 8,          // 2026-10-03 night: $5 -> $8 (account holder: bigger Kalshi bets)
 
   // LEARNING + WIN-RATE FOCUS (2026-09-25) - see outcomeLearner.js
   // 2026-09-29: 35-70c -> 25-80c (account holder: live games get traded).
@@ -493,7 +493,10 @@ export const DEFAULTS = {
   // 2026-10-02: entrySports - new Polymarket buys only in these sports
   // (Kalshi's settled winners: NFL 13-6 +$31.64, NCAAF +$14.33). [] = all.
   // A game held on one exchange is never bought on the other.
-  polymarket: { enabled: true, trading: "auto", shortSide: "auto", entrySports: ["americanfootball_nfl", "americanfootball_ncaaf"] },
+  polymarket: { enabled: true, trading: "auto", shortSide: "auto", entrySports: ["americanfootball_nfl", "americanfootball_ncaaf"], mirrorKalshi: true, mirrorMaxExtraCents: 2, flatStakeDollars: 2.5,
+    // Polymarket stake tiers (2026-10-03 night, account holder): $2.50 under $50,
+    // $5 at $50, $7.50 at $100, $10 at $150, $15 at $300, $25 at $500, 3% from $1,000.
+    stakeTiers: [{ at: 0, x: 1 }, { at: 50, x: 2 }, { at: 100, x: 3 }, { at: 150, x: 4 }, { at: 300, x: 6 }, { at: 500, x: 10 }, { at: 1000, pct: 0.03 }] },
 
   // IN-GAME SWING TRADING (2026-09-29, account holder's plan) - swingEngine.js.
   // Buy the dip (price under what the score and clock say the team is worth),
@@ -728,6 +731,23 @@ const ONE_TIME_UPDATES = [
       };
     },
     note: "three lanes: dip 35-49c (5% min), middle 50-92c (0.5-8%), favorite 65%+ to win up to 92c (0.5% min); best expected return first (tiers 65/30/15/5/2/0.5%); evaluate 1 min, enter within 2",
+  },
+  {
+    // BIGGER KALSHI BETS + POLYMARKET MIRRORS KALSHI (2026-10-03 night,
+    // account holder's call). Kalshi: base stake $5 -> $8 (tiers scale from it:
+    // $12 at $75 equity, $16 at $150 ...) and live resting bids at the full
+    // stake instead of half - nothing else on Kalshi changes. Polymarket: copies
+    // every Kalshi position (same team, same game) at no more than 2c above
+    // Kalshi's fill, on its own stake tiers ($2.50 under $50, $5 at $50, $7.50
+    // at $100, $10 at $150, $15 at $300, $25 at $500, 3% from $1,000). The losing-streak brake
+    // (half stake after 4 straight losses) still applies to both.
+    id: "2026-10-03-kalshi-8-pm-mirror",
+    apply: (c) => {
+      c.flatStakeDollars = 8;
+      c.maker = { ...(c.maker || {}), liveStakeFactor: 1 };
+      c.polymarket = { ...DEFAULTS.polymarket, ...(c.polymarket || {}), mirrorKalshi: true, mirrorMaxExtraCents: 2, flatStakeDollars: 2.5, stakeTiers: [{ at: 0, x: 1 }, { at: 50, x: 2 }, { at: 100, x: 3 }, { at: 150, x: 4 }, { at: 300, x: 6 }, { at: 500, x: 10 }, { at: 1000, pct: 0.03 }] };
+    },
+    note: "Kalshi base stake $8 (was $5), resting bids full stake; Polymarket mirrors every Kalshi position (same team, <= 2c above Kalshi's price), Polymarket stake $2.50 under $50 equity, $5 at $50, $7.50 at $100, $10 at $150, $15 at $300, $25 at $500, 3% from $1,000",
   },
 ];
 
