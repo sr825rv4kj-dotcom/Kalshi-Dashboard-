@@ -25,6 +25,7 @@
 import fs from "fs";
 import path from "path";
 import { CONFIG_DIR } from "./paths.js";
+import { atomicWriteFileSync } from "./stateStore.js";
 
 const CONFIG_PATH = path.join(CONFIG_DIR, "bot-config.json");
 
@@ -546,7 +547,9 @@ function readRaw() {
 
 function writeRaw(obj) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(obj, null, 2));
+  // 2026-10-04: temp file + rename - a restart mid-write can never leave a
+  // half-written config (which would read as {} and wipe dashboard settings).
+  atomicWriteFileSync(CONFIG_PATH, JSON.stringify(obj, null, 2));
 }
 
 /**
