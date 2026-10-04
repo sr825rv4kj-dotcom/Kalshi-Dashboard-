@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { DATA_DIR } from "./paths.js";
+import { atomicWriteFileSync } from "./stateStore.js";
 
 const LEDGER_PATH = path.join(DATA_DIR, "trade-ledger.json");
 
@@ -58,7 +59,7 @@ function exitFeeCents(row) {
 function ensureFile() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(LEDGER_PATH)) {
-    fs.writeFileSync(LEDGER_PATH, JSON.stringify([], null, 2));
+    atomicWriteFileSync(LEDGER_PATH, JSON.stringify([], null, 2));
   }
 }
 
@@ -67,8 +68,10 @@ export function loadLedger() {
   return JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8"));
 }
 
+// 2026-10-04: temp file + rename, so a restart mid-write can never leave a
+// half-written ledger (the same failure that broke state.json).
 function writeLedger(ledger) {
-  fs.writeFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2));
+  atomicWriteFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2));
 }
 
 export function recordTrade({
