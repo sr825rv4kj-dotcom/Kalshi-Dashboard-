@@ -95,7 +95,7 @@ import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-03-three-lanes";
+export const SCANNER_VERSION = "2026-10-05-soccer-fresh-line";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -693,6 +693,20 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
               `betting line ${(staleLine * 100).toFixed(0)}% is stale, priced on the score model ${(corr.modelProbability * 100).toFixed(0)}% ` +
               `(pre-game ${(corr.prior * 100).toFixed(0)}%, ${priorNote})`;
             bump("model-priced", `${c.teamName}: ${c.liveContext}`);
+            return true;
+          }
+          // SOCCER WITH A FRESH LINE (2026-10-05). The score model has no draw,
+          // so in soccer it is the model that is wrong, not the line: Cordoba
+          // up 2-1 at half read 55% on the model against a 72% line and a 75c
+          // Kalshi price. A soccer line updated within the last 5 minutes is
+          // live - it is traded on the sharp price instead of vetoed. A soccer
+          // line older than that, or of unknown age, is still vetoed.
+          if (corr.disagreementPoints > maxDisagree && !c.addOn && !modelPricingAllowed(sportKey, config) &&
+              Number.isFinite(Number(c.lineAgeSeconds)) && c.lineAgeSeconds != null && Number(c.lineAgeSeconds) <= 300) {
+            c.liveContext =
+              `${game.homeTeam} ${game.homeScore}-${game.awayScore} ${game.awayTeam}, ${(frac * 100).toFixed(0)}% left - ` +
+              `soccer: line updated ${Math.round(Number(c.lineAgeSeconds))}s ago is live, traded on the sharp price ` +
+              `(the no-draw score model reads ${(corr.modelProbability * 100).toFixed(0)}%)`;
             return true;
           }
           if (corr.disagreementPoints > maxDisagree) {
