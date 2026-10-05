@@ -87,10 +87,10 @@ import { recordFairFromProbabilities } from "../fairValue.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "../swingEngine.js";
 import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, modelPricingAllowed, laneFor, laneMiss, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
 
-export const PM_ENGINE_VERSION = "2026-10-03-mirror-kalshi";
+export const PM_ENGINE_VERSION = "2026-10-05-mirror-same-price";
 export const PM_FEE = 0.0695;
-/** Polymarket's stake tiers on a $2.50 base: $5 at $50, $7.50 at $100 ... 3% from $1,000. */
-export const PM_STAKE_TIERS = [{ at: 0, x: 1 }, { at: 50, x: 2 }, { at: 100, x: 3 }, { at: 150, x: 4 }, { at: 300, x: 6 }, { at: 500, x: 10 }, { at: 1000, pct: 0.03 }];
+/** Polymarket's stake tiers on a $3.50 base: $5 at $50, $7.50 at $100, $10 at $150, $15 at $300, $25 at $500, 3% from $1,000. */
+export const PM_STAKE_TIERS = [{ at: 0, x: 1 }, { at: 50, x: 10 / 7 }, { at: 100, x: 15 / 7 }, { at: 150, x: 20 / 7 }, { at: 300, x: 30 / 7 }, { at: 500, x: 50 / 7 }, { at: 1000, pct: 0.03 }];
 
 const SELF_CHECK_EVERY_MS = 30 * 60 * 1000;
 const SELF_CHECK_RETRY_MS = 5 * 60 * 1000;
@@ -109,6 +109,14 @@ export function pmSettings(config = {}) {
     // runs its own scan again.
     mirrorKalshi: true,
     mirrorMaxExtraCents: 2,
+    // MIRROR = THE SAME TRADE (2026-10-05). Copied only within mirrorMaxMinutes
+    // of Kalshi's fill and at no more than mirrorMaxBelowCents under Kalshi's
+    // price. Production 2026-10-05: Belgium bought on Kalshi at 41c was copied
+    // at 15c ten minutes later (the game had turned), Riestra 68c on Kalshi was
+    // copied at 47c - a price that far from Kalshi's is a different situation,
+    // not the same trade.
+    mirrorMaxMinutes: 10,
+    mirrorMaxBelowCents: 5,
     ...(config.polymarket && typeof config.polymarket === "object" ? config.polymarket : {}),
   };
 }
@@ -147,7 +155,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", "2026-10-02-model-when-stale", "2026-10-03-two-lanes", "2026-10-03-three-lanes", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", "2026-10-02-model-when-stale", "2026-10-03-two-lanes", "2026-10-03-three-lanes", "2026-10-03-mirror-kalshi", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -951,9 +959,21 @@ export async function scanPolymarket(config, settings, active) {
         if (mirrorPos) {
           // MIRROR: Kalshi's scan made the decision; only the price is checked.
           const kEntry = Math.round(Number(mirrorPos.entryPriceCents));
-          const cap = Math.min(kEntry + Number(pmSettings(config).mirrorMaxExtraCents ?? 2), Number(config.maxEntryPriceCents ?? 92), 99);
+          const ms = pmSettings(config);
+          const cap = Math.min(kEntry + Number(ms.mirrorMaxExtraCents ?? 2), Number(config.maxEntryPriceCents ?? 92), 99);
+          const floorPx = kEntry - Number(ms.mirrorMaxBelowCents ?? 5);
+          const ageMin = (Date.now() - Date.parse(mirrorPos.openedAt)) / 60000;
+          const maxMin = Number(ms.mirrorMaxMinutes ?? 10);
+          if (Number.isFinite(ageMin) && maxMin > 0 && ageMin > maxMin) {
+            skip("pm-mirror-too-late", `Kalshi bought ${t.name} ${ageMin.toFixed(0)} min ago - mirrors are only taken within ${maxMin} min of Kalshi's fill`);
+            continue;
+          }
           if (!(askCents <= cap)) {
             skip("pm-mirror-price", `Kalshi bought ${t.name} at ${kEntry}c; Polymarket ask ${askCents}c is above the ${cap}c mirror limit - waiting for the price`);
+            continue;
+          }
+          if (askCents < floorPx) {
+            skip("pm-mirror-price-off", `Kalshi bought ${t.name} at ${kEntry}c; Polymarket ask ${askCents}c is more than ${kEntry - floorPx}c lower - a different situation, not the same trade`);
             continue;
           }
           limit = cap;
