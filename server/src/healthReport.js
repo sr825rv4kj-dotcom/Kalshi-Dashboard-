@@ -29,9 +29,10 @@
 
 import { loadState } from "./stateStore.js";
 import { loadConfig } from "./configStore.js";
+import { schedulePlan } from "./liveSchedule.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 
-export const HEALTH_VERSION = "2026-09-27-pregame-prior";
+export const HEALTH_VERSION = "2026-10-05-idle-aware";
 
 /** A scan older than this means the bot is not scanning, not being choosy. */
 const SCAN_STALE_MS = 5 * 60 * 1000;
@@ -198,6 +199,19 @@ const CODE_GUIDE = {
     fix: "Usually an empty book. If it repeats on busy markets, send the example to Claude.",
   },
   "unresolved:draw-or-tie": { severity: "info", healthy: true, title: "Draw/tie outcome - not a team market", fix: "Not a fault." },
+  // 2026-10-05: codes added by the lanes, model pricing and opponent check.
+  "unresolved:opponent-mismatch": {
+    severity: "info", healthy: true, title: "Kalshi market belonged to a different game - refused (opponent check)",
+    fix: "Healthy. The ticker's other side was not this game's opponent, so it was not bought.",
+  },
+  "model-priced": {
+    severity: "info", healthy: true, title: "Betting line stale in play - priced on the live score model instead",
+    fix: "Healthy. The game still goes through every lane and return check.",
+  },
+  "no-lane": { severity: "info", healthy: true, title: "Price fits no trade lane", fix: "Healthy. Dip 35-49c, middle 50-92c (0.5-8%), favorite 65%+ to win." },
+  "middle-edge-too-good": { severity: "info", healthy: true, title: "Middle-lane edge too big - treated as a bad line", fix: "Healthy. At 50-92c, 8%+ edges have lost on this account." },
+  "live-watching": { severity: "info", healthy: true, title: "Watching before a live buy (waiting period / price reader)", fix: "Healthy. Buys after 3 reads over 1 minute, at a good price." },
+  "pregame-watching": { severity: "info", healthy: true, title: "Watching before a pre-game buy (waiting period / price reader)", fix: "Healthy." },
   "unresolved:unusable-name": {
     severity: "medium", title: "Team name had no usable words to match",
     fix: "Send the example to Claude.",
@@ -262,8 +276,25 @@ export function diagnose({ state, config, now = Date.now() } = {}) {
   const rows = Object.entries(scans).map(([sportKey, r]) => ({ sportKey, ...r, t: Date.parse(r.at) }))
     .filter((r) => Number.isFinite(r.t));
   const newest = rows.reduce((m, r) => Math.max(m, r.t), 0);
+  // IDLE IS NOT STOPPED (2026-10-05). Production 12:49Z flagged "stopped
+  // scanning" at 5:49am Pacific: the last NPB game had ended at 12:29Z and the
+  // next start was 15:00Z, so the bot was correctly waiting. With a schedule
+  // that shows no game live or about to start, no scan is the right state.
+  let idle = null;
   guard(() => {
-    if (st.running && (!newest || now - newest > SCAN_STALE_MS)) {
+    const plan = schedulePlan(now);
+    if (plan.ready && !plan.liveGames && !plan.soonGames) idle = plan;
+  });
+  guard(() => {
+    if (st.running && idle && (!newest || now - newest > SCAN_STALE_MS)) {
+      const nx = idle.next;
+      healthy.push({
+        code: "idle-no-games", count: 1,
+        title: "Idle - no game live or starting within 65 minutes",
+        example: nx ? `Next: ${nx.away} @ ${nx.home} (${nx.sportKey}) at ${nx.commence}` : null,
+        fix: "Not a fault. Scanning resumes on its own before the next game.",
+      });
+    } else if (st.running && (!newest || now - newest > SCAN_STALE_MS)) {
       const age = newest ? `${Math.round((now - newest) / 60000)} min ago` : "never";
       problems.push(problem("critical", "not-scanning", "The bot is running but has stopped scanning",
         `Last scan: ${age}.`, "Restart the service in Railway. If it recurs, send the Railway log to Claude."));
