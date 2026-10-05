@@ -82,7 +82,7 @@ import { appendLog } from "./stateStore.js";
 const V2 = "/trade-api/v2";
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;   // series lists barely move
 
-export const DISCOVERY_VERSION = "2026-09-24-moneyline-titles";
+export const DISCOVERY_VERSION = "2026-10-05-nations-league-pin";
 
 let cache = null;
 
@@ -115,6 +115,11 @@ export const PINNED_SERIES = {
   soccer_france_ligue_two: "KXLIGUE2GAME",                // Ligue 2 Game | Soccer
   soccer_uefa_champs_league: "KXUCLGAME",                 // UEFA Champions League Game | Soccer
   soccer_uefa_europa_league: "KXUELGAME",                 // UEFA Europa League Game | Soccer
+  // 2026-10-05: discovery had bound Nations League to KXUEFAGAME, which lists
+  // no markets ("series-empty" on every Nations League line). Kalshi's own
+  // series for it, checked live 2026-10-05 (63 markets, e.g.
+  // KXUEFANLGAME-26OCT06SCOSLO-SCO "Scotland"):
+  soccer_uefa_nations_league: "KXUEFANLGAME",             // UEFA Nations League Game | Soccer
   soccer_netherlands_eredivisie: "KXEREDIVISIEGAME",      // Eredivisie Game | Soccer
   soccer_brazil_campeonato: "KXBRASILEIROGAME",           // Brasileiro Serie A Game | Soccer
   soccer_conmebol_copa_libertadores: "KXCONMEBOLLIBGAME", // CONMEBOL Libertadores Game | Soccer
