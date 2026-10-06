@@ -28,13 +28,13 @@ import { registerOpenPositions, markDue, needsBackfill, backfillFromLedger } fro
 import { runPolymarketCycle } from "./polymarket/pmEngine.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "./swingEngine.js";
 import { feePerContractCents } from "./riskManager.js";
-import { sportDisabled, withSportRules } from "./sportRules.js";
+import { sportDisabled, withSportRules, recoveryAllowed, recoveryConfig, recoverySettings } from "./sportRules.js";
 
 const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-10-02-sport-rules";
+export const CONTROLLER_VERSION = "2026-10-05-recovery-mode";
 
 /**
  * 2026-09-24 - four changes in this file:
@@ -595,7 +595,7 @@ async function checkDailyHalt(config) {
       state.haltDate = null;
       saveState(state);
     } else {
-      return { halted: true, reason: state.haltReason };
+      return { halted: true, reason: state.haltReason, drawdown, equity };
     }
   }
 
@@ -612,7 +612,7 @@ async function checkDailyHalt(config) {
     appendLog(state.haltReason, "error");
     const { botToken, chatId } = getTelegramCredentials();
     notifyDailyHalt({ botToken, chatId, reason: state.haltReason }).catch(() => {});
-    return { halted: true, reason: state.haltReason };
+    return { halted: true, reason: state.haltReason, drawdown, equity };
   }
 
   return { halted: false, currentBalance: cash, equity, positionsValue: positions };
@@ -1005,8 +1005,10 @@ async function resyncUncertainPosition(position) {
   saveState(st);
 }
 
+let lastRecoveryLogAt = 0;
+
 export async function runCycle() {
-  const config = loadConfig();
+  let config = loadConfig();
 
   const maxFailures = config.circuitBreakerFailures ?? 3;
 
@@ -1094,9 +1096,23 @@ export async function runCycle() {
       appendLog(`CLV marking skipped this cycle (${err.message}).`, "warn");
     }
 
-    const { halted, reason } = await checkDailyHalt(config);
+    const { halted, reason, drawdown } = await checkDailyHalt(config);
     markExchangeReachable();   // checkDailyHalt reads the balance - the exchange answered
-    if (halted) {
+    // RECOVERY MODE (2026-10-05 night, sportRules.js): past the daily loss
+    // limit the bot keeps trading, but only 70%+ win-chance sides at half
+    // stake - until the hard stop (25% daily drawdown), where it stops.
+    if (halted && recoveryAllowed(config, drawdown)) {
+      config = recoveryConfig(config);
+      const now = Date.now();
+      if (now - lastRecoveryLogAt > 10 * 60 * 1000) {
+        lastRecoveryLogAt = now;
+        const r = recoverySettings(config);
+        appendLog(
+          `RECOVERY MODE - ${reason}. Still trading, but only sides rated ${(r.minWinProbability * 100).toFixed(0)}%+ to win, ` +
+          `at ${(r.stakeFactor * 100).toFixed(0)}% stake; full stop at ${(r.hardStopPct * 100).toFixed(0)}% daily drawdown.`, "warn"
+        );
+      }
+    } else if (halted) {
       // A halted day must not keep buying through resting bids either.
       const n = await cancelAllResting("trading halted for the day").catch(() => 0);
       appendLog(`Skipping cycle - halted for today: ${reason}` + (n ? ` (${n} resting bid(s) cancelled)` : ""));
