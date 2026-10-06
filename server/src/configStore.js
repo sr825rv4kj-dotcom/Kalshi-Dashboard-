@@ -458,6 +458,15 @@ export const DEFAULTS = {
   //   middle:   50-92c under 65% to win, 0.5-8% expected return (8%+ at these
   //             prices: 4 trades, 1 won, -$12.49; 0-8%: 14 trades, 11 won, +$6.10)
   // enabled: false switches a lane off.
+  // BLOCKED PRICE RANGE (2026-10-05 night, account holder): 60-69c lost
+  // -$19.16 over 18 Kalshi trades - never bought, in any lane (sportRules.js).
+  blockedEntryCents: [{ min: 60, max: 69 }],
+
+  // RECOVERY MODE (2026-10-05 night, account holder): past the 15% daily loss
+  // limit, keep trading - only sides rated 70%+ to win, at half stake - and
+  // stop completely at a 25% daily drawdown. enabled: false = old full halt.
+  recoveryMode: { enabled: true, minWinProbability: 0.70, stakeFactor: 0.5, hardStopPct: 0.25 },
+
   lanes: {
     dip: { enabled: true, minCents: 35, maxCents: 49, minReturnPct: 5 },
     favorite: { enabled: true, minWinProbability: 0.65, maxCents: 92, minReturnPct: 0.5 },
