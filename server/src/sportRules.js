@@ -175,6 +175,63 @@ export function returnTierOf(pct) {
   return null;
 }
 
+/**
+ * BLOCKED PRICE RANGE (2026-10-05 night, account holder's call). The ledger by
+ * entry price, Kalshi, all trades to 2026-10-06:
+ *   35-44c  77 trades  +$37.04  (kept - the best range)
+ *   60-69c  18 trades  -$19.16  (cut - the worst range)
+ * A side whose ask is inside a blocked range is not bought, in any lane.
+ */
+export const DEFAULT_BLOCKED_ENTRY_CENTS = [{ min: 60, max: 69 }];
+
+export function blockedEntryRange(askCents, config = {}) {
+  const list = Array.isArray(config.blockedEntryCents) ? config.blockedEntryCents : DEFAULT_BLOCKED_ENTRY_CENTS;
+  const a = Number(askCents);
+  return list.find((r) => r && a >= Number(r.min) && a <= Number(r.max)) || null;
+}
+
+/**
+ * RECOVERY MODE (2026-10-05 night, account holder's call). When an exchange
+ * hits the 15% daily loss limit it no longer stops for the day: it keeps
+ * trading, but ONLY sides rated recoveryMode.minWinProbability (70%) or
+ * better to win, at recoveryMode.stakeFactor (half) of the normal stake.
+ * Below recoveryMode.hardStopPct (25%) daily drawdown it stops completely.
+ */
+export const DEFAULT_RECOVERY = { enabled: true, minWinProbability: 0.70, stakeFactor: 0.5, hardStopPct: 0.25 };
+
+export function recoverySettings(config = {}) {
+  const r = config.recoveryMode && typeof config.recoveryMode === "object" ? config.recoveryMode : {};
+  return { ...DEFAULT_RECOVERY, ...r };
+}
+
+/** May trading continue in recovery mode at this daily drawdown (a fraction)? */
+export function recoveryAllowed(config = {}, drawdown = 0) {
+  const r = recoverySettings(config);
+  if (r.enabled === false) return false;
+  const hard = Number(r.hardStopPct);
+  return !(Number.isFinite(hard) && hard > 0 && Number(drawdown) >= hard);
+}
+
+/**
+ * The config a recovery cycle trades with: favorite lane only, at the
+ * recovery win-chance minimum, half stake. Every other rule is unchanged.
+ */
+export function recoveryConfig(config = {}) {
+  const r = recoverySettings(config);
+  const L = lanesOf(config);
+  const factor = Number(r.stakeFactor) > 0 ? Number(r.stakeFactor) : 0.5;
+  return {
+    ...config,
+    recoveryActive: true,
+    flatStakeDollars: Number(config.flatStakeDollars) > 0 ? Number(config.flatStakeDollars) * factor : config.flatStakeDollars,
+    lanes: {
+      dip: { ...L.dip, enabled: false },
+      middle: { ...L.middle, enabled: false },
+      favorite: { ...L.favorite, enabled: true, minWinProbability: Math.max(Number(L.favorite.minWinProbability) || 0, Number(r.minWinProbability) || 0.7) },
+    },
+  };
+}
+
 /** The fair-value shrink factor, clamped to (0, 1]. 1 = no shrink. */
 export function fairShrinkOf(config = {}) {
   const n = Number(config.fairShrink);
