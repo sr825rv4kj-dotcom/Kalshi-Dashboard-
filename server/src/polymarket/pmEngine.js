@@ -85,9 +85,9 @@ import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, kalshiTeamOnGame, normName, pmPositionsOnGame } from "./pmState.js";
 import { recordFairFromProbabilities } from "../fairValue.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "../swingEngine.js";
-import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, modelPricingAllowed, laneFor, laneMiss, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
+import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, modelPricingAllowed, laneFor, laneMiss, blockedEntryRange, recoveryAllowed, recoveryConfig, recoverySettings, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
 
-export const PM_ENGINE_VERSION = "2026-10-05-mirror-same-price";
+export const PM_ENGINE_VERSION = "2026-10-05-recovery-mode";
 export const PM_FEE = 0.0695;
 /** Polymarket's stake tiers on a $3.50 base: $5 at $50, $7.50 at $100, $10 at $150, $15 at $300, $25 at $500, 3% from $1,000. */
 export const PM_STAKE_TIERS = [{ at: 0, x: 1 }, { at: 50, x: 10 / 7 }, { at: 100, x: 15 / 7 }, { at: 150, x: 20 / 7 }, { at: 300, x: 30 / 7 }, { at: 500, x: 50 / 7 }, { at: 1000, pct: 0.03 }];
@@ -155,7 +155,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", "2026-10-02-model-when-stale", "2026-10-03-two-lanes", "2026-10-03-three-lanes", "2026-10-03-mirror-kalshi", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", "2026-10-02-model-when-stale", "2026-10-03-two-lanes", "2026-10-03-three-lanes", "2026-10-03-mirror-kalshi", "2026-10-05-mirror-same-price", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -771,6 +771,13 @@ export async function scanPolymarket(config, settings, active) {
     bump("pm-halted-for-day");
   }
   const halted = pmMeta().haltedForDay === true;
+  // RECOVERY MODE (2026-10-05 night, same rule as Kalshi - sportRules.js):
+  // past the daily loss limit Polymarket keeps trading, but only sides rated
+  // 70%+ to win, at half stake, until the 25% hard stop.
+  const pmDrawdown = dayStart > 0 ? (dayStart - equity) / dayStart : 0;
+  const pmRecovery = halted && recoveryAllowed(config, pmDrawdown);
+  const recoveryMinWin = Number(recoverySettings(config).minWinProbability) || 0.7;
+  if (pmRecovery) bump("pm-recovery-mode", `drawdown ${(pmDrawdown * 100).toFixed(1)}%`);
   const paused = meta.pausedUntil && Date.parse(meta.pausedUntil) > Date.now();
   if (paused) bump("pm-paused-after-failures", `until ${meta.pausedUntil}`);
 
@@ -786,7 +793,8 @@ export async function scanPolymarket(config, settings, active) {
     stakeTiers: Array.isArray(pmSet.stakeTiers) && pmSet.stakeTiers.length ? pmSet.stakeTiers : PM_STAKE_TIERS,
   }, equity);
   const brake = streakStakeFactor(config);
-  const stake = Number(stakeDecision.stake) * brake.factor;
+  const recoveryFactor = pmRecovery ? (Number(recoverySettings(config).stakeFactor) || 0.5) : 1;
+  const stake = Number(stakeDecision.stake) * brake.factor * recoveryFactor;
   // OPEN-TRADE CAP BY BALANCE (2026-09-28): the same rule as Kalshi, read from
   // the POLYMARKET account - stakes that fit in 75% of its equity, 5 to 10.
   // SURVIVAL MODE (2026-10-01): the same cap rule as Kalshi (botController
@@ -810,7 +818,7 @@ export async function scanPolymarket(config, settings, active) {
   if (!meta.coverage?.at || Date.now() - Date.parse(meta.coverage.at) > 10 * 60 * 1000) {
     try { updatePmMeta({ coverage: await buildCoverage(config) }); } catch { /* shown next time */ }
   }
-  const baseConfig = config;
+  const baseConfig = pmRecovery ? recoveryConfig(config) : config;
   for (const [sportKey, entry] of lines) {
     // Switched-off sports and sports off the Polymarket trade list get no new
     // buys here (sportRules.js). Held positions are managed elsewhere.
@@ -976,6 +984,10 @@ export async function scanPolymarket(config, settings, active) {
             skip("pm-mirror-price-off", `Kalshi bought ${t.name} at ${kEntry}c; Polymarket ask ${askCents}c is more than ${kEntry - floorPx}c lower - a different situation, not the same trade`);
             continue;
           }
+          if (pmRecovery && !(Number(c.prob) >= recoveryMinWin)) {
+            skip("pm-recovery-win-chance", `Recovery mode: ${t.name} is rated ${(Number(c.prob) * 100).toFixed(0)}% to win - only ${(recoveryMinWin * 100).toFixed(0)}%+ sides are copied until the day recovers`);
+            continue;
+          }
           limit = cap;
           countAt = (p) => flatBetContracts(stake, p, PM_FEE);
           returnAt = (p) => {
@@ -1042,6 +1054,7 @@ export async function scanPolymarket(config, settings, active) {
         // THREE LANES (2026-10-03, same rules as Kalshi, sportRules.js).
         const lane = laneFor({ winProbability: c.prob, askCents }, config);
         if (!lane) { skip("pm-no-lane", laneMiss({ winProbability: c.prob, askCents }, config)); continue; }
+        { const br = blockedEntryRange(askCents, config); if (br) { skip("pm-blocked-price-range", `${askCents}c is in the blocked ${br.min}-${br.max}c range`); continue; } }
 
         const learned = learnedBlock({ sportKey, priceCents: askCents }, config);
         if (learned.blocked) { skip("pm-learned-block", learned.reason); continue; }
@@ -1125,7 +1138,7 @@ export async function scanPolymarket(config, settings, active) {
           if (!active) { skip("pm-would-trade", `Would buy, but Polymarket trading is not active: ${reason}`); return; }
           // Re-read: a failure earlier in this cycle can pause or halt trading.
           const metaNow = pmMeta();
-          if (halted || metaNow.haltedForDay === true) { skip("pm-halted", "Polymarket paused for today by the daily loss limit"); return; }
+          if ((halted || metaNow.haltedForDay === true) && !pmRecovery) { skip("pm-halted", "Polymarket stopped for today - past the 25% hard stop (or recovery mode off)"); return; }
           if (paused || (metaNow.pausedUntil && Date.parse(metaNow.pausedUntil) > Date.now())) { feed({ sportKey, team: t.name, opponent: opp, commenceTime, code: "pm-paused-after-failures", why: `Paused after 3 failed orders, until ${metaNow.pausedUntil ?? meta.pausedUntil}`, ...at }); return; }
           if (addOnHeld) {
             const onGameNow = pmPositionsOnGame({ sportKey, commenceTime, teamNames });
