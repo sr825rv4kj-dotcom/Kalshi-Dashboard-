@@ -88,14 +88,14 @@ import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame } from "./polymarket/pmState.js";
-import { fairShrinkOf, shrinkFair, modelPricingAllowed, laneFor, laneMiss, returnTierOf } from "./sportRules.js";
+import { fairShrinkOf, shrinkFair, modelPricingAllowed, laneFor, laneMiss, returnTierOf, blockedEntryRange } from "./sportRules.js";
 import { noteDecision, noteScan } from "./scanFeed.js";
 import { getTradeLifecycles, filterByVenue } from "./tradeLedgerStore.js";
 import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-05-soccer-fresh-line";
+export const SCANNER_VERSION = "2026-10-05-cut-60-69";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -854,6 +854,16 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       continue;
     }
     c.lane = lane;
+    // BLOCKED PRICE RANGE (2026-10-05 night, sportRules.js): 60-69c lost
+    // -$19.16 over 18 Kalshi trades - not bought in any lane.
+    const blocked = blockedEntryRange(askCents, config);
+    if (blocked) {
+      const line = `${c.ticker}: ${askCents}c is in the blocked ${blocked.min}-${blocked.max}c range (the account's worst-performing prices)`;
+      ddBump("blocked-price-range", line);
+      rejected.push(line);
+      await dropResting(c.ticker, "blocked price range");
+      continue;
+    }
 
     // A wide book means the quoted ask is not a price anyone is trading at,
     // and any edge measured against it is measurement error.
