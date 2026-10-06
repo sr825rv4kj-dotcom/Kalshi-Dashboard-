@@ -32,7 +32,7 @@ import { loadConfig } from "./configStore.js";
 import { schedulePlan } from "./liveSchedule.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 
-export const HEALTH_VERSION = "2026-10-05-idle-aware";
+export const HEALTH_VERSION = "2026-10-05-recovery-mode";
 
 /** A scan older than this means the bot is not scanning, not being choosy. */
 const SCAN_STALE_MS = 5 * 60 * 1000;
@@ -208,6 +208,7 @@ const CODE_GUIDE = {
     severity: "info", healthy: true, title: "Betting line stale in play - priced on the live score model instead",
     fix: "Healthy. The game still goes through every lane and return check.",
   },
+  "blocked-price-range": { severity: "info", healthy: true, title: "Price in the blocked 60-69c range", fix: "Healthy. 60-69c lost -$19.16 over 18 Kalshi trades." },
   "no-lane": { severity: "info", healthy: true, title: "Price fits no trade lane", fix: "Healthy. Dip 35-49c, middle 50-92c (0.5-8%), favorite 65%+ to win." },
   "middle-edge-too-good": { severity: "info", healthy: true, title: "Middle-lane edge too big - treated as a bad line", fix: "Healthy. At 50-92c, 8%+ edges have lost on this account." },
   "live-watching": { severity: "info", healthy: true, title: "Watching before a live buy (waiting period / price reader)", fix: "Healthy. Buys after 3 reads over 1 minute, at a good price." },
@@ -260,9 +261,16 @@ export function diagnose({ state, config, now = Date.now() } = {}) {
         null, "Open the dashboard and tap Start Bot."));
     }
     if (st.haltedForDay) {
-      problems.push(problem("critical", "halted-for-day", "Trading is halted for the day",
-        st.haltReason || null,
-        "The daily loss limit was hit. It clears automatically tomorrow; resume from the dashboard sooner if you choose."));
+      const rm = cfg && cfg.recoveryMode && typeof cfg.recoveryMode === "object" ? cfg.recoveryMode : {};
+      if (rm.enabled !== false) {
+        problems.push(problem("high", "recovery-mode", "Recovery mode - daily loss limit hit, trading only 70%+ win-chance sides at half stake",
+          st.haltReason || null,
+          "Automatic. It stops completely at a 25% daily drawdown and clears at midnight Pacific."));
+      } else {
+        problems.push(problem("critical", "halted-for-day", "Trading is halted for the day",
+          st.haltReason || null,
+          "The daily loss limit was hit. It clears automatically tomorrow; resume from the dashboard sooner if you choose."));
+      }
     }
     if (st.circuitBreakerOpen) {
       problems.push(problem("critical", "circuit-breaker", "The circuit breaker is open - trading stopped after repeated failures",
