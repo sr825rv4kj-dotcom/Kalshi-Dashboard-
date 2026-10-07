@@ -149,6 +149,16 @@ async function registerOptionalModules() {
     console.warn("[optional] tradeCounter.js not loaded:", err.message);
   }
 
+  // MONEY REMINDERS (2026-10-06): banner + Telegram push when an account
+  // needs money or a Kalshi shard is empty (fundsAlerts.js).
+  try {
+    const { registerFundsAlertRoutes } = await import("./fundsAlerts.js");
+    registerFundsAlertRoutes(app);
+    console.log("Money reminders enabled at /api/alerts");
+  } catch (err) {
+    console.warn("[optional] fundsAlerts.js not loaded:", err.message);
+  }
+
   try {
     const { registerSelfCheckRoutes } = await import("./selfCheck.js");
     registerSelfCheckRoutes(app);
