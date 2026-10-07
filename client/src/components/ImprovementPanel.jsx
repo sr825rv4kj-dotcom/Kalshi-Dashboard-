@@ -180,3 +180,4 @@ export default function ImprovementsPanel({ apiBase }) {
     </div>
   );
 }
+
