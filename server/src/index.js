@@ -139,6 +139,16 @@ async function registerOptionalModules() {
     console.warn("[optional] improvementLab.js not loaded:", err.message);
   }
 
+  // THE DAY'S TRADE COUNTER (2026-10-06): scans, trades by lane, pace vs
+  // target, top blockers (tradeCounter.js).
+  try {
+    const { registerTradeCounterRoutes } = await import("./tradeCounter.js");
+    registerTradeCounterRoutes(app, loadConfig);
+    console.log("Trade counter enabled at /api/trade-counter");
+  } catch (err) {
+    console.warn("[optional] tradeCounter.js not loaded:", err.message);
+  }
+
   try {
     const { registerSelfCheckRoutes } = await import("./selfCheck.js");
     registerSelfCheckRoutes(app);
