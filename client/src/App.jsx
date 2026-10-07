@@ -17,6 +17,7 @@ import WallpaperPanel from "./components/WallpaperPanel.jsx";
 import BotConfigPanel from "./components/BotConfigPanel.jsx";
 import DiagnosticPanel from "./components/DiagnosticPanel.jsx";
 import ImprovementsPanel from "./components/ImprovementsPanel.jsx";
+import TradeCounterPanel from "./components/TradeCounterPanel.jsx";
 import SelfCheckPanel from "./components/SelfCheckPanel.jsx";
 import StrategyReviewPanel from "./components/StrategyReviewPanel.jsx";
 import CoveragePanel from "./components/CoveragePanel.jsx";
@@ -234,6 +235,7 @@ function DashboardApp() {
 
       {section === "system" && (
         <>
+          <TradeCounterPanel apiBase={API_BASE} />
           <ImprovementsPanel apiBase={API_BASE} />
           <LiveSchedulePanel apiBase={API_BASE} />
           <CoveragePanel apiBase={API_BASE} />
