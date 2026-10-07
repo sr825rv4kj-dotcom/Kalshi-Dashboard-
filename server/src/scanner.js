@@ -86,6 +86,7 @@ import { workCandidate, cancelResting, getRestingOrders, cancelPendingOnEvent } 
 import { recordFairFromProbabilities } from "./fairValue.js";
 import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
+import { countScan, countEntry } from "./tradeCounter.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame } from "./polymarket/pmState.js";
 import { fairShrinkOf, shrinkFair, modelPricingAllowed, laneFor, laneMiss, returnTierOf } from "./sportRules.js";
@@ -95,7 +96,7 @@ import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-05-soccer-fresh-line";
+export const SCANNER_VERSION = "2026-10-06-learner-probation";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -358,6 +359,8 @@ export function recordScanTally(sportKey, tally, seen, entered, samples = {}) {
       reasons: tally,
       samples,
     };
+    // THE DAY'S COUNTER (tradeCounter.js): scans, markets priced, refusals.
+    countScan(sportKey, tally, seen);
     // Keep only sports seen in the last hour so this cannot grow unbounded.
     const cutoff = Date.now() - 60 * 60 * 1000;
     for (const [k, v] of Object.entries(state.lastScan)) {
@@ -890,13 +893,16 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     }
     // LEARNED FROM RESULTS (outcomeLearner.js): a sport or price band that has
     // won clearly less often than its prices implied, and lost money, is skipped.
-    const learned = learnedBlock({ sportKey, priceCents: askCents }, config);
+    // 2026-10-06: judged by sport AT this price range, and a blocked range may
+    // take one half-stake PROBATION trade a day while the bot is behind pace.
+    const learned = learnedBlock({ sportKey, priceCents: askCents, allowProbation: !c.addOn }, config);
     if (learned.blocked) {
       const line = `${c.ticker} ${askCents}c: ${learned.reason}`;
       ddBump("learned-block", line);
       rejected.push(line);
       continue;
     }
+    if (learned.probation) appendLog(`${c.ticker} ${askCents}c: ${learned.reason}`);
 
     // Kelly sizing is EARNED per sport. Until a sport's CLV is confidently
     // positive, it trades the flat survival stake whatever the balance is.
@@ -909,7 +915,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // LOSING-STREAK BRAKE: after config.streakBrakeLosses straight losses the
     // flat stake is halved until the next win. Protects the balance only.
     const brake = streakStakeFactor(config);
-    const flatStake = Number(stakeDecision.stake) * brake.factor;
+    const flatStake = Number(stakeDecision.stake) * brake.factor * (learned.probation ? learned.stakeFactor : 1);
     const sizingSurvival = Number.isFinite(flatStake) && flatStake > 0
       ? { ...(config.survivalMode || {}), balanceThreshold: Infinity, flatBetDollars: flatStake }
       : earnedKelly
@@ -1169,6 +1175,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       openEvents.add(eventKeyOf(c.ticker));
       heldEvents.add(eventKeyOf(c.ticker));
       entered += 1;
+      countEntry({ ticker: c.ticker, lane: c.lane?.name ?? null, probation: !!learned.probation, segment: learned.segment });
       if (c.addOn) {
         markDoubledDown(c.ticker);
         appendLog(`DOUBLE-DOWN filled on ${c.ticker} (${c.teamName}): ${result.filled} more contracts - this game is now held twice and will not be doubled again.`);
