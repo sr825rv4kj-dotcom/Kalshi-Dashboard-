@@ -203,3 +203,4 @@ export function learnerReport(config = {}) {
     })).sort((a, b) => b.trades - a.trades),
   };
 }
+
