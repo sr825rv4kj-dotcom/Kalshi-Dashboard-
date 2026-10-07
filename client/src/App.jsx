@@ -18,6 +18,7 @@ import BotConfigPanel from "./components/BotConfigPanel.jsx";
 import DiagnosticPanel from "./components/DiagnosticPanel.jsx";
 import ImprovementsPanel from "./components/ImprovementsPanel.jsx";
 import TradeCounterPanel from "./components/TradeCounterPanel.jsx";
+import FundsAlertBanner from "./components/FundsAlertBanner.jsx";
 import SelfCheckPanel from "./components/SelfCheckPanel.jsx";
 import StrategyReviewPanel from "./components/StrategyReviewPanel.jsx";
 import CoveragePanel from "./components/CoveragePanel.jsx";
@@ -164,6 +165,8 @@ function DashboardApp() {
         </span>
       </div>
 
+      <FundsAlertBanner apiBase={API_BASE} />
+
       <SystemStatusBar apiBase={API_BASE} />
 
       {skippedSetup && (
@@ -256,4 +259,3 @@ export default function App() {
     </AuthGate>
   );
 }
-
