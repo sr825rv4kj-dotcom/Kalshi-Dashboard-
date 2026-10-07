@@ -48,6 +48,7 @@ import { LIVE_MODEL_VERSION, pregamePriorCount } from "../liveModel.js";
 import { pmMonitorReport, PM_ENGINE_VERSION } from "../polymarket/pmEngine.js";
 import { inPlayBookReport } from "../scraper.js";
 import { improvementReport } from "../improvementLab.js";
+import { tradeCounterReport } from "../tradeCounter.js";
 
 /**
  * Read MONITOR_TOKEN the way a phone-edited Railway variable actually arrives.
@@ -260,6 +261,8 @@ export function registerMonitorRoutes(app) {
     section("learner", () => learnerReport(loadConfig()));
     // WHAT NEEDS IMPROVEMENT: losing areas, what was tested instead, the verdict.
     section("improvements", () => improvementReport());
+    // THE DAY'S COUNTER: trades by lane and exchange, pace, top blockers.
+    section("tradeCounter", () => tradeCounterReport(loadConfig()));
     // Current stake, the tier it came from, the next step, and any double-downs.
     section("stake", () => stakeReport(loadConfig()));
     // Trading Desk: swing positions (bid, fair, next sale), today vs the goal.
