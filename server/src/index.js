@@ -128,6 +128,17 @@ async function registerOptionalModules() {
     console.warn("[optional] polymarket routes not loaded:", err.message);
   }
 
+  // WHAT NEEDS IMPROVEMENT (2026-10-06): the System tab's report of where
+  // the bot loses and what it tested instead (improvementLab.js). Behind the
+  // login like every other /api route.
+  try {
+    const { registerImprovementRoutes } = await import("./improvementLab.js");
+    registerImprovementRoutes(app);
+    console.log("Improvement report enabled at /api/improvements");
+  } catch (err) {
+    console.warn("[optional] improvementLab.js not loaded:", err.message);
+  }
+
   try {
     const { registerSelfCheckRoutes } = await import("./selfCheck.js");
     registerSelfCheckRoutes(app);
