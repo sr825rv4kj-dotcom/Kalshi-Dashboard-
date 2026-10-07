@@ -1216,3 +1216,4 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   recordScanTally(sportKey, tally, teamEntries.length, entered, samples);
   return stopScanning;
 }
+
