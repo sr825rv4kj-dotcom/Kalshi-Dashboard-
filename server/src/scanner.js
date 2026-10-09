@@ -89,14 +89,14 @@ import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { countScan, countEntry } from "./tradeCounter.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame } from "./polymarket/pmState.js";
-import { fairShrinkOf, shrinkFair, modelPricingAllowed, laneFor, laneMiss, returnTierOf } from "./sportRules.js";
+import { fairShrinkOf, shrinkFair, modelPricingAllowed, laneFor, laneMiss, returnTierOf, blockedEntryRange, limitBelowBlocked } from "./sportRules.js";
 import { noteDecision, noteScan } from "./scanFeed.js";
 import { getTradeLifecycles, filterByVenue } from "./tradeLedgerStore.js";
 import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-06-learner-probation";
+export const SCANNER_VERSION = "2026-10-09-block-60-69";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -857,6 +857,15 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       continue;
     }
     c.lane = lane;
+    // BLOCKED PRICE RANGE (2026-10-09, sportRules.js): 60-69c is not bought.
+    const blocked = blockedEntryRange(askCents, config);
+    if (blocked) {
+      const line = `${c.ticker}: ${askCents}c is in the blocked ${blocked.min}-${blocked.max}c range`;
+      ddBump("blocked-price-range", line);
+      rejected.push(line);
+      await dropResting(c.ticker, "blocked price range");
+      continue;
+    }
 
     // A wide book means the quoted ask is not a price anyone is trading at,
     // and any edge measured against it is measurement error.
@@ -1089,6 +1098,16 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       }
     }
 
+    // A walk-up limit never reaches into a blocked range: an ask of 57c with a
+    // 61c limit could fill at 60-61c. Capped one cent under the range.
+    {
+      const lim = limitBelowBlocked(askCents, assessment.limitCents, config);
+      if (lim < assessment.limitCents) {
+        assessment.limitCents = lim;
+        assessment.walkupCents = lim - askCents;
+      }
+    }
+
     // THE CAP COUNTS RESTING BIDS (2026-09-24). Checked here, at the moment of
     // a taker entry, not at the top of the loop: the scan must keep running at
     // the cap so resting bids keep being re-confirmed and re-priced, or the
@@ -1216,4 +1235,3 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
   recordScanTally(sportKey, tally, teamEntries.length, entered, samples);
   return stopScanning;
 }
-
