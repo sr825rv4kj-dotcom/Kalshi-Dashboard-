@@ -85,9 +85,9 @@ import { leagueSlugFor, leagueSlugsFor, getSportEvents, mappedSports, getLeagues
 import { pmPositions, savePmPositions, pmMeta, updatePmMeta, heldOnPolymarket, kalshiTeamOnGame, normName, pmPositionsOnGame } from "./pmState.js";
 import { recordFairFromProbabilities } from "../fairValue.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "../swingEngine.js";
-import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, modelPricingAllowed, laneFor, laneMiss, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
+import { sportDisabled, polymarketSportAllowed, withSportRules, fairShrinkOf, modelPricingAllowed, laneFor, laneMiss, blockedEntryRange, limitBelowBlocked, DEFAULT_PM_ENTRY_SPORTS } from "../sportRules.js";
 
-export const PM_ENGINE_VERSION = "2026-10-05-mirror-same-price";
+export const PM_ENGINE_VERSION = "2026-10-09-block-60-69";
 export const PM_FEE = 0.0695;
 /** Polymarket's stake tiers on a $3.50 base: $5 at $50, $7.50 at $100, $10 at $150, $15 at $300, $25 at $500, 3% from $1,000. */
 export const PM_STAKE_TIERS = [{ at: 0, x: 1 }, { at: 50, x: 10 / 7 }, { at: 100, x: 15 / 7 }, { at: 150, x: 20 / 7 }, { at: 300, x: 30 / 7 }, { at: 500, x: 50 / 7 }, { at: 1000, pct: 0.03 }];
@@ -155,7 +155,7 @@ const DOCUMENTED_SHORT_FORMAT = "long-price";
 // Builds whose self-check sends the NO preview in the documented format. A
 // confirmation from any of them stands: the order format does not change
 // between builds, so a new build does not switch the NO side off.
-const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", "2026-10-02-model-when-stale", "2026-10-03-two-lanes", "2026-10-03-three-lanes", "2026-10-03-mirror-kalshi", "2026-10-05-recovery-mode", PM_ENGINE_VERSION]);
+const DOCUMENTED_FORMAT_VERSIONS = new Set(["2026-09-28-no-side-per-docs", "2026-09-28-live-schedule", "2026-09-28-same-trades-both", "2026-09-28-scanner-tab", "2026-09-29-no-score-fresh-line", "2026-09-29-swing", "2026-10-01-same-as-kalshi", "2026-10-02-one-venue-per-game", "2026-10-02-price-reader", "2026-10-02-model-when-stale", "2026-10-03-two-lanes", "2026-10-03-three-lanes", "2026-10-03-mirror-kalshi", "2026-10-05-recovery-mode", "2026-10-05-mirror-same-price", PM_ENGINE_VERSION]);
 
 function shortConfirmed(sc) {
   return sc?.shortConvention === DOCUMENTED_SHORT_FORMAT && DOCUMENTED_FORMAT_VERSIONS.has(sc?.version);
@@ -960,7 +960,14 @@ export async function scanPolymarket(config, settings, active) {
           // MIRROR: Kalshi's scan made the decision; only the price is checked.
           const kEntry = Math.round(Number(mirrorPos.entryPriceCents));
           const ms = pmSettings(config);
-          const cap = Math.min(kEntry + Number(ms.mirrorMaxExtraCents ?? 2), Number(config.maxEntryPriceCents ?? 92), 99);
+          // Never into a blocked range (sportRules.js): a 58c Kalshi buy is
+          // copied up to 59c, not 60c.
+          const cap = limitBelowBlocked(askCents, Math.min(kEntry + Number(ms.mirrorMaxExtraCents ?? 2), Number(config.maxEntryPriceCents ?? 92), 99), config);
+          const blockedPm = blockedEntryRange(askCents, config);
+          if (blockedPm) {
+            skip("pm-blocked-price-range", `Kalshi bought ${t.name} at ${kEntry}c; Polymarket ask ${askCents}c is in the blocked ${blockedPm.min}-${blockedPm.max}c range`);
+            continue;
+          }
           const floorPx = kEntry - Number(ms.mirrorMaxBelowCents ?? 5);
           const ageMin = (Date.now() - Date.parse(mirrorPos.openedAt)) / 60000;
           const maxMin = Number(ms.mirrorMaxMinutes ?? 10);
@@ -1042,6 +1049,8 @@ export async function scanPolymarket(config, settings, active) {
         // THREE LANES (2026-10-03, same rules as Kalshi, sportRules.js).
         const lane = laneFor({ winProbability: c.prob, askCents }, config);
         if (!lane) { skip("pm-no-lane", laneMiss({ winProbability: c.prob, askCents }, config)); continue; }
+
+        { const br = blockedEntryRange(askCents, config); if (br) { skip("pm-blocked-price-range", `${askCents}c is in the blocked ${br.min}-${br.max}c range`); continue; } }
 
         const learned = learnedBlock({ sportKey, priceCents: askCents }, config);
         if (learned.blocked) { skip("pm-learned-block", learned.reason); continue; }
