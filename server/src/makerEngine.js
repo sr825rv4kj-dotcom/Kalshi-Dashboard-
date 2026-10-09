@@ -48,6 +48,7 @@
  */
 
 import { kalshiGet, kalshiPost, kalshiDelete } from "./kalshiClient.js";
+import { blockedEntryRange } from "./sportRules.js";
 import { appendLog, loadState, saveState } from "./stateStore.js";
 import { recordTrade, scheduleFeeCents } from "./tradeLedgerStore.js";
 import { feeCentsAt, requiredEdgeThreshold, fractionalKellySize, feePerContractCents, flatBetContracts } from "./riskManager.js";
@@ -55,7 +56,7 @@ import { notifyEntry } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 import { currentCadenceSeconds } from "./cadence.js";
 
-export const MAKER_VERSION = "2026-10-01-live-bids";
+export const MAKER_VERSION = "2026-10-09-block-60-69";
 
 /*
  * LIVE RESTING BIDS (2026-10-01, account holder's call). In a live game that
@@ -585,6 +586,9 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents, stak
       minReturnPct: Number(config.minExpectedReturnPct ?? 0),
     });
     if (plan.priceCents == null) return refuse(plan.reason);
+    // BLOCKED PRICE RANGE (2026-10-09, sportRules.js): no bid rests at 60-69c.
+    const blocked = blockedEntryRange(plan.priceCents, config);
+    if (blocked) return refuse(`${c.ticker}: a ${plan.priceCents}c bid is in the blocked ${blocked.min}-${blocked.max}c range`);
 
     if (existing && plan.keep) {
       writeResting((r) => { if (r[c.ticker]) { r[c.ticker].refreshedAt = new Date().toISOString(); r[c.ticker].trueProbability = c.trueProbability; } });
