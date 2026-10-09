@@ -175,6 +175,46 @@ export function returnTierOf(pct) {
   return null;
 }
 
+/**
+ * BLOCKED PRICE RANGE (2026-10-09, account holder's call: "delete 60-69c
+ * trades"). Across both exchanges, buys at 60-69c: 34 trades, 17 won against
+ * 21.8 their prices implied, -$42.81 - the average win $1.43, the average
+ * loss $4.80. 50-59c over the same period: 32 trades, +$29.30.
+ *
+ * Nothing is bought inside a blocked range - not by a taker order, not by a
+ * walk-up limit (capped one cent under the range), not by a resting bid, and
+ * not by Polymarket's copy of a Kalshi trade. config.blockedEntryCents
+ * replaces the default; [] removes the block.
+ */
+export const DEFAULT_BLOCKED_ENTRY_CENTS = [{ min: 60, max: 69 }];
+
+function blockedRanges(config = {}) {
+  const list = Array.isArray(config.blockedEntryCents) ? config.blockedEntryCents : DEFAULT_BLOCKED_ENTRY_CENTS;
+  return list
+    .map((r) => ({ min: Number(r?.min), max: Number(r?.max) }))
+    .filter((r) => Number.isFinite(r.min) && Number.isFinite(r.max) && r.min <= r.max);
+}
+
+/** The blocked range a price falls in, or null. */
+export function blockedEntryRange(priceCents, config = {}) {
+  const p = Number(priceCents);
+  if (!Number.isFinite(p)) return null;
+  return blockedRanges(config).find((r) => p >= r.min && p <= r.max) || null;
+}
+
+/**
+ * The highest limit that cannot fill inside a blocked range: an order with an
+ * ask under a range and a limit reaching into it is capped one cent under it.
+ */
+export function limitBelowBlocked(askCents, limitCents, config = {}) {
+  let limit = Number(limitCents);
+  const ask = Number(askCents);
+  for (const r of blockedRanges(config)) {
+    if (ask < r.min && limit >= r.min) limit = r.min - 1;
+  }
+  return limit;
+}
+
 /** The fair-value shrink factor, clamped to (0, 1]. 1 = no shrink. */
 export function fairShrinkOf(config = {}) {
   const n = Number(config.fairShrink);
