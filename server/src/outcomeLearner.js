@@ -50,7 +50,7 @@
 import { getTradeLifecycles, loadLedger } from "./tradeLedgerStore.js";
 import { behindPace, probationUsedToday } from "./tradeCounter.js";
 
-export const LEARNER_VERSION = "2026-10-06-sport-price-probation";
+export const LEARNER_VERSION = "2026-10-09-ten-cent-bands";
 
 const CACHE_MS = 60_000;
 let cache = { at: 0, closed: [] };
@@ -71,8 +71,13 @@ export function bandOf(cents) {
   if (c < 25) return "<25c";
   if (c < 35) return "25-35c";
   if (c < 50) return "35-50c";
-  if (c < 70) return "50-70c";
-  return "70c+";
+  // 2026-10-09: 10c steps above 50c. One 50-70c range let 50-59c (32 trades,
+  // +$29.30) hide 60-69c (34 trades, -$42.81, 17 won vs 21.8 implied), so the
+  // learner never saw the losing range. Split, each is judged on its own.
+  if (c < 60) return "50-60c";
+  if (c < 70) return "60-70c";
+  if (c < 80) return "70-80c";
+  return "80c+";
 }
 
 /** The segments one trade belongs to: its sport at its price range, and its price range. */
@@ -203,4 +208,3 @@ export function learnerReport(config = {}) {
     })).sort((a, b) => b.trades - a.trades),
   };
 }
-
