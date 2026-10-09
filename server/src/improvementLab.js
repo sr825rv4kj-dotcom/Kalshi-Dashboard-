@@ -40,7 +40,7 @@
 
 import { getTradeLifecycles } from "./tradeLedgerStore.js";
 
-export const IMPROVEMENT_VERSION = "2026-10-06-improvement-lab";
+export const IMPROVEMENT_VERSION = "2026-10-09-ten-cent-bands";
 
 const FEE = { kalshi: 0.07, polymarket: 0.0695 };
 const MIN_AREA_TRADES = 6;
@@ -57,10 +57,13 @@ export function bandOf(cents) {
   if (c < 25) return "under 25c";
   if (c < 35) return "25-34c";
   if (c < 50) return "35-49c";
-  if (c < 70) return "50-69c";
-  return "70c+";
+  if (c < 60) return "50-59c";
+  if (c < 70) return "60-69c";
+  if (c < 80) return "70-79c";
+  return "80c+";
 }
-const BAND_ORDER = ["under 25c", "25-34c", "35-49c", "50-69c", "70c+"];
+// 2026-10-09: 10c steps above 50c, matching the outcome learner.
+const BAND_ORDER = ["under 25c", "25-34c", "35-49c", "50-59c", "60-69c", "70-79c", "80c+"];
 
 const SPORT_NAMES = {
   americanfootball_nfl: "NFL", americanfootball_ncaaf: "NCAAF", americanfootball_cfl: "CFL",
