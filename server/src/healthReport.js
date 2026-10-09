@@ -32,7 +32,7 @@ import { loadConfig } from "./configStore.js";
 import { schedulePlan } from "./liveSchedule.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 
-export const HEALTH_VERSION = "2026-10-05-idle-aware";
+export const HEALTH_VERSION = "2026-10-09-block-60-69";
 
 /** A scan older than this means the bot is not scanning, not being choosy. */
 const SCAN_STALE_MS = 5 * 60 * 1000;
@@ -166,6 +166,7 @@ const CODE_GUIDE = {
     fix: "Healthy. This is the bot correctly refusing a losing trade.",
   },
   "price-below-floor": { severity: "info", healthy: true, title: "Price under the floor", fix: "Healthy refusal." },
+  "blocked-price-range": { severity: "info", healthy: true, title: "Price in the blocked 60-69c range", fix: "Healthy - 60-69c is not bought (sportRules.js blockedEntryCents)." },
   "price-above-ceiling": { severity: "info", healthy: true, title: "Price over the ceiling", fix: "Healthy refusal." },
   "ev-too-thin": { severity: "info", healthy: true, title: "Expected value below the floor", fix: "Healthy refusal." },
   "no-lines-from-provider": { severity: "info", healthy: true, title: "No games on the board", fix: "Not a fault." },
