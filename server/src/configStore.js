@@ -789,6 +789,43 @@ const ONE_TIME_UPDATES = [
     },
     note: "Polymarket buying off; NHL off; Kalshi trades in-play only",
   },
+  {
+    // BACK TO THE BEST-DAY FORMULA (2026-10-10, account holder's call: "go
+    // back to the day I earned the most and keep that formula"). Sep 26-27,
+    // +$41.45 over 33 trades, every one of them: $5 flat, IN-PLAY, bought at
+    // 35-52c, only when the expected return was 30%+ (on the unshrunk fair
+    // value - the shrink came in on Oct 2).
+    //
+    // That formula across the account's whole Kalshi record (in-play, 35-59c,
+    // no NHL): 103 trades, won 54 vs 44.1 the prices implied, +$70.02 (+18.7%),
+    // and still +$17.23 since Sep 30. Everything added since (middle and
+    // favorite lanes up to 92c, 0.5% minimum returns, pre-game, NHL):
+    // 102 trades, -$43.87.
+    //
+    //   one lane:  35-59c (60-69c stays blocked), 30% minimum expected return
+    //   no shrink: fairShrink 1, as on the best days
+    //   in-play only, $5 flat on the existing stake tiers, NHL and Polymarket
+    //   off - kept from 2026-10-10-keep-what-works
+    // Every fix since (state file, schedule, resolver, 60-69c block, learner,
+    // reader, counters, reminders) stays.
+    id: "2026-10-10-best-day-formula",
+    apply: (c) => {
+      c.flatStakeDollars = 5;
+      c.liveOnly = true;
+      c.fairShrink = 1;
+      c.minExpectedReturnPct = 30;
+      c.minEntryPriceCents = 35;
+      c.liveBandMinCents = 35;
+      c.maxEntryPriceCents = 59;
+      c.liveBandMaxCents = 59;
+      c.lanes = {
+        dip: { enabled: true, minCents: 35, maxCents: 59, minReturnPct: 30 },
+        middle: { ...(c.lanes?.middle || {}), enabled: false },
+        favorite: { ...(c.lanes?.favorite || {}), enabled: false },
+      };
+    },
+    note: "best-day formula: in-play only, 35-59c, 30% min expected return, no fair shrink, $5 flat; middle and favorite lanes off",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
