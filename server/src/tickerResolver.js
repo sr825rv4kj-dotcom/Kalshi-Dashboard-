@@ -115,7 +115,7 @@ const CACHE_TTL_MS = 3 * 60 * 1000;
 /** How many days either side of kickoff a ticker's date may sit. */
 const DATE_SLACK_DAYS = 1;
 
-export const RESOLVER_VERSION = "2026-10-02-opponent-check";
+export const RESOLVER_VERSION = "2026-10-09-state-schools";
 
 /**
  * Accent folding. kärpät -> karpat, ässät -> assat, Malmö -> malmo.
@@ -289,6 +289,30 @@ export function spelledFromName(code, teamName) {
 }
 
 export function codeAffinity(code, teamName) {
+  const base = codeAffinityCore(code, teamName);
+  const alt = stateUniversityAffinity(code, teamName);
+  return Math.max(base, alt);
+}
+
+/**
+ * "STATE UNIVERSITY" CODES (2026-10-09). Kalshi codes many college "State"
+ * schools with a U for University: ISU Iowa State, WSU Washington State, USU
+ * Utah State, SJSU San Jose State, KSU Kansas State, SDSU San Diego State.
+ * None can be spelled from "Iowa State Cyclones" - there is no U - so those
+ * teams went unmatched, or matched another school's code (IOWA for Iowa State)
+ * and were refused. The name is also scored as "... State University ...";
+ * codeAffinity keeps the better score, so no existing match scores lower.
+ * A code that fits ONLY this way must also pass the opponent check (see
+ * "UNIVERSITY-ONLY FITS" in resolveTicker), so it can never pick a team the
+ * old matching would not have.
+ */
+function stateUniversityAffinity(code, teamName) {
+  const name = String(teamName || "");
+  if (!/\bstate\b/i.test(name) || /\buniversity\b/i.test(name)) return 0;
+  return codeAffinityCore(code, name.replace(/\bstate\b/i, "state university"));
+}
+
+function codeAffinityCore(code, teamName) {
   const c = String(code || "").toLowerCase().replace(/[^a-z]/g, "");
   const words = fold(teamName).toLowerCase().replace(/[^a-z ]/g, " ").split(/\s+/).filter(Boolean);
   if (!c || !words.length) return 0;
@@ -716,7 +740,28 @@ export async function resolveTicker({ sportKey, teamName, commenceTime, opponent
     if (!tcode) continue;
     codesAvailable++;
     const aff = codeAffinity(tcode, teamName);
-    if (aff > 0) coded.push({ m, tcode, aff });
+    if (aff > 0) coded.push({ m, tcode, aff, universityOnly: codeAffinityCore(tcode, teamName) === 0 });
+  }
+
+  // UNIVERSITY-ONLY FITS (2026-10-09). A code that fits this team only through
+  // the "State University" reading is kept only when its game holds the
+  // opponent. Mississippi State fits MSU that way, but MSU is Michigan State's
+  // game - dropped, so Mississippi State resolves exactly as it did before.
+  // Iowa State fits ISU that way and ISU's game holds BYU - kept.
+  for (let i = coded.length - 1; i >= 0; i--) {
+    if (coded[i].universityOnly && !opponentCheck(coded[i].m, coded[i].tcode).ok) coded.splice(i, 1);
+  }
+  // OPPONENT FIRST (2026-10-09). When several codes fit, keep the ones whose
+  // game holds the opponent. "Iowa State" fits IOWA (Iowa's game, higher score)
+  // and ISU (its own); IOWA was picked, refused by the opponent check, and the
+  // real ISU market was never tried. Only applied when at least one code
+  // passes - otherwise every candidate is kept and the refusal is unchanged.
+  if (coded.length > 1) {
+    const passing = coded.filter((x) => opponentCheck(x.m, x.tcode).ok);
+    if (passing.length && passing.length < coded.length) {
+      coded.length = 0;
+      coded.push(...passing);
+    }
   }
 
   // IF THIS SERIES CARRIES SIDE CODES AND NONE OF THEM FIT, THE TEAM IS NOT
