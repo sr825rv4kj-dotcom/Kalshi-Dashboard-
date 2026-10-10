@@ -766,6 +766,29 @@ const ONE_TIME_UPDATES = [
     },
     note: "Kalshi base stake $5 (was $8); Polymarket base $3.50 ($5 at $50 equity); mirror only within 10 min of Kalshi's fill and within 5c of its price",
   },
+  {
+    // KEEP WHAT WORKS (2026-10-10, account holder's call: "use what works and
+    // drop what doesn't"). From the account's 270 closed trades (export
+    // 2026-10-10 05:53Z):
+    //   Polymarket        65 trades  -$36.21  copies of Kalshi's picks (same
+    //                                         result on every shared game),
+    //                                         paying its own fees - off.
+    //                                         Back on: Controls > Polymarket > Auto
+    //   NHL (regular)     10 trades   2 won vs 4.3 implied, -$22.13 - off
+    //   Kalshi pre-game   32 trades  -$6.00 (-13%); in-play is where the
+    //                                         profit is - in-play only
+    // Kalshi with these and the 60-69c block replayed: 148 trades, +$72.00
+    // (+14.7%) - the 57 trades it skips netted -$45.85.
+    id: "2026-10-10-keep-what-works",
+    apply: (c) => {
+      const off = new Set(Array.isArray(c.disabledSports) ? c.disabledSports : []);
+      off.add("icehockey_nhl");
+      c.disabledSports = [...off];
+      c.liveOnly = true;
+      c.polymarket = { ...DEFAULTS.polymarket, ...(c.polymarket || {}), trading: "off" };
+    },
+    note: "Polymarket buying off; NHL off; Kalshi trades in-play only",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
