@@ -30,6 +30,7 @@ import path from "path";
 import { DATA_DIR } from "./paths.js";
 import { atomicWriteFileSync, tradingDay } from "./stateStore.js";
 import { loadLedger } from "./tradeLedgerStore.js";
+import { paperReport } from "./paperTrader.js";
 
 export const TRADE_COUNTER_VERSION = "2026-10-06-trade-counter";
 
@@ -198,6 +199,9 @@ export function tradeCounterReport(config = {}) {
     },
     blockers,
     entries: entries.slice(0, 20),
+    // PAPER STRATEGIES (2026-10-11): other ways of trading, scored on real
+    // prices without spending (paperTrader.js).
+    paper: (() => { try { return paperReport(); } catch (err) { return { error: err.message }; } })(),
   };
 }
 
