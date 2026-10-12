@@ -86,6 +86,27 @@ export default function TradeCounterPanel({ apiBase }) {
             {r.blockers.map((b) => <Row key={b.code} label={b.label} value={b.count.toLocaleString()} />)}
           </div>
 
+          {r.paper && Array.isArray(r.paper.strategies) && (
+            <div className="bot-subsection">
+              <h3>Paper strategies (no money spent)</h3>
+              <div className="ledger-reason" style={{ marginBottom: 6 }}>{r.paper.note}</div>
+              {r.paper.strategies.map((s) => (
+                <div key={s.key} className="ledger-card">
+                  <div className="ledger-card-head">
+                    <span>{s.label}</span>
+                    <span className={s.settled ? (s.net >= 0 ? "pos" : "neg") : ""}>
+                      {s.settled ? `${s.net >= 0 ? "+" : "-"}$${Math.abs(s.net).toFixed(2)}` : "—"}
+                    </span>
+                  </div>
+                  <Row label="Paper trades" value={`${s.trades} (${s.open} open)`} />
+                  <Row label="Won vs prices implied" value={s.settled ? `${s.wins} of ${s.settled} vs ${s.expectedWins}` : "none settled yet"} />
+                  {s.roiPct != null && <Row label="Return" value={`${s.roiPct >= 0 ? "+" : ""}${s.roiPct}%`} tone={s.roiPct >= 0 ? "pos" : "neg"} />}
+                  {s.recent.length > 0 && <div className="ledger-reason" style={{ marginTop: 4 }}>{s.recent.join(" · ")}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+
           {r.entries.length > 0 && (
             <div className="bot-subsection">
               <h3>Today's trades</h3>
