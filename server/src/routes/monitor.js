@@ -49,6 +49,7 @@ import { pmMonitorReport, PM_ENGINE_VERSION } from "../polymarket/pmEngine.js";
 import { inPlayBookReport } from "../scraper.js";
 import { improvementReport } from "../improvementLab.js";
 import { tradeCounterReport } from "../tradeCounter.js";
+import { paperReport } from "../paperTrader.js";
 
 /**
  * Read MONITOR_TOKEN the way a phone-edited Railway variable actually arrives.
@@ -150,6 +151,90 @@ export function registerMonitorRoutes(app) {
   // to the account holder's own Telegram, not to this route. Contained - a
   // failure to start them must never stop the server from booting.
   try { startHealthAlerts(); } catch (err) { console.warn("[health] alerts not started:", err.message); }
+
+  /**
+   * THE BRIEF (2026-10-10). The same read-only diagnostics, cut down to what
+   * a check-in needs - about 10-20 KB instead of 300 KB - so it can be read
+   * from outside without anyone copying an export by hand. Same token, same
+   * rules: no secrets, no POST, cannot trade or change anything.
+   *   GET /api/monitor/<MONITOR_TOKEN>/brief
+   */
+  app.get("/api/monitor/:token/brief", async (req, res) => {
+    if (!tokenMatches(req.params.token)) {
+      const expected = expectedToken();
+      if (!expected) return res.status(503).json({ error: "Monitor not configured on this server." });
+      return res.status(403).json({ error: "Wrong monitor token." });
+    }
+    const out = { at: new Date().toISOString(), kind: "brief" };
+    const section = (name, fn) => {
+      try { out[name] = fn(); } catch (err) { out[name] = { error: err.message }; }
+    };
+    const cut = (s, n = 220) => { const x = String(s ?? ""); return x.length > n ? x.slice(0, n) + "..." : x; };
+
+    section("versions", () => ({
+      scanner: SCANNER_VERSION, resolver: RESOLVER_VERSION, controller: CONTROLLER_VERSION,
+      polymarket: PM_ENGINE_VERSION, health: HEALTH_VERSION, maker: MAKER_VERSION,
+      settingsUpdates: (() => { const c = loadConfig(); return Array.isArray(c.oneTimeUpdates) ? c.oneTimeUpdates.slice(-4) : null; })(),
+    }));
+    section("problems", () => {
+      const d = diagnose();
+      return { summary: d.summary, items: (d.problems || []).map((p) => `${p.severity}: ${p.title}`) };
+    });
+    section("bot", () => {
+      const st = loadState();
+      return {
+        running: !!st.running, haltedForDay: !!st.haltedForDay, haltReason: st.haltReason ?? null,
+        open: (st.positions || []).map((p) => `${p.teamName} ${p.sportKey} ${p.contracts}x @ ${p.entryPriceCents}c since ${p.openedAt}`),
+      };
+    });
+    section("balances", () => {
+      const s = stakeReport(loadConfig()).current || {};
+      let pm = null;
+      try { pm = pmMonitorReport(loadConfig()).account ?? null; } catch { pm = null; }
+      return { kalshiEquity: s.equity ?? null, kalshiStake: s.stake ?? null, nextStakeAt: s.nextAt ?? null, polymarket: pm };
+    });
+    section("today", () => {
+      const r = tradeCounterReport(loadConfig());
+      return { day: r.day, scans: r.scans, entered: r.entered, byLane: r.byLane, pace: `${r.pace.entered} of ${r.pace.targetPerDay} (${r.pace.status})`, blockers: r.blockers.slice(0, 6).map((b) => `${b.code} x${b.count}`) };
+    });
+    section("results", () => {
+      const done = getTradeLifecycles().completed;
+      const net = (list) => Math.round(list.reduce((t, x) => t + x.netDollars, 0) * 100) / 100;
+      const isPm = (x) => String(x.ticker || "").startsWith("PM:");
+      const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      const last24 = done.filter((x) => Date.parse(x.exitTimestamp) >= dayAgo);
+      return {
+        allTime: { trades: done.length, net: net(done), kalshi: net(done.filter((x) => !isPm(x))), polymarket: net(done.filter(isPm)) },
+        last24h: { trades: last24.length, won: last24.filter((x) => x.netDollars > 0).length, net: net(last24) },
+        recent: done.slice(0, 15).map((x) => `${x.exitTimestamp} ${isPm(x) ? "PM" : "K"} ${x.sportKey} ${x.teamName} ${x.contracts}x@${x.entryPriceCents}c ${x.exitReason} ${x.netDollars >= 0 ? "+" : ""}${x.netDollars.toFixed(2)}`),
+      };
+    });
+    section("scans", () => {
+      const st = loadState();
+      const scans = Object.entries(st.lastScan || {}).filter(([, r]) => r.seen > 0);
+      const total = {};
+      for (const [, r] of scans) for (const [k, n] of Object.entries(r.reasons || {})) total[k] = (total[k] || 0) + n;
+      return {
+        refusalsLastScan: total,
+        bySport: scans.slice(0, 12).map(([k, r]) => `${k}: seen ${r.seen}, entered ${r.entered}, ${Object.entries(r.reasons || {}).map(([c, n]) => `${c} x${n}`).join(", ")}`),
+        examples: scans.slice(0, 6).flatMap(([, r]) => Object.values(r.samples || {}).slice(0, 2).map((s) => cut(s, 200))),
+      };
+    });
+    section("learner", () => learnerReport(loadConfig()).segments.filter((s) => s.blocked).map((s) => `${s.segment}: ${s.wins}/${s.trades} vs ${s.expectedWins}, ${s.net}`));
+    section("paper", () => paperReport().strategies.map((s) => `${s.label}: ${s.trades} trades (${s.open} open), won ${s.wins}/${s.settled} vs ${s.expectedWins}, net ${s.net}`));
+    section("settings", () => {
+      const c = loadConfig();
+      return {
+        liveOnly: c.liveOnly !== false, fairShrink: c.fairShrink ?? null, minExpectedReturnPct: c.minExpectedReturnPct,
+        entryCents: `${c.minEntryPriceCents}-${c.maxEntryPriceCents}`, liveBandCents: `${c.liveBandMinCents}-${c.liveBandMaxCents}`,
+        lanes: c.lanes ?? null, flatStakeDollars: c.flatStakeDollars, blockedEntryCents: c.blockedEntryCents ?? "default 60-69",
+        disabledSports: c.disabledSports ?? [], polymarketTrading: c.polymarket?.trading ?? null, dailyLossHaltPct: c.dailyLossHaltPct,
+      };
+    });
+    section("log", () => getRecentLog(30).map((l) => `${l.time} ${l.level} ${cut(l.message)}`));
+
+    res.json(out);
+  });
 
   app.get("/api/monitor/:token", async (req, res) => {
     if (!tokenMatches(req.params.token)) {
@@ -263,6 +348,8 @@ export function registerMonitorRoutes(app) {
     section("improvements", () => improvementReport());
     // THE DAY'S COUNTER: trades by lane and exchange, pace, top blockers.
     section("tradeCounter", () => tradeCounterReport(loadConfig()));
+    // PAPER STRATEGIES: other ways of trading, scored without spending.
+    section("paper", () => paperReport());
     // Current stake, the tier it came from, the next step, and any double-downs.
     section("stake", () => stakeReport(loadConfig()));
     // Trading Desk: swing positions (bid, fair, next sale), today vs the goal.
