@@ -87,6 +87,7 @@ import { recordFairFromProbabilities } from "./fairValue.js";
 import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { countScan, countEntry } from "./tradeCounter.js";
+import { paperObserve } from "./paperTrader.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame } from "./polymarket/pmState.js";
 import { fairShrinkOf, shrinkFair, modelPricingAllowed, laneFor, laneMiss, returnTierOf, blockedEntryRange, limitBelowBlocked } from "./sportRules.js";
@@ -96,7 +97,7 @@ import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-09-block-60-69";
+export const SCANNER_VERSION = "2026-10-11-paper-strategies";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -843,6 +844,11 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       await dropResting(c.ticker, "no usable price in the book");
       continue;
     }
+
+    // PAPER STRATEGIES (2026-10-11, paperTrader.js): every priced market is
+    // offered to the paper strategies before the real lane rules - scored on
+    // real prices and Kalshi's real results, no money spent.
+    if (!c.addOn) paperObserve({ ticker: c.ticker, sportKey, teamName: c.teamName, askCents, fair: c.trueProbability, live: c.timing.live, commenceTime: c.commenceTime });
 
     // THREE LANES (2026-10-03, sportRules.js): dip (35-49c, 5% minimum),
     // middle (50-92c, 2-8% expected return) and favorite (65%+ to win, up to
