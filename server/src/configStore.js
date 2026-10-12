@@ -826,6 +826,43 @@ const ONE_TIME_UPDATES = [
     },
     note: "best-day formula: in-play only, 35-59c, 30% min expected return, no fair shrink, $5 flat; middle and favorite lanes off",
   },
+  {
+    // 50-59c ONLY (2026-10-11, account holder's call: "50-59c is the most
+    // profit and safety"). The account's Kalshi trades bought at 50-59c:
+    //   28 trades, 21 won (75%), +$24.07 (+23.7%)
+    //   expected return 0.5-8% at entry:  24 trades, 20 won, +$36.56
+    //   expected return 30%+ at entry:     4 trades,  1 won, -$12.49
+    // At these prices a big claimed edge has meant a stale line, so the lane
+    // takes small edges (0.5% minimum) and refuses "too good" ones (8% ceiling),
+    // measured on the shrunk fair value those winning trades were priced on.
+    //   - one lane, 50-59c; dip and favorite lanes off
+    //   - in-play AND pre-game (50-59c pre-game won 4 of 5)
+    //   - every sport, NHL back on (its 50-59c trades won 6 of 6)
+    //   - daily loss halt 10% (was 15%); no per-trade stop loss - the
+    //     account's stop-loss and blowout exits lost $24.86 together
+    //   - Polymarket copies Kalshi's trades again, never below Kalshi's price
+    //     (so never under 50c) and never into 60c+ (60-69c stays blocked)
+    id: "2026-10-11-fifty-to-fifty-nine",
+    apply: (c) => {
+      c.flatStakeDollars = 5;
+      c.liveOnly = false;
+      c.fairShrink = 0.5;
+      c.minExpectedReturnPct = 0.5;
+      c.minEntryPriceCents = 50;
+      c.liveBandMinCents = 50;
+      c.maxEntryPriceCents = 59;
+      c.liveBandMaxCents = 59;
+      c.dailyLossHaltPct = 0.10;
+      c.lanes = {
+        dip: { ...(c.lanes?.dip || {}), enabled: false },
+        middle: { enabled: true, minCents: 50, maxCents: 59, minReturnPct: 0.5, maxReturnPct: 8 },
+        favorite: { ...(c.lanes?.favorite || {}), enabled: false },
+      };
+      c.disabledSports = (Array.isArray(c.disabledSports) ? c.disabledSports : []).filter((s) => s !== "icehockey_nhl");
+      c.polymarket = { ...DEFAULTS.polymarket, ...(c.polymarket || {}), trading: "auto", mirrorKalshi: true, mirrorMaxExtraCents: 2, mirrorMaxBelowCents: 0, flatStakeDollars: 3.5 };
+    },
+    note: "50-59c only (0.5-8% expected return), in-play and pre-game, all sports incl. NHL, 10% daily halt, Polymarket mirrors Kalshi at 50-59c",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
