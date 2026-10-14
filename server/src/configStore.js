@@ -332,6 +332,16 @@ export const DEFAULTS = {
   // every tournament key. Delete an entry to turn that sport back on.
   disabledSports: ["mma_mixed_martial_arts", "tennis_*", "basketball_euroleague"],
 
+  // PAPER-ONLY SPORTS (2026-10-13, sportRules.js paperOnlySport). Still
+  // scanned and scored by the paper strategies (paperTrader.js), but no real
+  // buy on either exchange - Polymarket only copies Kalshi's trades. Same
+  // "*" prefix rule as disabledSports. Delete an entry to trade it again.
+  paperOnlySports: [],
+
+  // FLIP SPORTS (2026-10-13, flipTrader.js). The normal formula runs; when it
+  // picks a team, the OTHER team in that game is bought instead, same stake.
+  flipSports: [],
+
   // PER-SPORT PRICE FLOOR (2026-10-02, sportRules.js). Raised over the normal
   // band for that sport only, pre-game and live, both exchanges, resting bids
   // included. NHL (regular + preseason, Kalshi): entries under 45c won 2 of
@@ -863,6 +873,76 @@ const ONE_TIME_UPDATES = [
     },
     note: "50-59c only (0.5-8% expected return), in-play and pre-game, all sports incl. NHL, 10% daily halt, Polymarket mirrors Kalshi at 50-59c",
   },
+  {
+    // AT MOST 3 OPEN BETS (2026-10-11, account holder's call: "1-3 bots until
+    // the balance goes up"). A fixed cap on open positions, on each exchange,
+    // resting bids included - replaces the 5-10 cap by balance. Raise it later
+    // by changing maxConcurrentPositions.
+    id: "2026-10-11-max-3-open",
+    apply: (c) => { c.maxConcurrentPositions = 3; },
+    note: "at most 3 open bets at a time on each exchange (resting bids count)",
+  },
+  {
+    // NHL TO PAPER (2026-10-13, account holder's call: "a lot of losses mainly
+    // nhl... purposely bet on what [you] think would be the losing team").
+    // The account's Kalshi NHL trades: 2 won of 13 vs 5.9 the prices implied
+    // (z -2.2), -$31.89; since the 50-59c plan 0 of 3, -$9.76. The other side
+    // of those games would have made +$20.30 - in hindsight, on 8 trades.
+    // Real money stops on NHL; the paper "nhl_flip" strategy bets the other
+    // team every time the live rule would have bought one, at the real ask,
+    // so the flip is proven or disproven before any money goes on it.
+    id: "2026-10-13-nhl-paper-only",
+    apply: (c) => {
+      const off = new Set(Array.isArray(c.paperOnlySports) ? c.paperOnlySports.map(String) : []);
+      off.add("icehockey_nhl");
+      c.paperOnlySports = [...off];
+    },
+    note: "NHL: no real-money bets; still priced and scored on paper (live rule vs the flip)",
+  },
+  {
+    // LOSING SPORTS TO PAPER (2026-10-13, account holder's call: "look at all
+    // other high losing sports... try the same things again"). Kalshi trades
+    // held to the result, won vs the prices implied, from the account's
+    // closed trades (2026-10-14 02:36Z export):
+    //   NHL preseason        3 of 9  vs 3.7   -$9.70
+    //   MLB                 12 of 34 vs 15.0  -$5.72  (z -1.1)
+    //   NBA preseason        7 of 14 vs 8.9   -$8.71  (z -1.1)
+    //   Brazil Serie B       1 of 8  vs 2.8   -$11.65 (z -1.35)
+    //   Brazil Serie A       0 of 2  vs 0.8   -$9.76
+    //   MLS                  0 of 2  vs 0.9   -$9.28
+    // No real-money bets on these; paper flips (paperTrader.js FLIP_GROUPS)
+    // bet NO on every pick the live rule would have made. Tennis, EuroLeague
+    // and MMA stay switched off entirely (disabledSports).
+    id: "2026-10-13-losing-sports-paper-only",
+    apply: (c) => {
+      const off = new Set(Array.isArray(c.paperOnlySports) ? c.paperOnlySports.map(String) : []);
+      for (const k of ["icehockey_nhl", "icehockey_nhl_preseason", "baseball_mlb", "basketball_nba_preseason",
+        "soccer_brazil_serie_b", "soccer_brazil_campeonato", "soccer_usa_mls"]) off.add(k);
+      c.paperOnlySports = [...off];
+    },
+    note: "NHL, NHL preseason, MLB, NBA preseason, Brazil Serie A/B, MLS: no real-money bets; scored on paper (live rule vs the flip)",
+  },
+  {
+    // REAL-MONEY FLIP (2026-10-13 20:08 PT, account holder's call: "Bet on
+    // the opposite teams. All losing teams that have lost consistently use
+    // same formula just bet on opposite what bot thinks is going to win. Same
+    // with mlb"). The sports the bot has lost in, from the account's closed
+    // Kalshi trades: NHL, NHL preseason, MLB, NBA preseason, Brazil Serie A,
+    // Brazil Serie B, MLS. They come off paper-only and trade for real, flipped
+    // (flipTrader.js): the 50-59c formula runs unchanged, and when it picks a
+    // team the other team is bought at its own ask, $5 flat. Tennis, EuroLeague
+    // and MMA stay switched off (disabledSports).
+    id: "2026-10-13-flip-losing-sports",
+    apply: (c) => {
+      const flip = ["icehockey_nhl", "icehockey_nhl_preseason", "baseball_mlb", "basketball_nba_preseason",
+        "soccer_brazil_serie_b", "soccer_brazil_campeonato", "soccer_usa_mls"];
+      c.paperOnlySports = (Array.isArray(c.paperOnlySports) ? c.paperOnlySports : []).filter((k) => !flip.includes(k));
+      const set = new Set(Array.isArray(c.flipSports) ? c.flipSports.map(String) : []);
+      for (const k of flip) set.add(k);
+      c.flipSports = [...set];
+    },
+    note: "FLIP for real: NHL, NHL preseason, MLB, NBA preseason, Brazil Serie A/B, MLS - when the formula picks a team, the other team is bought ($5)",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
@@ -950,6 +1030,8 @@ export function describeStrategy() {
     clv: `kill switch ${c.clvKillSwitch === false ? "off" : "on"} (${c.clvMinSample ?? 15} marks, ${c.clvZ ?? 1}x SE); ` +
       `Kelly sizing ${c.clvGatedSizing === false ? "for every sport" : "only on sports with proven CLV"}`,
     disabledSports: (c.disabledSports || []).join(", ") || "none",
+    paperOnlySports: (c.paperOnlySports || []).join(", ") || "none",
+    flipSports: (c.flipSports || []).join(", ") || "none",
     entries: c.liveOnly === false ? "live and pre-game" : "LIVE GAMES ONLY - no pre-game buys or resting bids",
   };
 }
