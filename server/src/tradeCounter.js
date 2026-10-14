@@ -161,6 +161,9 @@ const CODE_WORDS = {
   "model-priced": "betting line stale - priced on the score model",
   "dropped:duplicate": "already holding that game",
   "skipped:shard-unfunded": "Kalshi rejected - funds on another exchange shard",
+  "paper-only-sport": "paper-only sport - scored on paper, no real bet",
+  "flip-no-opponent": "flip skipped - other team's market not found",
+  "flip-no-size": "flip skipped - stake too small at that price",
 };
 
 /** For the System tab and the monitor. */
