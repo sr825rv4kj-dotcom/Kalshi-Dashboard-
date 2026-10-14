@@ -20,6 +20,15 @@
  */
 
 /** Is this sport switched off? Supports exact keys and "prefix*" entries. */
+/**
+ * PAPER-ONLY SPORTS (2026-10-13). Scanned and scored by paperTrader.js, never
+ * bought with real money (scanner.js refuses after the paper observation).
+ * "*" suffix = prefix match, as in disabledSports.
+ */
+export function paperOnlySport(sportKey, config = {}) {
+  return sportDisabled(sportKey, { disabledSports: Array.isArray(config.paperOnlySports) ? config.paperOnlySports : [] });
+}
+
 export function sportDisabled(sportKey, config = {}) {
   const key = String(sportKey || "");
   const list = Array.isArray(config.disabledSports) ? config.disabledSports : [];
