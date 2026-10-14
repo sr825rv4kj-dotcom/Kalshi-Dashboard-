@@ -21,6 +21,17 @@
  *                                               - the Sep 26-27 formula
  *   avg_down     a REAL open Kalshi position whose ask has fallen 10c+ below
  *                its entry: one paper add at that ask (the "double down" idea)
+ *   nhl_flip / mlb_flip / nba_flip / soccer_flip   (2026-10-13) THE FLIP:
+ *                whenever the live rule (fifty_59) would buy a team in that
+ *                sport group, buy "NO" on that same market instead - the bet
+ *                against the bot's pick (for hockey, baseball and basketball
+ *                that is the other team; in soccer it is the other team OR a
+ *                draw). Priced at the real "no" ask read from Kalshi, settled
+ *                from the same market result ("no" wins).
+ *
+ * Since 2026-10-13 20:08 PT these sports also trade the flip for REAL money
+ * (flipTrader.js - the other team's YES); the paper flip keeps scoring the
+ * NO side alongside it.
  *
  * Never places, cancels or sizes a real order. Stored in
  * DATA_DIR/paper-trades.json, written atomically.
@@ -33,7 +44,7 @@ import { atomicWriteFileSync, loadState } from "./stateStore.js";
 import { scheduleFeeCents } from "./tradeLedgerStore.js";
 import { kalshiGet, hasCredentialsConfigured } from "./kalshiClient.js";
 
-export const PAPER_VERSION = "2026-10-11-paper-strategies";
+export const PAPER_VERSION = "2026-10-13-flip-groups";
 
 const FILE = path.join(DATA_DIR, "paper-trades.json");
 const STAKE_DOLLARS = 5;
@@ -49,7 +60,23 @@ export const STRATEGIES = {
   fav_70_89: "70-89c favorites, 65%+ to win",
   best_day: "Best-day formula: in-play 35-59c, 30%+ raw return",
   avg_down: "Average down: add after a 10c+ drop",
+  nhl_flip: "NHL flip: bet against the bot's pick",
+  mlb_flip: "MLB flip: bet against the bot's pick",
+  nba_flip: "NBA preseason flip: bet against the bot's pick",
+  soccer_flip: "Soccer flip (Brazil A/B, MLS): bet against the bot's pick",
 };
+
+/** Which flip strategy (if any) scores a sport. */
+export const FLIP_GROUPS = {
+  icehockey_nhl: "nhl_flip",
+  icehockey_nhl_preseason: "nhl_flip",
+  baseball_mlb: "mlb_flip",
+  basketball_nba_preseason: "nba_flip",
+  soccer_brazil_serie_b: "soccer_flip",
+  soccer_brazil_campeonato: "soccer_flip",
+  soccer_usa_mls: "soccer_flip",
+};
+const flipInFlight = new Set();
 
 let book = null;
 let timersStarted = false;
@@ -112,10 +139,10 @@ function hasPosition(strategy, ticker) {
   return load().positions.some((x) => x.strategy === strategy && (x.event === ev || x.ticker === ticker));
 }
 
-function record({ strategy, ticker, sportKey, teamName, askCents, fair, live, commenceTime, note }) {
+function record({ strategy, ticker, side = "yes", sportKey, teamName, askCents, fair, live, commenceTime, note }) {
   const { contracts, feeCents, costDollars } = paperSize(askCents);
   load().positions.push({
-    strategy, ticker, event: eventOf(ticker), sportKey: sportKey ?? null, team: teamName ?? null,
+    strategy, ticker, side, event: eventOf(ticker), sportKey: sportKey ?? null, team: teamName ?? null,
     priceCents: Number(askCents), fair: Number.isFinite(Number(fair)) ? Math.round(Number(fair) * 1000) / 1000 : null,
     live: !!live, contracts, feeCents, costDollars, commenceTime: commenceTime ?? null, note: note ?? null,
     openedAt: new Date().toISOString(), result: null, netDollars: null, settledAt: null,
@@ -136,7 +163,39 @@ export function paperObserve({ ticker, sportKey, teamName, askCents, fair, live,
       added = true;
     }
     if (added) save();
+    const flip = FLIP_GROUPS[String(sportKey)];
+    if (flip && strategiesFor({ askCents, fair, live }).includes("fifty_59")) {
+      flipAgainst({ strategy: flip, ticker, sportKey, teamName, askCents, live, commenceTime }).catch(() => {});
+    }
   } catch { /* never affects the scan */ }
+}
+
+/**
+ * THE FLIP: the live rule would buy `teamName` on `ticker`; record a paper buy
+ * of "NO" on that same market at its real no ask, read fresh from Kalshi.
+ */
+async function flipAgainst({ strategy, ticker, sportKey, teamName, askCents, live, commenceTime }) {
+  const ev = eventOf(ticker);
+  if (!ev || flipInFlight.has(ev) || hasPosition(strategy, ticker)) return;
+  if (!hasCredentialsConfigured()) return;
+  flipInFlight.add(ev);
+  try {
+    const m = await readMarket(ticker);
+    // NO ask straight from Kalshi; if absent, 100 minus the YES bid - the same
+    // price in Kalshi's binary book (selling YES at the bid = buying NO).
+    const yesBid = centsField(m, "yes_bid");
+    const noAsk = centsField(m, "no_ask") ?? (yesBid ? 100 - yesBid : null);
+    if (!(noAsk >= 1 && noAsk <= 99)) return;
+    record({
+      strategy, ticker, side: "no", sportKey,
+      teamName: `against ${teamName ?? ticker}`,
+      askCents: noAsk, fair: null, live, commenceTime,
+      note: `bot would buy ${teamName ?? ticker} at ${askCents}c; NO bought at ${noAsk}c`,
+    });
+    save();
+  } finally {
+    flipInFlight.delete(ev);
+  }
 }
 
 function centsField(m, key) {
@@ -188,7 +247,8 @@ async function settleOpen() {
       const r = String(m.result || "").toLowerCase();
       if (r !== "yes" && r !== "no") continue;
       x.result = r;
-      x.netDollars = Math.round(((r === "yes" ? x.contracts : 0) - x.costDollars) * 100) / 100;
+      x.won = r === (x.side || "yes");
+      x.netDollars = Math.round(((x.won ? x.contracts : 0) - x.costDollars) * 100) / 100;
       x.settledAt = new Date().toISOString();
       changed = true;
     } catch { /* retried next round */ }
@@ -209,7 +269,8 @@ export function scorecards(positions) {
   return Object.entries(STRATEGIES).map(([key, label]) => {
     const all = positions.filter((x) => x.strategy === key);
     const done = all.filter((x) => x.result);
-    const wins = done.filter((x) => x.result === "yes").length;
+    const won = (x) => (x.won != null ? x.won : x.result === (x.side || "yes"));
+    const wins = done.filter(won).length;
     const net = done.reduce((t, x) => t + x.netDollars, 0);
     const cost = done.reduce((t, x) => t + x.costDollars, 0);
     return {
@@ -218,7 +279,7 @@ export function scorecards(positions) {
       expectedWins: Math.round(done.reduce((t, x) => t + x.priceCents / 100, 0) * 10) / 10,
       net: Math.round(net * 100) / 100,
       roiPct: cost > 0 ? Math.round((net / cost) * 1000) / 10 : null,
-      recent: all.slice(-5).reverse().map((x) => `${x.team ?? x.ticker} @ ${x.priceCents}c ${x.result ? (x.result === "yes" ? "won" : "lost") + ` ${x.netDollars >= 0 ? "+" : ""}${x.netDollars.toFixed(2)}` : "open"}`),
+      recent: all.slice(-5).reverse().map((x) => `${x.team ?? x.ticker} @ ${x.priceCents}c ${x.result ? (won(x) ? "won" : "lost") + ` ${x.netDollars >= 0 ? "+" : ""}${x.netDollars.toFixed(2)}` : "open"}`),
     };
   });
 }
@@ -229,7 +290,7 @@ export function paperReport() {
   return {
     version: PAPER_VERSION,
     since: positions.length ? positions[0].openedAt : null,
-    note: "Paper only - flat $5 at the real ask, real taker fee, settled from Kalshi's own result. No money is spent.",
+    note: "Paper only - flat $5 at the real ask, real taker fee, settled from Kalshi's own result. No money is spent. Paper flips bet NO on the bot's pick (NHL, MLB, NBA preseason, Brazil A/B, MLS); real money flips those sports too (other team's YES).",
     strategies: scorecards(positions),
   };
 }
