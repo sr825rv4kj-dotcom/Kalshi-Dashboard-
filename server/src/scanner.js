@@ -88,16 +88,17 @@ import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { countScan, countEntry } from "./tradeCounter.js";
 import { paperObserve } from "./paperTrader.js";
+import { flipSport, findOpponent } from "./flipTrader.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame } from "./polymarket/pmState.js";
-import { fairShrinkOf, shrinkFair, modelPricingAllowed, laneFor, laneMiss, returnTierOf, blockedEntryRange, limitBelowBlocked } from "./sportRules.js";
+import { fairShrinkOf, shrinkFair, modelPricingAllowed, laneFor, laneMiss, returnTierOf, blockedEntryRange, limitBelowBlocked, paperOnlySport } from "./sportRules.js";
 import { noteDecision, noteScan } from "./scanFeed.js";
 import { getTradeLifecycles, filterByVenue } from "./tradeLedgerStore.js";
 import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-11-paper-strategies";
+export const SCANNER_VERSION = "2026-10-13-real-flip";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -850,6 +851,22 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // real prices and Kalshi's real results, no money spent.
     if (!c.addOn) paperObserve({ ticker: c.ticker, sportKey, teamName: c.teamName, askCents, fair: c.trueProbability, live: c.timing.live, commenceTime: c.commenceTime });
 
+    // PAPER-ONLY SPORT (2026-10-13, configStore.js paperOnlySports - NHL, MLB,
+    // NBA preseason, Brazil Serie A/B, MLS):
+    // priced and scored on paper above, never bought - taker, resting bid or
+    // double-down. A bid already resting on it is cancelled.
+    if (paperOnlySport(sportKey, config)) {
+      const line = `${c.ticker}: ${sportKey} is paper-only - scored on paper, no real bet`;
+      ddBump("paper-only-sport", line);
+      rejected.push(line);
+      await dropResting(c.ticker, "sport is paper-only");
+      continue;
+    }
+    // FLIP SPORT (2026-10-13, flipTrader.js): no double-downs and no resting
+    // bids - a resting bid would buy the bot's own pick, not the other team.
+    const flipping = flipSport(sportKey, config);
+    if (flipping && c.addOn) continue;
+
     // THREE LANES (2026-10-03, sportRules.js): dip (35-49c, 5% minimum),
     // middle (50-92c, 2-8% expected return) and favorite (65%+ to win, up to
     // 92c, 2% minimum). A side that fits none is not bought. A double-down keeps
@@ -911,7 +928,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // 2026-10-06: judged by sport AT this price range, and a blocked range may
     // take one half-stake PROBATION trade a day while the bot is behind pace.
     const learned = learnedBlock({ sportKey, priceCents: askCents, allowProbation: !c.addOn }, config);
-    if (learned.blocked) {
+    // In a flip sport the bot's picks losing is the reason to flip - a learner
+    // block on the bot's own pick does not stop the flip (flipTrader.js).
+    if (learned.blocked && flipping) appendLog(`${c.ticker} ${askCents}c: learner block on the bot's pick ignored - ${sportKey} is flipped`);
+    if (learned.blocked && !flipping) {
       const line = `${c.ticker} ${askCents}c: ${learned.reason}`;
       ddBump("learned-block", line);
       rejected.push(line);
@@ -990,6 +1010,8 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       rejected.push(line);
       if (c.addOn) {
         // An add-on never becomes a resting bid - it is taken now or not at all.
+      } else if (flipping) {
+        await dropResting(c.ticker, "flip sport - no resting bids");
       } else if (assessment.code === "edge-too-small" || (c.timing.live && assessment.code === "price-above-ceiling")) {
         // Fairly priced (or priced above the band) right now: rest a bid at
         // the price that returns the minimum and let the market come to it.
@@ -1038,7 +1060,7 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
         rejected.push(line);
         // LIVE: an edge too thin at the ask can still return the minimum a few
         // cents lower - rest a bid there (makerEngine.js LIVE RESTING BIDS).
-        if (c.timing.live && !c.addOn) {
+        if (c.timing.live && !c.addOn && !flipping) {
           const m = await workCandidate({ c: cMaker, config, bankroll, cap: positionCap, heldEvents, stakeDollars: flatStake });
           maker[m.action] = (maker[m.action] || 0) + 1;
           if (!makerExample || (m.action !== "none" && m.action !== "kept")) makerExample = m.line;
@@ -1139,6 +1161,78 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     if (bidOnGame || cancelPendingOnEvent(c.ticker)) {
       rejected.push(`${c.ticker}: taker entry waits one cycle for a resting bid on this game to clear`);
       feedC("waiting-for-bid-cancel", "Clearing a resting bid on this game first - buys next cycle if the edge holds");
+      continue;
+    }
+
+    // THE FLIP (2026-10-13, flipTrader.js): the formula picked c.teamName -
+    // buy the OTHER team in this game instead, at its own real ask, same flat
+    // stake, limit = the ask (no walk-up).
+    if (flipping) {
+      let opp;
+      try { opp = await findOpponent(c.ticker); } catch (err) { opp = { error: err.message }; }
+      if (opp.error) {
+        const line = `${c.ticker}: flip skipped - ${opp.error}`;
+        ddBump("flip-no-opponent", line);
+        rejected.push(line);
+        continue;
+      }
+      const oppBlocked = blockedEntryRange(opp.askCents, config);
+      if (oppBlocked) {
+        const line = `${opp.ticker}: flip skipped - ${opp.askCents}c is in the blocked ${oppBlocked.min}-${oppBlocked.max}c range`;
+        ddBump("blocked-price-range", line);
+        rejected.push(line);
+        continue;
+      }
+      const feeMult = config.feeMultiplier ?? 0.07;
+      const stake = Number.isFinite(flatStake) && flatStake > 0 ? flatStake : Number(config.flatStakeDollars ?? 5);
+      const n = flatBetContracts(stake, opp.askCents, feeMult);
+      if (!(n >= 1)) {
+        const line = `${opp.ticker}: flip skipped - $${stake.toFixed(2)} buys no contracts at ${opp.askCents}c`;
+        ddBump("flip-no-size", line);
+        rejected.push(line);
+        continue;
+      }
+      const dollarsIn = (n * (opp.askCents + feePerContractCents(opp.askCents, n, feeMult))) / 100;
+      appendLog(
+        `FLIP ${sportKey}: the formula picked ${c.teamName} at ${askCents}c (sharp ${(c.trueProbability * 100).toFixed(1)}%) - ` +
+        `buying the other team, ${opp.teamName} (${opp.ticker}), ${n} @ ${opp.askCents}c, $${dollarsIn.toFixed(2)} in`
+      );
+      let flipResult = null;
+      try {
+        flipResult = await enterPosition({
+          ticker: opp.ticker,
+          side: "yes",
+          priceCents: opp.askCents,
+          limitCents: opp.askCents,
+          exchangeIndex: opp.exchangeIndex,
+          contracts: n,
+          reason:
+            `FLIP (${c.timing.live ? "in-play" : "pre-game"}): the bot's formula picked "${c.teamName}" at $${(askCents / 100).toFixed(2)} ` +
+            `(sharp ${(c.trueProbability * 100).toFixed(1)}%) - bought the other team "${opp.teamName}" instead, ` +
+            `${n} contracts at $${(opp.askCents / 100).toFixed(2)}, $${dollarsIn.toFixed(2)} in`,
+          edgePct: null,
+          teamName: opp.teamName,
+          sportKey,
+          commenceTime: c.commenceTime,
+        });
+      } catch (err) {
+        bump("order-error");
+        rejected.push(`${opp.ticker}: flip order failed - ${err.message}`);
+        feedC("order-error", `Flip order failed: ${err.message}`, "tried");
+        continue;
+      }
+      if (flipResult && flipResult.filled > 0) {
+        feedC("bought", `FLIP: formula picked ${c.teamName} at ${askCents}c - bought ${flipResult.filled} of ${opp.teamName} at ${opp.askCents}c`, "bought");
+        openEvents.add(eventKeyOf(c.ticker));
+        heldEvents.add(eventKeyOf(c.ticker));
+        entered += 1;
+        countEntry({ ticker: opp.ticker, lane: "flip", probation: false, segment: null });
+      } else if (flipResult && flipResult.skipped) {
+        ddBump(`skipped:${flipResult.skipped}`, `${opp.ticker}: ${flipResult.skipped}`);
+        rejected.push(`${opp.ticker}: flip order not placed - ${flipResult.skipped}`);
+      } else {
+        ddBump("no-fill", `${opp.ticker}: flip limit ${opp.askCents}c, nothing crossed before the order expired`);
+      }
       continue;
     }
 
