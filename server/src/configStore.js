@@ -943,6 +943,20 @@ const ONE_TIME_UPDATES = [
     },
     note: "FLIP for real: NHL, NHL preseason, MLB, NBA preseason, Brazil Serie A/B, MLS - when the formula picks a team, the other team is bought ($5)",
   },
+  {
+    // MORE BETS (2026-10-16, account holder's call: "more bets deployed right
+    // now. No new formula" -> "6 open, 25% halt"). At $45 equity the 10% halt
+    // was $4.50, so a single $5 loss stopped the day. Same formula, same $5.
+    //   - at most 6 open bets on each exchange (was 3)
+    //   - daily loss halt 25% (was 10%) - about $11 on $45
+    // Soccer flips also buy the tie (flipTrader.js, no config needed).
+    id: "2026-10-16-six-open-25-halt",
+    apply: (c) => {
+      c.maxConcurrentPositions = 6;
+      c.dailyLossHaltPct = 0.25;
+    },
+    note: "at most 6 open bets per exchange, daily loss halt 25%; soccer flips buy the other team and the tie",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
