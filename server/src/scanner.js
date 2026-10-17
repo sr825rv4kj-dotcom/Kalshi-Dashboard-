@@ -88,7 +88,7 @@ import { clvVerdict, recordShadow } from "./clvTracker.js";
 import { learnedBlock, streakStakeFactor } from "./outcomeLearner.js";
 import { countScan, countEntry } from "./tradeCounter.js";
 import { paperObserve } from "./paperTrader.js";
-import { flipSport, findOpponent } from "./flipTrader.js";
+import { flipSport, findOpponent, isSoccer } from "./flipTrader.js";
 import { tieredStake, noteStake, doubleDownConfig, addOnEligible, observeLead, forgetLead, markDoubledDown } from "./scaling.js";
 import { polymarketTeamOnGame } from "./polymarket/pmState.js";
 import { fairShrinkOf, shrinkFair, modelPricingAllowed, laneFor, laneMiss, returnTierOf, blockedEntryRange, limitBelowBlocked, paperOnlySport } from "./sportRules.js";
@@ -98,7 +98,7 @@ import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-13-real-flip";
+export const SCANNER_VERSION = "2026-10-16-soccer-tie-flip";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -1168,70 +1168,90 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     // buy the OTHER team in this game instead, at its own real ask, same flat
     // stake, limit = the ask (no walk-up).
     if (flipping) {
+      // SOCCER (2026-10-16): the other team AND the tie, $5 each.
+      const soccer = isSoccer(sportKey);
       let opp;
-      try { opp = await findOpponent(c.ticker); } catch (err) { opp = { error: err.message }; }
+      try { opp = await findOpponent(c.ticker, { withTie: soccer }); } catch (err) { opp = { error: err.message }; }
       if (opp.error) {
         const line = `${c.ticker}: flip skipped - ${opp.error}`;
         ddBump("flip-no-opponent", line);
         rejected.push(line);
         continue;
       }
-      const oppBlocked = blockedEntryRange(opp.askCents, config);
-      if (oppBlocked) {
-        const line = `${opp.ticker}: flip skipped - ${opp.askCents}c is in the blocked ${oppBlocked.min}-${oppBlocked.max}c range`;
-        ddBump("blocked-price-range", line);
-        rejected.push(line);
-        continue;
+      const legs = [opp];
+      if (soccer) {
+        if (opp.tie && !opp.tie.error) legs.push(opp.tie);
+        else appendLog(`${c.ticker}: soccer flip - tie leg not bought (${opp.tie?.error ?? "no tie market"}); other team only`);
       }
       const feeMult = config.feeMultiplier ?? 0.07;
       const stake = Number.isFinite(flatStake) && flatStake > 0 ? flatStake : Number(config.flatStakeDollars ?? 5);
-      const n = flatBetContracts(stake, opp.askCents, feeMult);
-      if (!(n >= 1)) {
-        const line = `${opp.ticker}: flip skipped - $${stake.toFixed(2)} buys no contracts at ${opp.askCents}c`;
-        ddBump("flip-no-size", line);
-        rejected.push(line);
-        continue;
+      let filledAny = false;
+      for (const [i, L] of legs.entries()) {
+        if (i > 0 && atCap()) {
+          const line = `${L.ticker}: flip tie leg refused - positions plus resting bids are at the cap`;
+          ddBump("at-cap", line);
+          rejected.push(line);
+          break;
+        }
+        const legBlocked = blockedEntryRange(L.askCents, config);
+        if (legBlocked) {
+          const line = `${L.ticker}: flip leg skipped - ${L.askCents}c is in the blocked ${legBlocked.min}-${legBlocked.max}c range`;
+          ddBump("blocked-price-range", line);
+          rejected.push(line);
+          continue;
+        }
+        const n = flatBetContracts(stake, L.askCents, feeMult);
+        if (!(n >= 1)) {
+          const line = `${L.ticker}: flip leg skipped - $${stake.toFixed(2)} buys no contracts at ${L.askCents}c`;
+          ddBump("flip-no-size", line);
+          rejected.push(line);
+          continue;
+        }
+        const dollarsIn = (n * (L.askCents + feePerContractCents(L.askCents, n, feeMult))) / 100;
+        const what = L.teamName === "Tie" ? "the tie" : `the other team, ${L.teamName}`;
+        appendLog(
+          `FLIP ${sportKey}: the formula picked ${c.teamName} at ${askCents}c (sharp ${(c.trueProbability * 100).toFixed(1)}%) - ` +
+          `buying ${what} (${L.ticker}), ${n} @ ${L.askCents}c, $${dollarsIn.toFixed(2)} in`
+        );
+        let flipResult = null;
+        try {
+          flipResult = await enterPosition({
+            ticker: L.ticker,
+            side: "yes",
+            priceCents: L.askCents,
+            limitCents: L.askCents,
+            exchangeIndex: L.exchangeIndex,
+            contracts: n,
+            reason:
+              `FLIP (${c.timing.live ? "in-play" : "pre-game"}): the bot's formula picked "${c.teamName}" at $${(askCents / 100).toFixed(2)} ` +
+              `(sharp ${(c.trueProbability * 100).toFixed(1)}%) - bought ${L.teamName === "Tie" ? "the tie" : `the other team "${L.teamName}"`} instead, ` +
+              `${n} contracts at $${(L.askCents / 100).toFixed(2)}, $${dollarsIn.toFixed(2)} in`,
+            edgePct: null,
+            teamName: L.teamName,
+            sportKey,
+            commenceTime: c.commenceTime,
+          });
+        } catch (err) {
+          bump("order-error");
+          rejected.push(`${L.ticker}: flip order failed - ${err.message}`);
+          feedC("order-error", `Flip order failed: ${err.message}`, "tried");
+          continue;
+        }
+        if (flipResult && flipResult.filled > 0) {
+          filledAny = true;
+          feedC("bought", `FLIP: formula picked ${c.teamName} at ${askCents}c - bought ${flipResult.filled} of ${L.teamName} at ${L.askCents}c`, "bought");
+          entered += 1;
+          countEntry({ ticker: L.ticker, lane: "flip", probation: false, segment: null });
+        } else if (flipResult && flipResult.skipped) {
+          ddBump(`skipped:${flipResult.skipped}`, `${L.ticker}: ${flipResult.skipped}`);
+          rejected.push(`${L.ticker}: flip order not placed - ${flipResult.skipped}`);
+        } else {
+          ddBump("no-fill", `${L.ticker}: flip limit ${L.askCents}c, nothing crossed before the order expired`);
+        }
       }
-      const dollarsIn = (n * (opp.askCents + feePerContractCents(opp.askCents, n, feeMult))) / 100;
-      appendLog(
-        `FLIP ${sportKey}: the formula picked ${c.teamName} at ${askCents}c (sharp ${(c.trueProbability * 100).toFixed(1)}%) - ` +
-        `buying the other team, ${opp.teamName} (${opp.ticker}), ${n} @ ${opp.askCents}c, $${dollarsIn.toFixed(2)} in`
-      );
-      let flipResult = null;
-      try {
-        flipResult = await enterPosition({
-          ticker: opp.ticker,
-          side: "yes",
-          priceCents: opp.askCents,
-          limitCents: opp.askCents,
-          exchangeIndex: opp.exchangeIndex,
-          contracts: n,
-          reason:
-            `FLIP (${c.timing.live ? "in-play" : "pre-game"}): the bot's formula picked "${c.teamName}" at $${(askCents / 100).toFixed(2)} ` +
-            `(sharp ${(c.trueProbability * 100).toFixed(1)}%) - bought the other team "${opp.teamName}" instead, ` +
-            `${n} contracts at $${(opp.askCents / 100).toFixed(2)}, $${dollarsIn.toFixed(2)} in`,
-          edgePct: null,
-          teamName: opp.teamName,
-          sportKey,
-          commenceTime: c.commenceTime,
-        });
-      } catch (err) {
-        bump("order-error");
-        rejected.push(`${opp.ticker}: flip order failed - ${err.message}`);
-        feedC("order-error", `Flip order failed: ${err.message}`, "tried");
-        continue;
-      }
-      if (flipResult && flipResult.filled > 0) {
-        feedC("bought", `FLIP: formula picked ${c.teamName} at ${askCents}c - bought ${flipResult.filled} of ${opp.teamName} at ${opp.askCents}c`, "bought");
+      if (filledAny) {
         openEvents.add(eventKeyOf(c.ticker));
         heldEvents.add(eventKeyOf(c.ticker));
-        entered += 1;
-        countEntry({ ticker: opp.ticker, lane: "flip", probation: false, segment: null });
-      } else if (flipResult && flipResult.skipped) {
-        ddBump(`skipped:${flipResult.skipped}`, `${opp.ticker}: ${flipResult.skipped}`);
-        rejected.push(`${opp.ticker}: flip order not placed - ${flipResult.skipped}`);
-      } else {
-        ddBump("no-fill", `${opp.ticker}: flip limit ${opp.askCents}c, nothing crossed before the order expired`);
       }
       continue;
     }
