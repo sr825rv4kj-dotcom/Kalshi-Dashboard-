@@ -976,6 +976,47 @@ const ONE_TIME_UPDATES = [
     },
     note: "every soccer league flipped: the bot's pick is not bought - the other team and the tie are ($5 each)",
   },
+  {
+    // 80-99c ONLY (2026-10-18 13:51 PT, account holder's call: "Use 80-99
+    // style bets only for now"). Same formula - sharp fair value vs the ask,
+    // 0.5-8% expected return after fees on the shrunk fair value - on one
+    // band, 80-99c, every sport, in-play and pre-game, $5 flat.
+    //   - flips OFF: the other side of an 80-99c pick costs 1-20c, a long
+    //     shot (Halmstad was bought at 8c on 2026-10-18 and lost)
+    //   - dip and favorite lanes off; Polymarket still copies Kalshi
+    // Account record at 80c+ (2026-10-18 20:32Z export): 12 of 14 won, +$0.17
+    // net - wins of $0.17-0.66, losses of $4.36 and $0.82.
+    id: "2026-10-18-eighty-to-ninety-nine",
+    apply: (c) => {
+      c.minEntryPriceCents = 80;
+      c.liveBandMinCents = 80;
+      c.maxEntryPriceCents = 99;
+      c.liveBandMaxCents = 99;
+      c.lanes = {
+        dip: { ...(c.lanes?.dip || {}), enabled: false },
+        middle: { enabled: true, minCents: 80, maxCents: 99, minReturnPct: 0.5, maxReturnPct: 8 },
+        favorite: { ...(c.lanes?.favorite || {}), enabled: false },
+      };
+      c.flipSports = [];
+    },
+    note: "80-99c only, same formula (0.5-8% expected return), every sport, $5 flat; flips off",
+  },
+  {
+    // ARBITRAGE ON (2026-10-18, account holder's call: "Build arbitrage
+    // engine"). arbEngine.js: Kalshi team A + Polymarket team B for under
+    // $1.00 a pair after worst-case fees, only in sports that cannot end in a
+    // tie. 2c a pair minimum, $0.10 a trade minimum, $10 a trade maximum,
+    // 3 games at once. Both legs held to settlement.
+    id: "2026-10-18-arbitrage-on",
+    apply: (c) => {
+      c.arbitrage = {
+        ...(c.arbitrage || {}),
+        enabled: true, minLockedCents: 2, minLockedDollars: 0.10, maxCostDollars: 10, maxOpenArbs: 3,
+        everySeconds: 30, runWhileHalted: true,
+      };
+    },
+    note: "arbitrage on: Kalshi + Polymarket pairs under $1.00 after fees, no-tie sports only, $10 max a trade",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
