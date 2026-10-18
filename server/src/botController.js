@@ -34,7 +34,10 @@ const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-10-02-sport-rules";
+export const CONTROLLER_VERSION = "2026-10-17-quiet-halt-log";
+
+const HALT_LOG_EVERY_MS = 30 * 60 * 1000;
+let lastHaltLog = { reason: null, at: 0 };
 
 /**
  * 2026-09-24 - four changes in this file:
@@ -1099,7 +1102,16 @@ export async function runCycle() {
     if (halted) {
       // A halted day must not keep buying through resting bids either.
       const n = await cancelAllResting("trading halted for the day").catch(() => 0);
-      appendLog(`Skipping cycle - halted for today: ${reason}` + (n ? ` (${n} resting bid(s) cancelled)` : ""));
+      // LOG ONCE, NOT EVERY 20s (2026-10-17). The halt line every cycle filled
+      // the whole log buffer (120 of 120 lines on 2026-10-17), hiding every
+      // trade and error from the export. Logged when it starts, when bids are
+      // cancelled, when the reason changes, and every 30 minutes after.
+      const nowMs = Date.now();
+      if (n || reason !== lastHaltLog.reason || nowMs - lastHaltLog.at >= HALT_LOG_EVERY_MS) {
+        appendLog(`Skipping cycles - halted for today: ${reason}` + (n ? ` (${n} resting bid(s) cancelled)` : "") +
+          " (repeats every 30 min while halted)");
+        lastHaltLog = { reason, at: nowMs };
+      }
       return;
     }
 
