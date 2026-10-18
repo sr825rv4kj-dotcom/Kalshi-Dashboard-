@@ -957,6 +957,25 @@ const ONE_TIME_UPDATES = [
     },
     note: "at most 6 open bets per exchange, daily loss halt 25%; soccer flips buy the other team and the tie",
   },
+  {
+    // FLIP ALL SOCCER (2026-10-17, account holder's call: "fix all recent
+    // losses"; standing rule from 2026-10-13: "All losing teams that have lost
+    // consistently use same formula just bet on opposite"). The account's
+    // closed trades (2026-10-17 23:49Z export):
+    //   Kalshi soccer at 50-59c, all time:   13 won of 31 vs 16.9 implied, -$27.16
+    //   soccer since Oct 14, both exchanges: 13 won of 36 vs 19.9 implied, -$39.70
+    //   soccer on Oct 17:                     4 won of 13 vs  7.3 implied, -$23.63
+    //   everything else at 50-59c on Kalshi since Oct 12: 10 of 19, +$9.00
+    // Every soccer league is flipped now (the "*" prefix): the formula's pick
+    // is not bought; the other team AND the tie are, $5 each (flipTrader.js).
+    id: "2026-10-17-flip-all-soccer",
+    apply: (c) => {
+      const set = new Set(Array.isArray(c.flipSports) ? c.flipSports.map(String) : []);
+      set.add("soccer_*");
+      c.flipSports = [...set];
+    },
+    note: "every soccer league flipped: the bot's pick is not bought - the other team and the tie are ($5 each)",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
