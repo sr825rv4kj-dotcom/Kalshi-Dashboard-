@@ -129,6 +129,8 @@ function kalshiPositionOnGame({ sportKey, commenceTime, teamNames }) {
   try { positions = loadState().positions || []; } catch { positions = []; }
   const want = Date.parse(commenceTime);
   return positions.find((p) => {
+    // An arbitrage leg is half of a hedge, not a pick to copy (arbEngine.js).
+    if (p.arb) return false;
     if (p.sportKey && p.sportKey !== sportKey) return false;
     if (!names.has(normName(p.teamName))) return false;
     const at = Date.parse(p.commenceTime);
@@ -1427,6 +1429,9 @@ async function managePmPositions(config, settings) {
       const p = pmPositions().find((x) => x.ticker === p0.ticker && x.openedAt === p0.openedAt);
       if (!p) continue;
       if (p.exitUncertainAt) { await resyncUncertainPm(p, heldCache); dropView("polymarket", key); continue; }
+      // ARBITRAGE LEGS ARE HELD TO SETTLEMENT (arbEngine.js): selling one
+      // half of a hedge would turn a locked profit into an open bet.
+      if (p.arb) { dropView("polymarket", key); continue; }
 
       let px;
       try { px = await sidePrice(p.slug, p.long === true); } catch (err) {
@@ -1632,3 +1637,27 @@ export function pmMonitorReport(config = {}) {
   };
 }
 
+// --- Arbitrage helpers (2026-10-18, arbEngine.js) -------------------------------------------
+
+/** Polymarket can take an arbitrage leg: keys set and the self-check passed. */
+export function pmArbReady() {
+  return pmConfigured() && pmMeta().selfCheck?.passed === true;
+}
+
+/** The NO side's order format is confirmed (needed when a leg is a short side). */
+export function pmShortReady() {
+  return shortConfirmed(pmMeta().selfCheck);
+}
+
+/** One immediate-or-cancel buy of a winner-market side, exactly as entries are placed. */
+export async function pmArbBuy({ slug, long, limitCents, contracts, seenAskCents }) {
+  return placeEntry({
+    c: { side: { slug, long } }, limitCents, contracts,
+    convention: pmMeta().selfCheck?.shortConvention, seenAskCents,
+  });
+}
+
+/** One immediate-or-cancel sell, at floorCents or better (used only to undo a half-filled arbitrage). */
+export async function pmArbSell({ slug, long, count, floorCents, seenBidCents }) {
+  return placeExit({ p: { slug, long }, count, floorCents, seenBidCents });
+}
