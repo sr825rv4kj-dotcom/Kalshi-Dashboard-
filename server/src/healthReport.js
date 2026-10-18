@@ -32,7 +32,7 @@ import { loadConfig } from "./configStore.js";
 import { schedulePlan } from "./liveSchedule.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 
-export const HEALTH_VERSION = "2026-10-09-block-60-69";
+export const HEALTH_VERSION = "2026-10-17-halt-not-stopped";
 
 /** A scan older than this means the bot is not scanning, not being choosy. */
 const SCAN_STALE_MS = 5 * 60 * 1000;
@@ -294,6 +294,15 @@ export function diagnose({ state, config, now = Date.now() } = {}) {
         title: "Idle - no game live or starting within 65 minutes",
         example: nx ? `Next: ${nx.away} @ ${nx.home} (${nx.sportKey}) at ${nx.commence}` : null,
         fix: "Not a fault. Scanning resumes on its own before the next game.",
+      });
+    } else if (st.running && st.haltedForDay) {
+      // HALTED IS NOT STOPPED (2026-10-17): the daily halt skips every scan on
+      // purpose, so "stopped scanning - restart Railway" was a false alarm.
+      healthy.push({
+        code: "halted-not-scanning", count: 1,
+        title: "Not scanning because of the daily loss halt",
+        example: st.haltReason || null,
+        fix: "Not a fault - no restart needed. Scanning resumes on its own at the next trading day.",
       });
     } else if (st.running && (!newest || now - newest > SCAN_STALE_MS)) {
       const age = newest ? `${Math.round((now - newest) / 60000)} min ago` : "never";
