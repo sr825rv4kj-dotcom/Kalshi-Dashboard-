@@ -26,6 +26,7 @@ import {
 } from "./fairValue.js";
 import { registerOpenPositions, markDue, needsBackfill, backfillFromLedger } from "./clvTracker.js";
 import { runPolymarketCycle } from "./polymarket/pmEngine.js";
+import { runArbitrageCycle } from "./arbEngine.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "./swingEngine.js";
 import { feePerContractCents } from "./riskManager.js";
 import { sportDisabled, withSportRules } from "./sportRules.js";
@@ -34,7 +35,7 @@ const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-10-17-quiet-halt-log";
+export const CONTROLLER_VERSION = "2026-10-18-arbitrage";
 
 const HALT_LOG_EVERY_MS = 30 * 60 * 1000;
 let lastHaltLog = { reason: null, at: 0 };
@@ -843,6 +844,9 @@ async function checkOpenPositionsOnce(config) {
     try {
       // Re-read: an earlier iteration may have exited or settled this one.
       if (!loadState().positions.some((p) => p.ticker === position.ticker && p.openedAt === position.openedAt)) continue;
+      // ARBITRAGE LEGS ARE HELD TO SETTLEMENT (arbEngine.js): no ceiling,
+      // swing, fair-value, stop-loss or blowout exit ever sells half a hedge.
+      if (position.arb) continue;
 
       const quote = await yesQuote(position.ticker);
 
@@ -1336,12 +1340,26 @@ async function runPolymarketSafely() {
   }
 }
 
+/**
+ * ARBITRAGE RUNS AFTER POLYMARKET (2026-10-18, arbEngine.js): Kalshi team A +
+ * Polymarket team B under $1.00 after fees. It runs while the daily halt is
+ * on too (no betting risk) and can never throw into the loop.
+ */
+async function runArbitrageSafely() {
+  try {
+    await runArbitrageCycle(loadConfig());
+  } catch (err) {
+    try { appendLog(`Arbitrage pass contained: ${err && err.message}`, "warn"); } catch { /* never break the loop */ }
+  }
+}
+
 function scheduleNextCycle() {
   if (intervalHandle) clearTimeout(intervalHandle);
   intervalHandle = setTimeout(async () => {
     try {
       await runCycle();
       await runPolymarketSafely();
+      await runArbitrageSafely();
     } catch (err) {
       // runCycle is supposed to swallow its own errors. If one still reaches
       // here, its error handler broke - so this must not depend on appendLog.
