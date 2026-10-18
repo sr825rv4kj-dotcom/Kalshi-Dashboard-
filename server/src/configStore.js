@@ -1017,6 +1017,28 @@ const ONE_TIME_UPDATES = [
     },
     note: "arbitrage on: Kalshi + Polymarket pairs under $1.00 after fees, no-tie sports only, $10 max a trade",
   },
+  {
+    // 70-99c (2026-10-18 14:11 PT, account holder's call: "Let's try 70-99 ...
+    // slow and steady more predictable returns"). Same formula and lane rules
+    // as 80-99c, band widened down to 70c. 60-69c stays blocked
+    // (blockedEntryCents). Account record, both exchanges (2026-10-18 20:32Z):
+    //   70-79c: 22 won of 31 (71%) vs 75% implied, -$7.42
+    //   80-89c: 11 won of 13 (85%) vs 84% implied, -$0.29
+    id: "2026-10-18-seventy-to-ninety-nine",
+    apply: (c) => {
+      c.minEntryPriceCents = 70;
+      c.liveBandMinCents = 70;
+      c.maxEntryPriceCents = 99;
+      c.liveBandMaxCents = 99;
+      c.lanes = {
+        dip: { ...(c.lanes?.dip || {}), enabled: false },
+        middle: { enabled: true, minCents: 70, maxCents: 99, minReturnPct: 0.5, maxReturnPct: 8 },
+        favorite: { ...(c.lanes?.favorite || {}), enabled: false },
+      };
+      c.flipSports = [];
+    },
+    note: "70-99c, same formula (0.5-8% expected return), every sport, $5 flat; 60-69c still blocked; flips off",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
