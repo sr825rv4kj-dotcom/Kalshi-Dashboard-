@@ -27,7 +27,7 @@
  */
 
 import crypto from "crypto";
-import { kalshiGet } from "../kalshiClient.js";
+import { kalshiGet, kalshiRateStats } from "../kalshiClient.js";
 import { loadState, getRecentLog } from "../stateStore.js";
 import { loadConfig } from "../configStore.js";
 import { getTradeStats, getTradeLifecycles } from "../tradeLedgerStore.js";
@@ -50,6 +50,8 @@ import { inPlayBookReport } from "../scraper.js";
 import { improvementReport } from "../improvementLab.js";
 import { tradeCounterReport } from "../tradeCounter.js";
 import { paperReport } from "../paperTrader.js";
+import { arbReport } from "../arbEngine.js";
+import { streakNow } from "../streakCounter.js";
 
 /**
  * Read MONITOR_TOKEN the way a phone-edited Railway variable actually arrives.
@@ -222,6 +224,19 @@ export function registerMonitorRoutes(app) {
     });
     section("learner", () => learnerReport(loadConfig()).segments.filter((s) => s.blocked).map((s) => `${s.segment}: ${s.wins}/${s.trades} vs ${s.expectedWins}, ${s.net}`));
     section("paper", () => paperReport().strategies.map((s) => `${s.label}: ${s.trades} trades (${s.open} open), won ${s.wins}/${s.settled} vs ${s.expectedWins}, net ${s.net}`));
+    section("kalshiRate", () => kalshiRateStats());
+    section("streak", () => {
+      const v = streakNow(loadConfig());
+      return v ? { winsInARow: v.wins, openBetsAllowed: v.cap, max: v.max, best: v.best, counted: v.counted, since: v.since, lastLoss: v.lastLoss, recent: v.recent } : { enabled: false };
+    });
+    section("arbitrage", () => {
+      const a = arbReport(loadConfig());
+      return {
+        enabled: a.enabled, stats: a.stats, skips: a.skips.slice(0, 6).map((x) => `${x.code} x${x.count}`),
+        closest: a.closestPairs.slice(0, 3).map((r) => `${r.kalshiTeam} K${r.kalshiCents} + ${r.pmTeam} P${r.pmCents} = ${r.pairCents}c, locked ${r.lockedPerContract}c/pair`),
+        trades: a.trades.slice(0, 5).map((t) => `${t.kalshi.team} K${t.kalshi.cents} + ${t.polymarket.team} P${t.polymarket.cents} x${t.kalshi.contracts}: +$${t.lockedDollars}${t.unwound ? ` (${t.unwound} unwound)` : ""}`),
+      };
+    });
     section("settings", () => {
       const c = loadConfig();
       return {
@@ -350,6 +365,12 @@ export function registerMonitorRoutes(app) {
     section("tradeCounter", () => tradeCounterReport(loadConfig()));
     // PAPER STRATEGIES: other ways of trading, scored without spending.
     section("paper", () => paperReport());
+    // ARBITRAGE (arbEngine.js): pairs compared, closest seen, trades locked.
+    section("arbitrage", () => arbReport(loadConfig()));
+    // WIN STREAK (streakCounter.js): open bets allowed = 1 + wins in a row.
+    section("streak", () => streakNow(loadConfig()) || { enabled: false });
+    // KALSHI PACING (kalshiClient.js): calls made, 429s, retries.
+    section("kalshiRate", () => kalshiRateStats());
     // Current stake, the tier it came from, the next step, and any double-downs.
     section("stake", () => stakeReport(loadConfig()));
     // Trading Desk: swing positions (bid, fair, next sale), today vs the goal.
