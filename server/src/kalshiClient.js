@@ -106,17 +106,87 @@ function root() {
   return getConfig().baseUrl.replace("/trade-api/v2", "");
 }
 
+/*
+ * RATE LIMITING (2026-10-24). Production log 2026-10-24 13:43-13:44 PT: every
+ * 20-second cycle failed with "Kalshi API error 429 too_many_requests", the
+ * circuit breaker opened and cleared on each one, and nothing traded. Every
+ * Kalshi call in the app goes through this file, so it is paced here:
+ *   - reads (GET) at most READS_PER_SEC, writes (POST / DELETE) at most
+ *     WRITES_PER_SEC - well under Kalshi's Basic-tier allowance
+ *   - a 429 is retried up to 3 times, waiting Kalshi's Retry-After when it
+ *     sends one, else 1s / 2s / 4s; during that wait every other call to the
+ *     same kind (read or write) waits too, so the burst stops instead of
+ *     piling on
+ *   - a 429 means Kalshi refused the request without acting on it, so an
+ *     order (POST) is safe to resend; it is resent with the SAME body and so
+ *     the same client_order_id, which Kalshi will not accept twice
+ * Counts are kept for the monitor (kalshiRateStats).
+ */
+const READS_PER_SEC = Number(process.env.KALSHI_READS_PER_SEC) > 0 ? Number(process.env.KALSHI_READS_PER_SEC) : 8;
+const WRITES_PER_SEC = Number(process.env.KALSHI_WRITES_PER_SEC) > 0 ? Number(process.env.KALSHI_WRITES_PER_SEC) : 4;
+const RETRY_WAITS_MS = [1000, 2000, 4000];
+
+const lanes = {
+  read: { gapMs: 1000 / READS_PER_SEC, next: 0, pausedUntil: 0 },
+  write: { gapMs: 1000 / WRITES_PER_SEC, next: 0, pausedUntil: 0 },
+};
+const rateStats = { reads: 0, writes: 0, limited: 0, retriedOk: 0, gaveUp: 0, last429At: null, lastPath: null };
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Waits for this lane's next free slot (spacing calls evenly, honouring any 429 pause). */
+async function takeSlot(kind) {
+  const lane = lanes[kind];
+  const now = Date.now();
+  const at = Math.max(now, lane.next, lane.pausedUntil);
+  lane.next = at + lane.gapMs;
+  if (at > now) await sleep(at - now);
+}
+
+function retryAfterMs(res) {
+  const h = res.headers?.get?.("retry-after");
+  const n = Number(h);
+  if (Number.isFinite(n) && n > 0) return Math.min(10000, n * 1000);
+  return null;
+}
+
+/** One Kalshi call, paced, with 429 retries. Returns the fetch Response and its text. */
+async function paced(kind, method, requestPath, url, body) {
+  for (let attempt = 0; ; attempt++) {
+    await takeSlot(kind);
+    rateStats[kind === "read" ? "reads" : "writes"] += 1;
+    const headers = { ...signRequest(method, requestPath), ...(body != null ? { "Content-Type": "application/json" } : {}) };
+    const res = await fetch(url, { method, headers, ...(body != null ? { body } : {}) });
+    const text = await res.text();
+    if (res.status !== 429) {
+      if (attempt > 0) rateStats.retriedOk += 1;
+      return { res, text };
+    }
+    rateStats.limited += 1;
+    rateStats.last429At = new Date().toISOString();
+    rateStats.lastPath = requestPath;
+    if (attempt >= RETRY_WAITS_MS.length) {
+      rateStats.gaveUp += 1;
+      return { res, text };
+    }
+    const wait = retryAfterMs(res) ?? RETRY_WAITS_MS[attempt];
+    lanes[kind].pausedUntil = Math.max(lanes[kind].pausedUntil, Date.now() + wait);
+  }
+}
+
+/** For the monitor: calls made, 429s seen, retries that then succeeded, and calls that gave up. */
+export function kalshiRateStats() {
+  return { readsPerSec: READS_PER_SEC, writesPerSec: WRITES_PER_SEC, ...rateStats };
+}
+
 export async function kalshiGet(requestPath, query = "") {
-  const headers = signRequest("GET", requestPath);
-  const res = await fetch(`${root()}${requestPath}${query}`, { method: "GET", headers });
-  if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${await res.text()}`);
-  return res.json();
+  const { res, text } = await paced("read", "GET", requestPath, `${root()}${requestPath}${query}`, null);
+  if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
+  return text ? JSON.parse(text) : {};
 }
 
 export async function kalshiPost(requestPath, body) {
-  const headers = { ...signRequest("POST", requestPath), "Content-Type": "application/json" };
-  const res = await fetch(`${root()}${requestPath}`, { method: "POST", headers, body: JSON.stringify(body) });
-  const text = await res.text();
+  const { res, text } = await paced("write", "POST", requestPath, `${root()}${requestPath}`, JSON.stringify(body));
   const data = text ? JSON.parse(text) : {};
   if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
   return data;
@@ -129,9 +199,7 @@ export async function kalshiPost(requestPath, body) {
  * the cancel is sent to shard 0 and misses the order.
  */
 export async function kalshiDelete(requestPath, query = "") {
-  const headers = signRequest("DELETE", requestPath);
-  const res = await fetch(`${root()}${requestPath}${query}`, { method: "DELETE", headers });
-  const text = await res.text();
+  const { res, text } = await paced("write", "DELETE", requestPath, `${root()}${requestPath}${query}`, null);
   const data = text ? JSON.parse(text) : {};
   if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
   return data;
