@@ -1039,6 +1039,67 @@ const ONE_TIME_UPDATES = [
     },
     note: "70-99c, same formula (0.5-8% expected return), every sport, $5 flat; 60-69c still blocked; flips off",
   },
+  {
+    // STREAK COUNTER + 65% TO WIN (2026-10-18 16:27 PT, account holder's call:
+    // "streak counter ... only able to deploy more with more wins. One loss
+    // draws deployments back to 1" and "all games to be bet on 65% odds or
+    // better ... mandatory").
+    //   - open bets allowed = 1 + wins in a row, back to 1 after any loss,
+    //     at most 6 (streakCounter.js); starts fresh at 1 from this update
+    //   - every bet needs a sharp fair value of 65%+ to win (scanner.js)
+    // Arbitrage pairs pay whoever wins, so neither rule applies to them.
+    id: "2026-10-18-streak-and-65",
+    apply: (c) => {
+      const max = Number(c.maxConcurrentPositions) > 0 ? Number(c.maxConcurrentPositions) : 6;
+      c.streak = { enabled: true, since: new Date().toISOString(), max };
+      c.minWinProbability = 0.65;
+    },
+    note: "streak counter on (1 bet + 1 per win in a row, back to 1 after a loss, max 6); every bet must be 65%+ to win",
+  },
+  {
+    // 60%+ ON EVERY ENTRY (2026-10-24 13:04 PT, account holder's call: "change
+    // all entry betting odds to 60% or higher for all games"). Price 60-99c
+    // and a sharp fair value of 60%+ to win; the 60-69c block is lifted.
+    // Same formula (0.5-8% expected return), $5 flat, streak counter on.
+    // Account record at 60-69c, both exchanges (2026-10-18 20:32Z export):
+    // 17 won of 34 (50%) vs 64% implied, -$42.81.
+    id: "2026-10-24-sixty-plus",
+    apply: (c) => {
+      c.minEntryPriceCents = 60;
+      c.liveBandMinCents = 60;
+      c.maxEntryPriceCents = 99;
+      c.liveBandMaxCents = 99;
+      c.minWinProbability = 0.60;
+      c.blockedEntryCents = [];
+      c.lanes = {
+        dip: { ...(c.lanes?.dip || {}), enabled: false },
+        middle: { enabled: true, minCents: 60, maxCents: 99, minReturnPct: 0.5, maxReturnPct: 8 },
+        favorite: { ...(c.lanes?.favorite || {}), enabled: false },
+      };
+    },
+    note: "60-99c, 60%+ to win on every bet, 60-69c block lifted; same formula, $5 flat, streak counter on",
+  },
+  {
+    // 55%+ CLEARS (2026-10-24 13:06 PT, account holder's call: "Make 55% bets
+    // clear"). Price 55-99c and a sharp fair value of 55%+ to win; nothing in
+    // between blocked. Same formula (0.5-8% expected return), $5 flat,
+    // streak counter on.
+    id: "2026-10-24-fifty-five-plus",
+    apply: (c) => {
+      c.minEntryPriceCents = 55;
+      c.liveBandMinCents = 55;
+      c.maxEntryPriceCents = 99;
+      c.liveBandMaxCents = 99;
+      c.minWinProbability = 0.55;
+      c.blockedEntryCents = [];
+      c.lanes = {
+        dip: { ...(c.lanes?.dip || {}), enabled: false },
+        middle: { enabled: true, minCents: 55, maxCents: 99, minReturnPct: 0.5, maxReturnPct: 8 },
+        favorite: { ...(c.lanes?.favorite || {}), enabled: false },
+      };
+    },
+    note: "55-99c, 55%+ to win on every bet; same formula, $5 flat, streak counter on",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
