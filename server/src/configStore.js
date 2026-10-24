@@ -1100,6 +1100,19 @@ const ONE_TIME_UPDATES = [
     },
     note: "55-99c, 55%+ to win on every bet; same formula, $5 flat, streak counter on",
   },
+  {
+    // POLYMARKET OFF (2026-10-24 13:09 PT, account holder's call: "Turn off all
+    // Polymarket trading"). No new Polymarket buys of any kind: the copy of
+    // Kalshi's bets stops (polymarket.trading "off", pmEngine tradingActive)
+    // and arbitrage stops too, since every arbitrage needs a Polymarket leg.
+    // Positions already open on Polymarket are still tracked to settlement.
+    id: "2026-10-24-polymarket-off",
+    apply: (c) => {
+      c.polymarket = { ...DEFAULTS.polymarket, ...(c.polymarket || {}), trading: "off" };
+      c.arbitrage = { ...(c.arbitrage || {}), enabled: false };
+    },
+    note: "Polymarket trading off (no copies, no arbitrage); open Polymarket positions still settle",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
