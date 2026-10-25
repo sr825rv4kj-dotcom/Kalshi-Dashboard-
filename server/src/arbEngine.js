@@ -510,3 +510,4 @@ export function arbReport(config = {}) {
     note: "A pair is team A on one exchange + team B on the other; it pays $1.00 whoever wins. Locked = $1.00 minus both prices minus worst-case fees.",
   };
 }
+
