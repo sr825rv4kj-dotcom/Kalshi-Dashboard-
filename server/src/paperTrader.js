@@ -294,3 +294,4 @@ export function paperReport() {
     strategies: scorecards(positions),
   };
 }
+
