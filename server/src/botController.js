@@ -27,6 +27,8 @@ import {
 import { registerOpenPositions, markDue, needsBackfill, backfillFromLedger } from "./clvTracker.js";
 import { runPolymarketCycle } from "./polymarket/pmEngine.js";
 import { runArbitrageCycle } from "./arbEngine.js";
+import { streakCap } from "./streakCounter.js";
+import { pmPositions } from "./polymarket/pmState.js";
 import { swingSettings, liveFair, swingDecision, noteView, dropView, noteEquity, viewFor } from "./swingEngine.js";
 import { feePerContractCents } from "./riskManager.js";
 import { sportDisabled, withSportRules } from "./sportRules.js";
@@ -35,7 +37,7 @@ const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-10-18-arbitrage";
+export const CONTROLLER_VERSION = "2026-10-18-streak-counter";
 
 const HALT_LOG_EVERY_MS = 30 * 60 * 1000;
 let lastHaltLog = { reason: null, at: 0 };
@@ -216,6 +218,10 @@ async function checkDailySummary(config, currentBalance) {
  *     never below the 5-trade floor and never above the balance rule.
  */
 function positionCapFor(config, bankroll, equity = lastEquity ?? bankroll) {
+  // WIN STREAK (2026-10-18, streakCounter.js): 1 + wins in a row, reset to 1
+  // by any loss, never above streak.max. Overrides every rule below while on.
+  const byStreak = streakCap(config);
+  if (byStreak != null) return byStreak;
   const fixed = Number(config.maxConcurrentPositions);
   if (Number.isFinite(fixed) && fixed > 0) return fixed;
   const stake = tieredStake(config, equity).stake ?? (Number(config.flatStakeDollars) || 5);
@@ -230,13 +236,18 @@ function positionCapFor(config, bankroll, equity = lastEquity ?? bankroll) {
 /** For the monitor and dashboard: the Kalshi cap in force right now. */
 export function kalshiOpenTradeCap(config = loadConfig()) {
   const equity = lastEquity;
-  return { cap: equity != null ? positionCapFor(config, lastCash ?? equity, equity) : null, equity, open: loadState().positions.length };
+  return { cap: equity != null ? positionCapFor(config, lastCash ?? equity, equity) : null, equity, open: betCount() };
+}
+
+/** Open BETS - arbitrage legs are hedged pairs, not bets, and use no slot (arbEngine.js). */
+function betCount() {
+  return loadState().positions.filter((p) => !p.arb).length;
 }
 
 function atConcurrentPositionCap(config, bankroll) {
   const cap = positionCapFor(config, bankroll);
   if (!cap) return false;
-  return loadState().positions.length >= cap;
+  return betCount() >= cap;
 }
 
 /** The taker path's cap: positions PLUS resting bids, so it can never overshoot. */
@@ -245,7 +256,7 @@ function takerAtCap(config, bankroll) {
   if (!cap) return false;
   let bids = 0;
   try { bids = restingCount(); } catch { bids = 0; }
-  return loadState().positions.length + bids >= cap;
+  return betCount() + bids >= cap;
 }
 
 /**
@@ -854,7 +865,7 @@ async function checkOpenPositionsOnce(config) {
       const ceiling = ceilingExitDecision(position, quote, config);
       if (ceiling) {
         if (config.ceilingExitOnlyWhenNeeded !== false) {
-          if (!need) need = await readCapitalNeed(config, loadState().positions.length);
+          if (!need) need = await readCapitalNeed(config, betCount());
           if (!need.needed) {
             // Holding: settlement pays the same for free. Logged once per position.
             if (!position.ceilingHoldLogged) {
@@ -1155,7 +1166,7 @@ export async function runCycle() {
       const now = Date.now();
       if (now - lastCapLogAt > 10 * 60 * 1000) {
         lastCapLogAt = now;
-        appendLog(`At the open-trade cap: ${loadState().positions.length} open of ${positionCapFor(config, bankroll)} allowed at $${(lastEquity ?? bankroll).toFixed(2)} equity - waiting for games to settle.`);
+        appendLog(`At the open-trade cap: ${betCount()} open of ${positionCapFor(config, bankroll)} allowed at $${(lastEquity ?? bankroll).toFixed(2)} equity - waiting for games to settle.`);
       }
       // Not scanning - but held games still need a fresh fair value for exits.
       await refreshHeldFairValues(config);
@@ -1334,7 +1345,17 @@ export function resetCircuitBreaker() {
  */
 async function runPolymarketSafely() {
   try {
-    await runPolymarketCycle(loadConfig());
+    // WIN STREAK caps Polymarket too (streakCounter.js). Polymarket counts its
+    // own open positions against the cap, so its arbitrage legs are added on
+    // top - they are hedges, not bets.
+    const config = loadConfig();
+    const cap = streakCap(config);
+    if (cap != null) {
+      let arbLegs = 0;
+      try { arbLegs = pmPositions().filter((p) => p.arb).length; } catch { arbLegs = 0; }
+      config.maxConcurrentPositions = cap + arbLegs;
+    }
+    await runPolymarketCycle(config);
   } catch (err) {
     try { appendLog(`Polymarket cycle contained: ${err && err.message}`, "warn"); } catch { /* never break the loop */ }
   }
