@@ -98,7 +98,7 @@ import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-16-soccer-tie-flip";
+export const SCANNER_VERSION = "2026-10-18-min-65-to-win";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -880,6 +880,20 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
       continue;
     }
     c.lane = lane;
+    // 65% TO WIN, MANDATORY (2026-10-18, account holder's call: "all games to
+    // be bet on 65% odds or better ... this is mandatory"). The sharp fair
+    // value itself (not shrunk) must give the side at least minWinProbability.
+    // Checked before every buy path - taker, resting bid and double-down.
+    {
+      const minWin = Number(config.minWinProbability);
+      if (Number.isFinite(minWin) && minWin > 0 && !(c.trueProbability >= minWin)) {
+        const line = `${c.ticker} ${askCents}c: ${(c.trueProbability * 100).toFixed(1)}% to win is under the mandatory ${(minWin * 100).toFixed(0)}%`;
+        ddBump("under-min-win-probability", line);
+        rejected.push(line);
+        await dropResting(c.ticker, "under the mandatory win probability");
+        continue;
+      }
+    }
     // BLOCKED PRICE RANGE (2026-10-09, sportRules.js): 60-69c is not bought.
     const blocked = blockedEntryRange(askCents, config);
     if (blocked) {
