@@ -31,6 +31,7 @@ import { DATA_DIR } from "./paths.js";
 import { atomicWriteFileSync, tradingDay } from "./stateStore.js";
 import { loadLedger } from "./tradeLedgerStore.js";
 import { paperReport } from "./paperTrader.js";
+import { streakNow } from "./streakCounter.js";
 
 export const TRADE_COUNTER_VERSION = "2026-10-06-trade-counter";
 
@@ -164,6 +165,7 @@ const CODE_WORDS = {
   "paper-only-sport": "paper-only sport - scored on paper, no real bet",
   "flip-no-opponent": "flip skipped - other team's market not found",
   "flip-no-size": "flip skipped - stake too small at that price",
+  "under-min-win-probability": "under 65% to win - mandatory minimum",
 };
 
 /** For the System tab and the monitor. */
@@ -205,6 +207,8 @@ export function tradeCounterReport(config = {}) {
     // PAPER STRATEGIES (2026-10-11): other ways of trading, scored on real
     // prices without spending (paperTrader.js).
     paper: (() => { try { return paperReport(); } catch (err) { return { error: err.message }; } })(),
+    // WIN STREAK (streakCounter.js): open bets allowed = 1 + wins in a row.
+    streak: (() => { try { return streakNow(config); } catch (err) { return { error: err.message }; } })(),
   };
 }
 
