@@ -66,6 +66,18 @@ export default function TradeCounterPanel({ apiBase }) {
           <Row label="Pace" value={`${pace.entered} of ${pace.targetPerDay} target (${pace.expectedByNow} expected by now) - ${pace.status}`} tone={paceTone} />
           <div className="ledger-reason" style={{ marginTop: 4 }}>{pace.adjustment}</div>
 
+          {r.streak && r.streak.cap != null && (
+            <div className="bot-subsection">
+              <h3>Win streak</h3>
+              <Row label="Wins in a row" value={r.streak.wins} tone={r.streak.wins > 0 ? "pos" : ""} />
+              <Row label="Open bets allowed" value={`${r.streak.cap} of ${r.streak.max}`} />
+              <Row label="Best streak" value={r.streak.best} />
+              {r.streak.lastLoss && <Row label="Last loss (reset to 1)" value={`${r.streak.lastLoss.team} ${r.streak.lastLoss.net}`} tone="neg" />}
+              {r.streak.recent?.length > 0 && <div className="ledger-reason" style={{ marginTop: 4 }}>{r.streak.recent.join(" · ")}</div>}
+              <div className="ledger-reason" style={{ marginTop: 4 }}>1 bet + 1 for every win in a row. Any loss puts it back to 1.</div>
+            </div>
+          )}
+
           <div className="bot-subsection">
             <h3>By lane (Kalshi)</h3>
             {Object.keys(r.byLane).length === 0 && <div className="empty-state">No Kalshi trades yet today.</div>}
