@@ -1113,6 +1113,33 @@ const ONE_TIME_UPDATES = [
     },
     note: "Polymarket trading off (no copies, no arbitrage); open Polymarket positions still settle",
   },
+  {
+    // KEEP WHAT WINS (2026-10-27, account holder's call: "Help me make
+    // effective changes to build the portfolio" / "$5 to make 5.50 ... is not
+    // a good investment"). The account's Kalshi bets since the 2026-10-24
+    // restart (2026-10-28 01:18Z export), 87 bets, +$2.69:
+    //   NFL 11 of 12 +$19.13, NCAAF 8 of 8 +$8.45, NHL 8 of 9 +$4.78
+    //     -> 27 of 29, +$32.36
+    //   every other sport: 34 of 58, -$29.67 (NBA 7 of 13 -$12.12)
+    //   85-99c: 11 of 13 won but +$0.20-0.60 a win vs -$4.38 a loss
+    //   (85-89c -$6.39) - risking $5 to make cents
+    //   - new bets only in NFL, college football and NHL (entrySports)
+    //   - price 55-84c (no more 85-99c bets)
+    // Everything else unchanged: 55%+ to win, 0.5-8% expected return, $5,
+    // streak counter, 25% daily halt, Polymarket off.
+    id: "2026-10-27-football-nhl-55-84",
+    apply: (c) => {
+      c.entrySports = ["americanfootball_nfl", "americanfootball_ncaaf", "icehockey_nhl"];
+      c.maxEntryPriceCents = 84;
+      c.liveBandMaxCents = 84;
+      c.lanes = {
+        dip: { ...(c.lanes?.dip || {}), enabled: false },
+        middle: { enabled: true, minCents: Number(c.minEntryPriceCents) || 55, maxCents: 84, minReturnPct: 0.5, maxReturnPct: 8 },
+        favorite: { ...(c.lanes?.favorite || {}), enabled: false },
+      };
+    },
+    note: "new bets only in NFL, NCAAF and NHL; price 55-84c (no 85-99c bets)",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
@@ -1205,5 +1232,4 @@ export function describeStrategy() {
     entries: c.liveOnly === false ? "live and pre-game" : "LIVE GAMES ONLY - no pre-game buys or resting bids",
   };
 }
-
 
