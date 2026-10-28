@@ -122,7 +122,9 @@ function root() {
  *     the same client_order_id, which Kalshi will not accept twice
  * Counts are kept for the monitor (kalshiRateStats).
  */
-const READS_PER_SEC = Number(process.env.KALSHI_READS_PER_SEC) > 0 ? Number(process.env.KALSHI_READS_PER_SEC) : 8;
+// 5 a second (was 8): production 2026-10-24 to 10-28 made 257,811 reads at 8/s
+// and Kalshi throttled 13,023 of them (5%) - 12,990 went through on retry.
+const READS_PER_SEC = Number(process.env.KALSHI_READS_PER_SEC) > 0 ? Number(process.env.KALSHI_READS_PER_SEC) : 5;
 const WRITES_PER_SEC = Number(process.env.KALSHI_WRITES_PER_SEC) > 0 ? Number(process.env.KALSHI_WRITES_PER_SEC) : 4;
 const RETRY_WAITS_MS = [1000, 2000, 4000];
 
@@ -204,4 +206,3 @@ export async function kalshiDelete(requestPath, query = "") {
   if (!res.ok) throw new Error(`Kalshi API error ${res.status}: ${text}`);
   return data;
 }
-
