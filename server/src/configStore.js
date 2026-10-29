@@ -1140,6 +1140,19 @@ const ONE_TIME_UPDATES = [
     },
     note: "new bets only in NFL, NCAAF and NHL; price 55-84c (no 85-99c bets)",
   },
+  {
+    // LADDER (2026-10-28 21:18 PT, account holder's call: "deploy more with
+    // each win and deploy one less bot with each loss"). streakCounter.js
+    // mode "ladder": +1 open bet per win, -1 per loss, between 1 and 6,
+    // walked through every Kalshi bet closed since the counter started
+    // (2026-10-24) - so the real record sets today's level, not a reset to 1.
+    id: "2026-10-28-ladder",
+    apply: (c) => {
+      const max = Number(c.streak?.max) > 0 ? Number(c.streak.max) : (Number(c.maxConcurrentPositions) > 0 ? Number(c.maxConcurrentPositions) : 6);
+      c.streak = { ...(c.streak || {}), enabled: true, since: c.streak?.since || new Date().toISOString(), max, mode: "ladder" };
+    },
+    note: "open bets: +1 for each win, -1 for each loss (1 to 6)",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
