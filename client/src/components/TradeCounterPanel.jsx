@@ -68,13 +68,13 @@ export default function TradeCounterPanel({ apiBase }) {
 
           {r.streak && r.streak.cap != null && (
             <div className="bot-subsection">
-              <h3>Win streak</h3>
+              <h3>Open-bet ladder</h3>
               <Row label="Wins in a row" value={r.streak.wins} tone={r.streak.wins > 0 ? "pos" : ""} />
               <Row label="Open bets allowed" value={`${r.streak.cap} of ${r.streak.max}`} />
               <Row label="Best streak" value={r.streak.best} />
-              {r.streak.lastLoss && <Row label="Last loss (reset to 1)" value={`${r.streak.lastLoss.team} ${r.streak.lastLoss.net}`} tone="neg" />}
+              {r.streak.lastLoss && <Row label={r.streak.mode === "reset" ? "Last loss (reset to 1)" : "Last loss (one fewer)"} value={`${r.streak.lastLoss.team} ${r.streak.lastLoss.net}`} tone="neg" />}
               {r.streak.recent?.length > 0 && <div className="ledger-reason" style={{ marginTop: 4 }}>{r.streak.recent.join(" · ")}</div>}
-              <div className="ledger-reason" style={{ marginTop: 4 }}>1 bet + 1 for every win in a row. Any loss puts it back to 1.</div>
+              <div className="ledger-reason" style={{ marginTop: 4 }}>{r.streak.mode === "reset" ? "1 bet + 1 for every win in a row. Any loss puts it back to 1." : `Each win allows one more open bet, each loss one fewer (1 to ${r.streak.max}).`}</div>
             </div>
           )}
 
