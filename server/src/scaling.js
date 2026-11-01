@@ -46,8 +46,9 @@
  */
 
 import { loadState, saveState } from "./stateStore.js";
+import { betPercentNow } from "./streakCounter.js";
 
-export const SCALING_VERSION = "2026-09-26-stake-tiers-double-down";
+export const SCALING_VERSION = "2026-11-01-bet-percent";
 
 export const DEFAULT_STAKE_TIERS = [
   { at: 0, x: 1 },
@@ -83,6 +84,24 @@ export function tieredStake(config = {}, equity) {
   const base = Number(config.flatStakeDollars);
   const eq = Number(equity);
   const maxStake = Number(config.stakeMaxDollars ?? 500);
+
+  // BET SIZE BY RESULTS (2026-11-01, streakCounter.js betPercentNow): a
+  // percentage of equity that steps down after each loss and back up after
+  // each win. Replaces the tiers while it is on.
+  const bp = betPercentNow(config);
+  if (bp && Number.isFinite(eq) && eq > 0) {
+    const raw = eq * bp.pct;
+    const stake = Math.max(1, Math.min(raw, maxStake > 0 ? maxStake : raw));
+    const nextPct = bp.step > 0 ? bp.steps[bp.step - 1] : null;
+    return {
+      stake: round2(stake),
+      tierAt: bp.step,
+      tierLabel: `${(bp.pct * 100).toFixed(bp.pct * 100 % 1 ? 1 : 0)}% of equity (step ${bp.step + 1} of ${bp.steps.length}${bp.step > 0 ? " - a win steps back up" : ""})`,
+      nextAt: null,
+      nextStake: nextPct != null ? round2(eq * nextPct) : null,
+      betPercent: bp,
+    };
+  }
   if (!(base > 0)) return { stake: null, tierAt: null, tierLabel: "flat stake off", nextAt: null, nextStake: null };
 
   const tiers = Array.isArray(config.stakeTiers) ? config.stakeTiers : DEFAULT_STAKE_TIERS;
@@ -130,6 +149,10 @@ export function noteStake(decision, equity) {
   const prev = lastStake;
   lastStake = { ...decision, equity: round2(Number(equity) || 0), at: new Date().toISOString() };
   if (!prev || prev.tierAt === decision.tierAt) return null;
+  if (decision.betPercent) {
+    return `Bet size now ${decision.tierLabel}: $${decision.stake.toFixed(2)} per bet at $${lastStake.equity.toFixed(2)} equity` +
+      ` (was ${prev.tierLabel}).`;
+  }
   const dir = decision.tierAt > prev.tierAt ? "UP" : "DOWN";
   return `Stake tier ${dir}: equity $${lastStake.equity.toFixed(2)} ` +
     `${dir === "UP" ? "cleared" : "fell under"} $${dir === "UP" ? decision.tierAt : prev.tierAt} - ` +
