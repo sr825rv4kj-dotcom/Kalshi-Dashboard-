@@ -98,7 +98,7 @@ import { observePregame, prunePregame } from "./pregameConfirm.js";
 
 const V2 = "/trade-api/v2";
 
-export const SCANNER_VERSION = "2026-10-18-min-65-to-win";
+export const SCANNER_VERSION = "2026-11-01-trade-list-all";
 
 /** Max age (seconds) of the sharp line for trading a live game that has no live score. */
 function noScoreMaxAge(config = {}) {
@@ -498,7 +498,10 @@ async function runScan({ sportKey, config, bankroll, tickerMap, atCap, skipEvent
     if (!timing.live && config.liveOnly !== false) { drops.pregame++; return null; }
     // MODELLED SPORTS ONLY: no in-game model calibrated for this sport, so no
     // new buy. Checked before the ticker lookup, so it costs no Kalshi call.
-    if (timing.live && !entryAllowedForSport(sportKey, config)) {
+    // TRADE LIST BEFORE KICKOFF TOO (2026-11-01): pre-game bets in soccer and
+    // cricket (Hammarby, Ireland, Leverkusen, Frosinone - Oct 29-Nov 1) were
+    // getting past the NFL/NCAAF/NHL list, which was only checked in play.
+    if (!entryAllowedForSport(sportKey, config)) {
       drops.unmodeled++;
       feedHere("no-model-for-sport", "This sport is not on the trade list - only sports with a proven record are bought");
       return null;
