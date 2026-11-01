@@ -49,6 +49,7 @@
 
 import { kalshiGet, kalshiPost, kalshiDelete } from "./kalshiClient.js";
 import { blockedEntryRange } from "./sportRules.js";
+import { entryAllowedForSport } from "./liveModel.js";
 import { appendLog, loadState, saveState } from "./stateStore.js";
 import { recordTrade, scheduleFeeCents } from "./tradeLedgerStore.js";
 import { feeCentsAt, requiredEdgeThreshold, fractionalKellySize, feePerContractCents, flatBetContracts } from "./riskManager.js";
@@ -56,7 +57,7 @@ import { notifyEntry } from "./notifier.js";
 import { getTelegramCredentials } from "./telegramStore.js";
 import { currentCadenceSeconds } from "./cadence.js";
 
-export const MAKER_VERSION = "2026-10-09-block-60-69";
+export const MAKER_VERSION = "2026-11-01-trade-list-stake";
 
 /*
  * LIVE RESTING BIDS (2026-10-01, account holder's call). In a live game that
@@ -541,6 +542,8 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents, stak
       return { action: "none", line: `${c.ticker}: waiting for the previous bid's cancel to clear` };
     }
     if (!s.enabled) return refuse("resting bids switched off");
+    // TRADE LIST (2026-11-01): no resting bid outside config.entrySports.
+    if (!entryAllowedForSport(c.sportKey, config)) return refuse(`${c.sportKey} is not on the trade list`);
     const live = c.timing.live === true;
     if (live && !s.allowLive) return refuse("game is live - resting bids are pre-game only");
 
@@ -568,7 +571,9 @@ export async function workCandidate({ c, config, bankroll, cap, heldEvents, stak
     const mult = makerMultiplierFor(c.ticker);
     const sm = config.survivalMode;
     // LIVE bids are staked at liveStakeFactor of the normal (tiered) stake.
-    const liveStake = live && Number(stakeDollars) > 0 ? Number(stakeDollars) * s.liveStakeFactor : null;
+    // PRE-GAME bids use the normal stake itself when one is given (2026-11-01)
+    // - the same bet size as every other entry, not a separate Kelly size.
+    const liveStake = Number(stakeDollars) > 0 ? Number(stakeDollars) * (live ? s.liveStakeFactor : 1) : null;
     const contractsAt = liveStake
       ? (px) => flatBetContracts(liveStake, px, mult)
       : sm && bankroll < sm.balanceThreshold
