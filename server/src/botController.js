@@ -37,7 +37,7 @@ const TICKER_MAP_PATH = path.join(CONFIG_DIR, "ticker-map.json");
 const V2 = "/trade-api/v2";
 const POSITION_MONITOR_INTERVAL_MS = 3 * 60 * 1000;
 
-export const CONTROLLER_VERSION = "2026-10-18-streak-counter";
+export const CONTROLLER_VERSION = "2026-11-01-bet-percent";
 
 const HALT_LOG_EVERY_MS = 30 * 60 * 1000;
 let lastHaltLog = { reason: null, at: 0 };
@@ -1225,7 +1225,13 @@ export async function runCycle() {
           // entries and to resting bids, which read the same band.
           ...withSportRules(config, sportKey),
           kellyFraction: config.kellyFraction ?? tier.kellyFraction,
-          maxStakeDollars: tier.maxStakeDollars,
+          // BET SIZE BY RESULTS (2026-11-01): a percentage-of-equity stake
+          // must not be cut back by the milestone tier's dollar cap or the
+          // 20% per-trade risk cap, or the bet silently shrinks.
+          maxStakeDollars: config.betPercent?.enabled === true ? null : tier.maxStakeDollars,
+          ...(config.betPercent?.enabled === true
+            ? { maxRiskPctPerTrade: Math.max(Number(config.maxRiskPctPerTrade) || 0, Math.max(...(Array.isArray(config.betPercent.steps) && config.betPercent.steps.length ? config.betPercent.steps.map(Number).filter((x) => x > 0) : [0.15])) + 0.05) }
+            : {}),
           // STAKE TIERS read EQUITY - cash plus open positions at market, the
           // portfolio total the Kalshi app shows - so the stake does not drop
           // just because money is tied up in games (scaling.js).
