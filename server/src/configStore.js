@@ -1153,6 +1153,28 @@ const ONE_TIME_UPDATES = [
     },
     note: "open bets: +1 for each win, -1 for each loss (1 to 6)",
   },
+  {
+    // ONE BIGGER BET AT A TIME (2026-11-01, account holder's call: "larger
+    // bets with less bots deployed ... 1 bet at a time ... Keep format until
+    // loss then only bet less percentage of portfolio according to losses";
+    // sizes chosen: 15% -> 10% -> 5%. Replayed on the 57 real Kalshi bets
+    // Oct 28-Nov 1 from $31: 15/10/5 -> $38.42, 50/25/12.5/6 -> $4.30).
+    //   - one open bet at a time (streak ladder capped at 1)
+    //   - bet size = 15% of equity; each loss steps it down 15 -> 10 -> 5%,
+    //     each win steps it back up one (streakCounter.js betPercent,
+    //     scaling.js), counted from this update
+    //   - the 4-loss half-stake brake is off (the steps already cut the size)
+    // Unchanged: NFL / NCAAF / NHL only, 55-84c, 55%+ to win, 25% daily halt,
+    // Polymarket off.
+    id: "2026-11-01-one-bet-15pct",
+    apply: (c) => {
+      c.betPercent = { enabled: true, since: new Date().toISOString(), steps: [0.15, 0.10, 0.05] };
+      c.streak = { ...(c.streak || {}), enabled: true, max: 1, mode: "ladder", since: c.streak?.since || new Date().toISOString() };
+      c.maxConcurrentPositions = 1;
+      c.streakBrakeLosses = 0;
+    },
+    note: "1 bet at a time at 15% of equity; each loss steps it down (10%, 5%), each win steps it back up",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
