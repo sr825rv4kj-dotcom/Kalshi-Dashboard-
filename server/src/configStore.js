@@ -1175,6 +1175,20 @@ const ONE_TIME_UPDATES = [
     },
     note: "1 bet at a time at 15% of equity; each loss steps it down (10%, 5%), each win steps it back up",
   },
+  {
+    // SCALE UP (2026-11-03 22:20 PT, account holder's call: "Scale up bets
+    // please"). First step 20% of equity (was 15%), then 15 -> 10 -> 5% after
+    // losses, back up one step per win. Replayed on the 85 real Kalshi bets
+    // that match today's filter (NFL / NCAAF / NHL, 55-84c, Oct 24-Nov 3; 66
+    // won vs 59.2 implied) from $43.39: 15/10/5 ends $128.78 (worst drop from
+    // a high 54%); 20/15/10/5 ends $169.88 (worst drop 66%); 30/20/10/5 ends
+    // $179.76 (worst drop 83%). Still one bet at a time.
+    id: "2026-11-03-scale-20pct",
+    apply: (c) => {
+      c.betPercent = { ...(c.betPercent || {}), enabled: true, since: c.betPercent?.since || new Date().toISOString(), steps: [0.2, 0.15, 0.1, 0.05] };
+    },
+    note: "bet size 20% of equity, stepping down 15% -> 10% -> 5% after losses, back up one step per win",
+  },
 ];
 
 function applyOneTimeUpdates(stored) {
